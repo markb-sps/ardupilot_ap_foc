@@ -4,10 +4,12 @@
 MCU STM32G431 STM32G431xx
 
 FLASH_RESERVE_START_KB 0
-FLASH_BOOTLOADER_LOAD_KB 24
+FLASH_BOOTLOADER_LOAD_KB 32
 
-# reserve some space for params
-APP_START_OFFSET_KB 2
+define STRICT_BOOTLOADER 1
+
+# reserve some space for params (NO! params at end of flash)
+APP_START_OFFSET_KB 0
 
 # board ID. See Tools/AP_Bootloader/board_types.txt
 APJ_BOARD_ID AP_HW_FlywooF745

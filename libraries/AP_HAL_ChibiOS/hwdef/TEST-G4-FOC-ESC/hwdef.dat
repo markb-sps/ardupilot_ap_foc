@@ -6,15 +6,15 @@
 # MCU class and specific type
 MCU STM32G431 STM32G431xx
 
-# bootloader starts firmware at 24k + 2k (STORAGE_FLASH)
-FLASH_RESERVE_START_KB 26
+# Flash reserved for bootloader
+FLASH_RESERVE_START_KB 32
 
-# store parameters in pages (2K flash) 13 and 14
-STORAGE_FLASH_PAGE 0
+# Flash page where storage starts (should be the end of the physical flash)
+STORAGE_FLASH_PAGE 62
 define HAL_STORAGE_SIZE 400
 
 # board ID. See Tools/AP_Bootloader/board_types.txt
-APJ_BOARD_ID AP_HW_CUBEORANGEPLUS
+APJ_BOARD_ID AP_HW_FlywooF745
 
 # setup build for a peripheral firmware
 env AP_PERIPH 1
@@ -27,7 +27,7 @@ OSCILLATOR_HZ 0
 
 STM32_ST_USE_TIMER 2
 
-# assume the 512k flash part
+# Total chip flash size
 FLASH_SIZE_KB 128
 
 # order of UARTs
