@@ -1177,7 +1177,8 @@ class ChibiOSHWDef(hwdef.HWDef):
             elif cortex == 'cortex-m7':
                 self.env_vars['CPU_FLAGS'].append('-DARM_MATH_CM7')
 
-        if not self.mcu_series.startswith("STM32F1") and not self.is_bootloader_fw():
+        if (not self.mcu_series.startswith("STM32F1") and not self.is_bootloader_fw() and
+                self.intdefines.get('HAL_CHPRINTF_USE_FLOAT', 1)):
             self.env_vars['CPU_FLAGS'].append('-u_printf_float')
             build_info['ENV_UDEFS'] = "-DCHPRINTF_USE_FLOAT=1"
 
