@@ -13,6 +13,16 @@ namespace ChibiOS {
 
 namespace {
 constexpr float ADC_LSB_VOLTS = 3.3f / 4095.0f;
+constexpr uint32_t OPEN_LOOP_PHASE_OFFSET_120 = 1431655765U;
+constexpr uint32_t OPEN_LOOP_PHASE_OFFSET_240 = 2863311530U;
+constexpr uint8_t OPEN_LOOP_SINE_BITS = 5;
+constexpr uint8_t OPEN_LOOP_SINE_SIZE = 1U << OPEN_LOOP_SINE_BITS;
+const int8_t open_loop_sine_lut[OPEN_LOOP_SINE_SIZE] = {
+    0, 25, 49, 71, 90, 106, 117, 125,
+    127, 125, 117, 106, 90, 71, 49, 25,
+    0, -25, -49, -71, -90, -106, -117, -125,
+    -127, -125, -117, -106, -90, -71, -49, -25
+};
 constexpr uint32_t PHASE_CURRENT_SAMPLE_TIME =
 #if defined(ADC_SMPR_SMP_47P5)
     ADC_SMPR_SMP_47P5;
@@ -80,6 +90,8 @@ const ADCConversionGroup phase_current_adc2_group = {
 
 }
 
+MotorControl *MotorControl::_singleton;
+
 bool MotorControl::init()
 {
     return init(Config{});
@@ -101,15 +113,21 @@ bool MotorControl::init(const Config &cfg)
     _phase_ticks[0] = 0;
     _phase_ticks[1] = 0;
     _phase_ticks[2] = 0;
+    _open_loop_amplitude_ticks = 0;
+    _open_loop_phase = 0;
+    _open_loop_phase_step = 0;
 
     _driver = &PWMD1;
+    _singleton = this;
     _pwm_cfg.frequency = cfg.pwm_clock_hz;
     const uint32_t period_divisor = cfg.center_aligned ? (2U * cfg.pwm_frequency_hz) : cfg.pwm_frequency_hz;
     _pwm_cfg.period = cfg.pwm_clock_hz / period_divisor;
     if (_pwm_cfg.period == 0) {
         return false;
     }
+    _open_loop_center_ticks = uint16_t(_pwm_cfg.period / 2U);
 
+    _pwm_cfg.callback = pwm_cycle_callback;
     _pwm_cfg.channels[0].mode = PWM_OUTPUT_ACTIVE_HIGH | PWM_COMPLEMENTARY_OUTPUT_ACTIVE_HIGH;
     _pwm_cfg.channels[1].mode = PWM_OUTPUT_ACTIVE_HIGH | PWM_COMPLEMENTARY_OUTPUT_ACTIVE_HIGH;
     _pwm_cfg.channels[2].mode = PWM_OUTPUT_ACTIVE_HIGH | PWM_COMPLEMENTARY_OUTPUT_ACTIVE_HIGH;
@@ -128,6 +146,7 @@ bool MotorControl::init(const Config &cfg)
         _driver->tim->CR1 &= ~STM32_TIM_CR1_CMS_MASK;
         _driver->tim->CR1 |= STM32_TIM_CR1_CMS(1);
     }
+    pwmEnablePeriodicNotification(_driver);
 
     init_opamps();
     _current_sense_initialized = init_current_sense();
@@ -148,6 +167,7 @@ void MotorControl::deinit()
     if (!_initialized || _driver == nullptr) {
         return;
     }
+    pwmDisablePeriodicNotification(_driver);
     pwmStop(_driver);
     _driver = nullptr;
     if (_adc1_started) {
@@ -162,6 +182,41 @@ void MotorControl::deinit()
 #endif
     _current_sense_initialized = false;
     _initialized = false;
+#endif
+}
+
+void MotorControl::set_open_loop_target(float electrical_hz, float modulation, bool reset_phase)
+{
+#if HAL_USE_PWM == TRUE && STM32_PWM_USE_TIM1 == TRUE
+    if (!_initialized || _driver == nullptr) {
+        return;
+    }
+
+    if (modulation <= 0.0f) {
+        _open_loop_amplitude_ticks = 0;
+    } else {
+        const float max_amplitude = float(_open_loop_center_ticks);
+        float scaled = modulation * 0.5f * float(_pwm_cfg.period);
+        if (scaled > max_amplitude) {
+            scaled = max_amplitude;
+        }
+        _open_loop_amplitude_ticks = uint16_t(scaled);
+    }
+
+    if (reset_phase) {
+        _open_loop_phase = 0;
+    }
+    if (electrical_hz <= 0.0f) {
+        _open_loop_phase_step = 0;
+        return;
+    }
+
+    const uint64_t step = uint64_t(electrical_hz * (4294967296.0 / double(_driver->config->frequency / _pwm_cfg.period)));
+    _open_loop_phase_step = uint32_t(step);
+#else
+    (void)electrical_hz;
+    (void)modulation;
+    (void)reset_phase;
 #endif
 }
 
@@ -262,6 +317,39 @@ uint16_t MotorControl::clamp_width(uint16_t width) const
         return _pwm_cfg.period;
     }
     return width;
+}
+
+void MotorControl::pwm_cycle_callback(PWMDriver *driver)
+{
+    if (_singleton == nullptr || driver != _singleton->_driver) {
+        return;
+    }
+    _singleton->update_open_loop_isr();
+}
+
+void MotorControl::update_open_loop_isr()
+{
+#if HAL_USE_PWM == TRUE && STM32_PWM_USE_TIM1 == TRUE
+    const uint16_t amplitude = _open_loop_amplitude_ticks;
+    const uint16_t center = _open_loop_center_ticks;
+    const auto phase_to_width = [amplitude, center](uint32_t phase) -> uint16_t {
+        const uint8_t index = uint8_t(phase >> (32U - OPEN_LOOP_SINE_BITS));
+        const int32_t scaled = int32_t(amplitude) * int32_t(open_loop_sine_lut[index]);
+        return uint16_t(int32_t(center) + scaled / 127);
+    };
+
+    const uint16_t phase_u = phase_to_width(_open_loop_phase);
+    const uint16_t phase_v = phase_to_width(_open_loop_phase - OPEN_LOOP_PHASE_OFFSET_120);
+    const uint16_t phase_w = phase_to_width(_open_loop_phase - OPEN_LOOP_PHASE_OFFSET_240);
+
+    _phase_ticks[0] = phase_u;
+    _phase_ticks[1] = phase_v;
+    _phase_ticks[2] = phase_w;
+    pwmEnableChannelI(_driver, 0, phase_u);
+    pwmEnableChannelI(_driver, 1, phase_v);
+    pwmEnableChannelI(_driver, 2, phase_w);
+    _open_loop_phase += _open_loop_phase_step;
+#endif
 }
 
 void MotorControl::init_opamps()

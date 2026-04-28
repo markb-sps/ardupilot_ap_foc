@@ -33,12 +33,15 @@ public:
 
     void set_phase_duty(float phase_u, float phase_v, float phase_w);
     void set_phase_duty_ticks(uint16_t phase_u, uint16_t phase_v, uint16_t phase_w);
+    void set_open_loop_target(float electrical_hz, float modulation, bool reset_phase=false);
 
     uint16_t period_ticks() const;
     bool current_sense_ready() const { return _current_sense_initialized; }
     PhaseCurrentSense read_phase_current_voltages();
 
 private:
+    static void pwm_cycle_callback(PWMDriver *driver);
+    void update_open_loop_isr();
     void init_opamps();
     bool init_current_sense();
     bool sample_phase_current_counts(uint16_t &phase_u, uint16_t &phase_v, uint16_t &phase_w);
@@ -56,7 +59,13 @@ private:
     adcsample_t _adc1_samples[2]{};
     adcsample_t _adc2_samples[1]{};
     uint16_t _phase_ticks[3]{};
+    uint16_t _open_loop_center_ticks = 0;
+    volatile uint16_t _open_loop_amplitude_ticks = 0;
+    volatile uint32_t _open_loop_phase = 0;
+    volatile uint32_t _open_loop_phase_step = 0;
     PWMConfig _pwm_cfg{};
+
+    static MotorControl *_singleton;
 };
 
 } // namespace ChibiOS

@@ -38,9 +38,12 @@
 
 namespace {
 constexpr float phase_current_shunt_ohms = 0.003f;
-constexpr float motor_test_modulation = 0.05f;
-constexpr float motor_test_electrical_hz = 20.0f;
-constexpr float two_pi = 6.28318530718f;
+constexpr float motor_test_modulation = 0.25f;
+constexpr uint8_t motor_test_pole_pairs = 6;
+constexpr uint16_t motor_test_align_hold_ms = 750;
+constexpr uint16_t motor_test_ramp_duration_ms = 40000;
+constexpr uint16_t motor_test_start_rpm = 5;
+constexpr uint16_t motor_test_target_rpm = 200;
 }
 
 // not only will the code not compile without features this enables,
@@ -446,15 +449,21 @@ void AP_Periph_FW::update_motor_test(uint32_t now_ms)
         return;
     }
 
-    const float theta = two_pi * motor_test_electrical_hz * (float(now_ms) * 0.001f);
-    const float theta_deg = wrap_360(degrees(theta));
-    const float duty_center = 0.5f;
-    const float duty_amplitude = 0.5f * motor_test_modulation;
-    const float phase_u = duty_center + duty_amplitude * sinf(theta);
-    const float phase_v = duty_center + duty_amplitude * sinf(theta - two_pi / 3.0f);
-    const float phase_w = duty_center + duty_amplitude * sinf(theta + two_pi / 3.0f);
-
-    motor_control.set_phase_duty(phase_u, phase_v, phase_w);
+    uint16_t target_rpm = 0;
+    if (now_ms < motor_test_align_hold_ms) {
+        motor_control.set_open_loop_target(0.0f, motor_test_modulation, true);
+    } else {
+        const uint32_t ramp_elapsed_ms = now_ms - motor_test_align_hold_ms;
+        if (ramp_elapsed_ms < motor_test_ramp_duration_ms) {
+            target_rpm = motor_test_start_rpm +
+                         uint16_t((uint32_t(motor_test_target_rpm - motor_test_start_rpm) * ramp_elapsed_ms) /
+                                  motor_test_ramp_duration_ms);
+        } else {
+            target_rpm = motor_test_target_rpm;
+        }
+        const float electrical_hz = float(target_rpm * motor_test_pole_pairs) / 60.0f;
+        motor_control.set_open_loop_target(electrical_hz, motor_test_modulation);
+    }
     motor_control.enable_outputs();
 
     if (now_ms - motor_test_last_cycle_ms < 500U) {
@@ -470,13 +479,12 @@ void AP_Periph_FW::update_motor_test(uint32_t now_ms)
     const float current_u_a = sense.u / phase_current_shunt_ohms;
     const float current_v_a = sense.v / phase_current_shunt_ohms;
     const float current_w_a = sense.w / phase_current_shunt_ohms;
-    printf("rotating vector %.0fdeg %.1fHz %.1f%%, duty U=%.2f%% V=%.2f%% W=%.2f%%, phase current: U=%.3fA V=%.3fA W=%.3fA (sense U=%lumV V=%lumV W=%lumV)\n\r",
-           (double)theta_deg,
-           (double)motor_test_electrical_hz,
+    const float electrical_hz = float(target_rpm * motor_test_pole_pairs) / 60.0f;
+    printf("motor test %s %uRPM %.2fHz %.1f%%, phase current: U=%.3fA V=%.3fA W=%.3fA (sense U=%lumV V=%lumV W=%lumV)\n\r",
+           now_ms < motor_test_align_hold_ms ? "align" : "spin",
+           (unsigned)target_rpm,
+           (double)electrical_hz,
            (double)(motor_test_modulation * 100.0f),
-           (double)(phase_u * 100.0f),
-           (double)(phase_v * 100.0f),
-           (double)(phase_w * 100.0f),
            (double)current_u_a,
            (double)current_v_a,
            (double)current_w_a,
