@@ -156,14 +156,14 @@ int main(void)
 #endif
 #endif  // AP_CHECK_FIRMWARE_ENABLED
 
-    if (was_watchdog && m != RTC_BOOT_FWOK) {
-        // we've had a watchdog within 30s of booting main CAN
-        // firmware. We will stay in bootloader to allow the user to
-        // load a fixed firmware
-        stm32_watchdog_clear_reason();
-        try_boot = false;
-        timeout = 0;
-    }
+    // if (was_watchdog && m != RTC_BOOT_FWOK) {
+    //     // we've had a watchdog within 30s of booting main CAN
+    //     // firmware. We will stay in bootloader to allow the user to
+    //     // load a fixed firmware
+    //     stm32_watchdog_clear_reason();
+    //     try_boot = false;
+    //     timeout = 0;
+    // }
 #elif AP_CHECK_FIRMWARE_ENABLED
     const auto ok = check_good_firmware();
     if (ok != check_fw_result_t::CHECK_FW_OK) {

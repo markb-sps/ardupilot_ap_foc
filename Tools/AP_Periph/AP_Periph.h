@@ -50,6 +50,9 @@
 #endif
 #include <AP_AHRS/AP_AHRS.h>
 #include <AP_DAC/AP_DAC.h>
+#if CONFIG_HAL_BOARD == HAL_BOARD_CHIBIOS
+#include <AP_HAL_ChibiOS/MotorControl.h>
+#endif
 
 #if AP_PERIPH_RELAY_ENABLED
 #if AP_PERIPH_PWM_HARDPOINT_ENABLED
@@ -447,6 +450,11 @@ public:
     Networking_Periph networking_periph;
 #endif
 
+#if CONFIG_HAL_BOARD == HAL_BOARD_CHIBIOS
+    ChibiOS::MotorControl motor_control;
+    uint32_t motor_test_last_cycle_ms;
+#endif
+
 #if AP_PERIPH_RTC_ENABLED
     AP_RTC rtc;
 #endif
@@ -509,6 +517,7 @@ public:
 
     // show stack as DEBUG msgs
     void show_stack_free();
+    void update_motor_test(uint32_t now_ms);
 
     static bool no_iface_finished_dna;
     static constexpr auto can_printf = ::can_printf;

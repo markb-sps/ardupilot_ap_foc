@@ -23,6 +23,7 @@
 #include <AP_HAL/AP_HAL.h>
 #include <AP_HAL/AP_HAL_Boards.h>
 #include "AP_Periph.h"
+#include <math.h>
 #include <stdio.h>
 
 #if CONFIG_HAL_BOARD == HAL_BOARD_CHIBIOS
@@ -34,6 +35,13 @@
 #ifndef HAL_PERIPH_HWESC_SERIAL_PORT
 #define HAL_PERIPH_HWESC_SERIAL_PORT 3
 #endif
+
+namespace {
+constexpr float phase_current_shunt_ohms = 0.003f;
+constexpr float motor_test_modulation = 0.05f;
+constexpr float motor_test_electrical_hz = 20.0f;
+constexpr float two_pi = 6.28318530718f;
+}
 
 // not only will the code not compile without features this enables,
 // but it forms part of a series of measures to give a robust recovery
@@ -74,6 +82,9 @@ AP_Periph_FW::AP_Periph_FW()
         AP_HAL::panic("AP_Periph_FW must be singleton");
     }
     _singleton = this;
+#if CONFIG_HAL_BOARD == HAL_BOARD_CHIBIOS
+    motor_test_last_cycle_ms = 0;
+#endif
 }
 
 #if HAL_LOGGING_ENABLED
@@ -113,6 +124,18 @@ void AP_Periph_FW::init()
 #endif
     serial_manager.init();
 
+#if CONFIG_HAL_BOARD == HAL_BOARD_CHIBIOS
+    {
+        ChibiOS::MotorControl::Config motor_cfg;
+        motor_cfg.pwm_clock_hz = 20000000;
+        motor_cfg.pwm_frequency_hz = 10000;
+        motor_cfg.deadtime_ticks = 2;
+        motor_cfg.center_aligned = true;
+        motor_cfg.break_input_enabled = false;
+        motor_control.init(motor_cfg);
+    }
+#endif
+
 #if AP_PERIPH_NETWORKING_ENABLED
     networking_periph.init();
 #endif
@@ -140,7 +163,7 @@ void AP_Periph_FW::init()
     check_firmware_print();
 
     if (hal.util->was_watchdog_reset()) {
-        printf("Reboot after watchdog reset\n");
+        printf("Reboot after watchdog reset\n\r");
     }
 
 #if AP_STATS_ENABLED
@@ -416,7 +439,52 @@ void AP_Periph_FW::show_stack_free()
 }
 #endif
 
+#if CONFIG_HAL_BOARD == HAL_BOARD_CHIBIOS
+void AP_Periph_FW::update_motor_test(uint32_t now_ms)
+{
+    if (!motor_control.is_initialized()) {
+        return;
+    }
 
+    const float theta = two_pi * motor_test_electrical_hz * (float(now_ms) * 0.001f);
+    const float theta_deg = wrap_360(degrees(theta));
+    const float duty_center = 0.5f;
+    const float duty_amplitude = 0.5f * motor_test_modulation;
+    const float phase_u = duty_center + duty_amplitude * sinf(theta);
+    const float phase_v = duty_center + duty_amplitude * sinf(theta - two_pi / 3.0f);
+    const float phase_w = duty_center + duty_amplitude * sinf(theta + two_pi / 3.0f);
+
+    motor_control.set_phase_duty(phase_u, phase_v, phase_w);
+    motor_control.enable_outputs();
+
+    if (now_ms - motor_test_last_cycle_ms < 500U) {
+        return;
+    }
+    motor_test_last_cycle_ms = now_ms;
+
+    const auto sense = motor_control.read_phase_current_voltages();
+
+    const uint32_t sense_u_mv = uint32_t(sense.u * 1000.0f + 0.5f);
+    const uint32_t sense_v_mv = uint32_t(sense.v * 1000.0f + 0.5f);
+    const uint32_t sense_w_mv = uint32_t(sense.w * 1000.0f + 0.5f);
+    const float current_u_a = sense.u / phase_current_shunt_ohms;
+    const float current_v_a = sense.v / phase_current_shunt_ohms;
+    const float current_w_a = sense.w / phase_current_shunt_ohms;
+    printf("rotating vector %.0fdeg %.1fHz %.1f%%, duty U=%.2f%% V=%.2f%% W=%.2f%%, phase current: U=%.3fA V=%.3fA W=%.3fA (sense U=%lumV V=%lumV W=%lumV)\n\r",
+           (double)theta_deg,
+           (double)motor_test_electrical_hz,
+           (double)(motor_test_modulation * 100.0f),
+           (double)(phase_u * 100.0f),
+           (double)(phase_v * 100.0f),
+           (double)(phase_w * 100.0f),
+           (double)current_u_a,
+           (double)current_v_a,
+           (double)current_w_a,
+           (unsigned long)sense_u_mv,
+           (unsigned long)sense_v_mv,
+           (unsigned long)sense_w_mv);
+}
+#endif
 
 void AP_Periph_FW::update()
 {
@@ -515,6 +583,10 @@ void AP_Periph_FW::update()
 
 #if AP_PERIPH_ACTUATOR_TELEM_ENABLED
     actuator_telem.update();
+#endif
+
+#if CONFIG_HAL_BOARD == HAL_BOARD_CHIBIOS
+    update_motor_test(now);
 #endif
 
 #if AP_PERIPH_BATTERY_BALANCE_ENABLED

@@ -1579,7 +1579,7 @@ bool AP_Periph_FW::can_do_dna()
     const uint32_t now = AP_HAL::millis();
 
     if (AP_Periph_FW::no_iface_finished_dna) {
-        printf("Waiting for dynamic node ID allocation %x... (pool %u)\n",  IFACE_ALL, pool_peak_percent());
+        printf("Waiting for dynamic node ID allocation %x... (pool %u)\n\r",  IFACE_ALL, pool_peak_percent());
     }
 
     dronecan.send_next_node_id_allocation_request_at_ms =
