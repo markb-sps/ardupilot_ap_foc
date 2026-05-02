@@ -452,10 +452,8 @@ public:
 
 #if CONFIG_HAL_BOARD == HAL_BOARD_CHIBIOS
     ChibiOS::MotorControl motor_control;
-    ChibiOS::MotorControl::PhaseCurrentSense motor_test_current_zero;
     uint32_t motor_test_last_cycle_ms;
     uint32_t motor_test_start_ms;
-    bool motor_test_current_zero_valid;
 #endif
 
 #if AP_PERIPH_RTC_ENABLED

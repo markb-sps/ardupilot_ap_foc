@@ -64,14 +64,6 @@ struct DriverState {
     volatile uint8_t pending_mask = 0U;
 } driver_state;
 
-void set_phase_ticks_hw(uint16_t phase_u, uint16_t phase_v, uint16_t phase_w)
-{
-    TIM1->CR1 |= TIM_CR1_UDIS;
-    TIM1->CCR1 = phase_u;
-    TIM1->CCR2 = phase_v;
-    TIM1->CCR3 = phase_w;
-    TIM1->CR1 &= ~TIM_CR1_UDIS;
-}
 
 void pwm_cycle_callback(PWMDriver *driver)
 {
@@ -326,7 +318,11 @@ Stm32FocMotorControlInitResult stm32_foc_motor_control_init(const Stm32FocMotorC
     init_tim4_trigger(driver_state.period_ticks, driver_state.current_sample_delay_ticks);
     driver_state.current_sense_ok = init_current_sense();
 
-    set_phase_ticks_hw(0U, 0U, 0U);
+    TIM1->CR1 |= TIM_CR1_UDIS;
+    TIM1->CCR1 = 0;
+    TIM1->CCR2 = 0;
+    TIM1->CCR3 = 0;
+    TIM1->CR1 &= ~TIM_CR1_UDIS;
     TIM1->BDTR &= ~TIM_BDTR_MOE;
     pwmEnablePeriodicNotification(&PWMD1);
 
@@ -392,7 +388,11 @@ void stm32_foc_motor_control_set_phase_ticks(uint16_t phase_u, uint16_t phase_v,
         return;
     }
     osalSysLock();
-    set_phase_ticks_hw(phase_u, phase_v, phase_w);
+    TIM1->CR1 |= TIM_CR1_UDIS;
+    TIM1->CCR1 = phase_u;
+    TIM1->CCR2 = phase_v;
+    TIM1->CCR3 = phase_w;
+    TIM1->CR1 &= ~TIM_CR1_UDIS;
     osalSysUnlock();
 #else
     (void)phase_u;
@@ -407,7 +407,11 @@ void stm32_foc_motor_control_set_phase_ticks_isr(uint16_t phase_u, uint16_t phas
     if (!driver_state.initialized) {
         return;
     }
-    set_phase_ticks_hw(phase_u, phase_v, phase_w);
+    TIM1->CR1 |= TIM_CR1_UDIS;
+    TIM1->CCR1 = phase_u;
+    TIM1->CCR2 = phase_v;
+    TIM1->CCR3 = phase_w;
+    TIM1->CR1 &= ~TIM_CR1_UDIS;
 #else
     (void)phase_u;
     (void)phase_v;
