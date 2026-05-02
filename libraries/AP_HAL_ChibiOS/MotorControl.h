@@ -1,6 +1,6 @@
 #pragma once
 
-#include <hal.h>
+#include <stdint.h>
 
 namespace ChibiOS {
 
@@ -10,11 +10,19 @@ public:
         float u = 0.0f;
         float v = 0.0f;
         float w = 0.0f;
+        float rms_u = 0.0f;
+        float rms_v = 0.0f;
+        float rms_w = 0.0f;
+        int32_t raw_u = 0;
+        int32_t raw_v = 0;
+        int32_t raw_w = 0;
+        bool valid = false;
     };
 
     struct Config {
         uint32_t pwm_clock_hz = 20000000;
         uint32_t pwm_frequency_hz = 20000;
+        uint16_t current_sample_delay_ticks = 2;
         uint8_t deadtime_ticks = 40;
         bool center_aligned = true;
         bool break_input_enabled = false;
@@ -38,34 +46,34 @@ public:
     uint16_t period_ticks() const;
     bool current_sense_ready() const { return _current_sense_initialized; }
     PhaseCurrentSense read_phase_current_voltages();
+    bool read_phase_current_voltages(PhaseCurrentSense &sense);
+    bool read_phase_current_average_raw_voltages(PhaseCurrentSense &sense, bool reset=true);
+    bool read_phase_current_average_voltages(PhaseCurrentSense &sense, bool reset=true);
+    void set_phase_current_zero_offsets(const PhaseCurrentSense &sense);
 
 private:
-    static void pwm_cycle_callback(PWMDriver *driver);
     void update_open_loop_isr();
-    void init_opamps();
-    bool init_current_sense();
-    bool sample_phase_current_counts(uint16_t &phase_u, uint16_t &phase_v, uint16_t &phase_w);
-    bool wait_for_low_side_window(uint16_t phase_width_ticks);
+    static void pwm_period_callback(void *ctx);
+    static void current_sample_callback(void *ctx, uint16_t sample_u, uint16_t sample_v);
+    void record_phase_current_sample_pair_isr(uint16_t sample_u, uint16_t sample_v);
     uint16_t clamp_width(uint16_t width) const;
 
     bool _initialized = false;
     bool _current_sense_initialized = false;
-    bool _adc1_started = false;
-    bool _adc2_started = false;
-    bool _center_aligned = true;
-    uint8_t _deadtime_ticks = 0;
-    PWMDriver *_driver = nullptr;
-    ADCConfig _adc_cfg{};
-    adcsample_t _adc1_samples[2]{};
-    adcsample_t _adc2_samples[1]{};
+    uint16_t _period_ticks = 0;
     uint16_t _phase_ticks[3]{};
+    volatile uint16_t _phase_current_zero_raw[2]{};
+    volatile uint64_t _phase_current_raw_sum[2]{};
+    volatile int32_t _phase_current_last_counts[3]{};
+    volatile int64_t _phase_current_sum_counts[3]{};
+    volatile uint64_t _phase_current_sum_sq_counts[3]{};
+    volatile uint32_t _phase_current_sample_count = 0U;
+    volatile bool _phase_current_zero_valid = false;
     uint16_t _open_loop_center_ticks = 0;
+    uint32_t _pwm_update_rate_hz = 0;
     volatile uint16_t _open_loop_amplitude_ticks = 0;
     volatile uint32_t _open_loop_phase = 0;
     volatile uint32_t _open_loop_phase_step = 0;
-    PWMConfig _pwm_cfg{};
-
-    static MotorControl *_singleton;
 };
 
 } // namespace ChibiOS

@@ -43,7 +43,14 @@ define STM32_USB_USE_USB1 TRUE
 
 
 
-# USART1, telemetry
+# PC4 is BEMF2 on the schematic, leave PC4/PC5 free until a real UART use is defined
+# leave a placeholder USART on otherwise-unused PB6/PB7 because the current
+# ChibiOS/AP_HAL serial build expects one USART instance to exist
+# USART1, telemetry placeholder
+# PB6/PB7 are not routed in this design
+PB6 USART1_TX USART1 SPEED_HIGH
+PB7 USART1_RX USART1 SPEED_HIGH
+# old incorrect assignment on BEMF pins, intentionally disabled
 PC4 USART1_TX USART1 SPEED_HIGH
 PC5 USART1_RX USART1 SPEED_HIGH
 
@@ -88,6 +95,8 @@ define STM32_ADC_USE_ADC1 TRUE
 define STM32_ADC_USE_ADC2 TRUE
 define STM32_ADC_ADC1_DMA_STREAM STM32_DMA_STREAM_ID(1, 4)
 define STM32_ADC_ADC2_DMA_STREAM STM32_DMA_STREAM_ID(1, 5)
+define STM32_ADC_ADC1_IRQ_HOOK do { extern void motor_control_adc1_irq_hook(uint32_t isr); motor_control_adc1_irq_hook(isr); } while (0);
+define STM32_ADC_ADC2_IRQ_HOOK do { extern void motor_control_adc2_irq_hook(uint32_t isr); motor_control_adc2_irq_hook(isr); } while (0);
 
 #PA4 VSENSE50  ADC2 SCALE(18.39416)
 #PA5 VSENSE3v3 ADC2 SCALE(1)
@@ -96,7 +105,9 @@ define STM32_ADC_ADC2_DMA_STREAM STM32_DMA_STREAM_ID(1, 5)
 # OPAMP1: PA1/PA3 -> PA2 (ADC1_IN3)
 # OPAMP2: PA7/PA5 -> PA6 (ADC2_IN3)
 # OPAMP3: PB0/PB2 -> PB1 (ADC1_IN12)
-# these pins are configured directly by MotorControl at runtime
+# MotorControl samples only OPAMP1/ADC1_IN3 and OPAMP2/ADC2_IN3.
+# Phase W is derived from U and V, so OPAMP3/ADC1_IN12 is left unused.
+# These pins are configured directly by MotorControl at runtime.
 
 # ESC interrupt
 #PC6 ESC_INT INPUT
