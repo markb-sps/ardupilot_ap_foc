@@ -47,7 +47,7 @@ constexpr float phase_current_shunt_input_attenuation =
     ((1.0f / phase_current_input_resistor_ohms) +
      (1.0f / phase_current_pullup_ohms) +
      (1.0f / phase_current_pulldown_ohms));
-constexpr float motor_test_modulation = 0.25f;
+constexpr float motor_test_modulation = 0.1f;
 constexpr uint8_t motor_test_pole_pairs = 14;
 constexpr uint16_t motor_test_zero_settle_ms = 250;
 constexpr uint16_t motor_test_align_hold_ms = 750;
@@ -142,8 +142,8 @@ void AP_Periph_FW::init()
         ChibiOS::MotorControl::Config motor_cfg;
         motor_cfg.pwm_clock_hz = 20000000;
         motor_cfg.pwm_frequency_hz = 20000;
-        motor_cfg.current_sample_delay_ticks = 2;
-        motor_cfg.deadtime_ticks = 2;
+        motor_cfg.current_sample_delay_ticks = 5; //
+        motor_cfg.deadtime_ticks = 3;
         motor_cfg.center_aligned = true;
         motor_cfg.break_input_enabled = false;
         motor_control.init(motor_cfg);
@@ -460,73 +460,73 @@ void AP_Periph_FW::update_motor_test(uint32_t now_ms)
         return;
     }
 
-    // if (!motor_test_current_zero_valid) {
-    //     motor_control.set_open_loop_target(0.0f, 0.0f, true);
-    //     motor_control.enable_outputs();
-    //     if (now_ms - start_ms < motor_test_zero_settle_ms) {
-    //         return;
-    //     }
-    //     if (!motor_control.read_phase_current_average_raw_voltages(motor_test_current_zero)) {
-    //         return;
-    //     }
-    //     motor_test_current_zero.w = 0.0f;
-    //     motor_test_current_zero.raw_w = 0;
-    //     motor_control.set_phase_current_zero_offsets(motor_test_current_zero);
-    //     motor_test_current_zero_valid = true;
-    //     motor_test_start_ms = now_ms;
-    //     motor_test_last_cycle_ms = now_ms;
-    //     printf("motor test current zero captured: U=%lumV V=%lumV\n\r",
-    //            (unsigned long)uint32_t(motor_test_current_zero.u * 1000.0f + 0.5f),
-    //            (unsigned long)uint32_t(motor_test_current_zero.v * 1000.0f + 0.5f));
-    //     return;
-    // }
-    //
-    // const uint32_t test_ms = now_ms - motor_test_start_ms;
-    // uint16_t target_rpm = 0;
-    // if (test_ms < motor_test_align_hold_ms) {
-    //     motor_control.set_open_loop_target(0.0f, motor_test_modulation, true);
-    // } else {
-    //     const uint32_t ramp_elapsed_ms = test_ms - motor_test_align_hold_ms;
-    //     if (ramp_elapsed_ms < motor_test_ramp_duration_ms) {
-    //         target_rpm = motor_test_start_rpm +
-    //                      uint16_t((uint32_t(motor_test_target_rpm - motor_test_start_rpm) * ramp_elapsed_ms) /
-    //                               motor_test_ramp_duration_ms);
-    //     } else {
-    //         target_rpm = motor_test_target_rpm;
-    //     }
-    //     const float electrical_hz = float(target_rpm * motor_test_pole_pairs) / 60.0f;
-    //     motor_control.set_open_loop_target(electrical_hz, motor_test_modulation);
-    // }
-    //
-    // motor_control.enable_outputs();
-    //
-    // if (now_ms - motor_test_last_cycle_ms < 1000U) {
-    //     return;
-    // }
-    // motor_test_last_cycle_ms = now_ms;
-    //
-    // ChibiOS::MotorControl::PhaseCurrentSense sense;
-    // if (!motor_control.read_phase_current_average_voltages(sense)) {
-    //     printf("motor test current average unavailable\n\r");
-    //     return;
-    // }
-    //
-    // const float phase_current_volts_to_amps =
-    //     1.0f / (phase_current_shunt_ohms *
-    //             phase_current_shunt_input_attenuation *
-    //             phase_current_opamp_gain);
-    // const float current_u_a = sense.rms_u * phase_current_volts_to_amps;
-    // const float current_v_a = sense.rms_v * phase_current_volts_to_amps;
-    // const float current_w_a = sense.rms_w * phase_current_volts_to_amps;
-    // const float electrical_hz = float(target_rpm * motor_test_pole_pairs) / 60.0f;
-    // printf("motor test %s %uRPM %.2fHz %.1f%%, phase current rms: U=%.3fA V=%.3fA W=%.3fA\n\r",
-    //        test_ms < motor_test_align_hold_ms ? "align" : "spin",
-    //        (unsigned)target_rpm,
-    //        (double)electrical_hz,
-    //        (double)(motor_test_modulation * 100.0f),
-    //        (double)current_u_a,
-    //        (double)current_v_a,
-    //        (double)current_w_a);
+    if (!motor_test_current_zero_valid) {
+        motor_control.set_open_loop_target(0.0f, 0.0f, true);
+        motor_control.enable_outputs();
+        if (now_ms - start_ms < motor_test_zero_settle_ms) {
+            return;
+        }
+        if (!motor_control.read_phase_current_average_raw_voltages(motor_test_current_zero)) {
+            return;
+        }
+        motor_test_current_zero.w = 0.0f;
+        motor_test_current_zero.raw_w = 0;
+        motor_control.set_phase_current_zero_offsets(motor_test_current_zero);
+        motor_test_current_zero_valid = true;
+        motor_test_start_ms = now_ms;
+        motor_test_last_cycle_ms = now_ms;
+        printf("motor test current zero captured: U=%lumV V=%lumV\n\r",
+               (unsigned long)uint32_t(motor_test_current_zero.u * 1000.0f + 0.5f),
+               (unsigned long)uint32_t(motor_test_current_zero.v * 1000.0f + 0.5f));
+        return;
+    }
+
+    const uint32_t test_ms = now_ms - motor_test_start_ms;
+    uint16_t target_rpm = 0;
+    if (test_ms < motor_test_align_hold_ms) {
+        motor_control.set_open_loop_target(0.0f, motor_test_modulation, true);
+    } else {
+        const uint32_t ramp_elapsed_ms = test_ms - motor_test_align_hold_ms;
+        if (ramp_elapsed_ms < motor_test_ramp_duration_ms) {
+            target_rpm = motor_test_start_rpm +
+                         uint16_t((uint32_t(motor_test_target_rpm - motor_test_start_rpm) * ramp_elapsed_ms) /
+                                  motor_test_ramp_duration_ms);
+        } else {
+            target_rpm = motor_test_target_rpm;
+        }
+        const float electrical_hz = float(target_rpm * motor_test_pole_pairs) / 60.0f;
+        motor_control.set_open_loop_target(electrical_hz, motor_test_modulation);
+    }
+
+    motor_control.enable_outputs();
+
+    if (now_ms - motor_test_last_cycle_ms < 1000U) {
+        return;
+    }
+    motor_test_last_cycle_ms = now_ms;
+
+    ChibiOS::MotorControl::PhaseCurrentSense sense;
+    if (!motor_control.read_phase_current_average_voltages(sense)) {
+        printf("motor test current average unavailable\n\r");
+        return;
+    }
+
+    const float phase_current_volts_to_amps =
+        1.0f / (phase_current_shunt_ohms *
+                phase_current_shunt_input_attenuation *
+                phase_current_opamp_gain);
+    const float current_u_a = sense.rms_u * phase_current_volts_to_amps;
+    const float current_v_a = sense.rms_v * phase_current_volts_to_amps;
+    const float current_w_a = sense.rms_w * phase_current_volts_to_amps;
+    const float electrical_hz = float(target_rpm * motor_test_pole_pairs) / 60.0f;
+    printf("motor test %s %uRPM %.2fHz %.1f%%, phase current rms: U=%.3fA V=%.3fA W=%.3fA\n\r",
+           test_ms < motor_test_align_hold_ms ? "align" : "spin",
+           (unsigned)target_rpm,
+           (double)electrical_hz,
+           (double)(motor_test_modulation * 100.0f),
+           (double)current_u_a,
+           (double)current_v_a,
+           (double)current_w_a);
 }
 #endif
 

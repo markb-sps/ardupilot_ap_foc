@@ -31,9 +31,10 @@ constexpr uint32_t PHASE_CURRENT_OPAMP_ENABLED_CSR =
     OPAMP_CSR_PGA_GAIN_16 |
     OPAMP_CSR_OPAMPxEN;
 
-// From STM32CubeG4 LL ADC trigger definitions: TIM2_CH2 regular conversion trigger on rising edge.
-constexpr uint32_t PHASE_CURRENT_ADC_TRIGGER_TIM2_CC2 =
-    ADC_CFGR_EXTSEL_1 |
+// STM32G4 RM Table 5: TIM4_CC4 regular trigger, EXTSEL=5=0b00101, rising edge.
+// TIM4 slaves off TIM1 ITR0, leaving TIM2 free for the ChibiOS system tick.
+constexpr uint32_t PHASE_CURRENT_ADC_TRIGGER_TIM4_CC4 =
+    ADC_CFGR_EXTSEL_2 |
     ADC_CFGR_EXTSEL_0 |
     ADC_CFGR_EXTEN_0;
 
@@ -110,44 +111,44 @@ void deinit_opamps()
 #endif
 }
 
-void init_tim2_trigger(uint16_t period_ticks, uint16_t current_sample_delay_ticks)
+void init_tim4_trigger(uint16_t period_ticks, uint16_t current_sample_delay_ticks)
 {
-    rccEnableTIM2(true);
-    rccResetTIM2();
+    rccEnableTIM4(true);
+    rccResetTIM4();
 
-    TIM2->CR1 = 0U;
-    TIM2->CR2 = 0U;
-    TIM2->SMCR = 0U;
-    TIM2->DIER = 0U;
-    TIM2->CCER = 0U;
-    TIM2->CCMR1 = 0U;
-    TIM2->CNT = 0U;
-    TIM2->PSC = 0U;
-    TIM2->ARR = 0xFFFFFFFFU;
-    TIM2->CCR2 = current_sample_delay_ticks == 0U ? 1U : current_sample_delay_ticks;
+    TIM4->CR1 = 0U;
+    TIM4->CR2 = 0U;
+    TIM4->SMCR = 0U;
+    TIM4->DIER = 0U;
+    TIM4->CCER = 0U;
+    TIM4->CCMR2 = 0U;
+    TIM4->CNT = 0U;
+    TIM4->PSC = 0U;
+    TIM4->ARR = 0xFFFFU;  // TIM4 is 16-bit on STM32G431
+    TIM4->CCR4 = current_sample_delay_ticks == 0U ? 1U : current_sample_delay_ticks;
 
-    if (period_ticks > 1U && TIM2->CCR2 >= period_ticks) {
-        TIM2->CCR2 = period_ticks - 1U;
+    if (period_ticks > 1U && TIM4->CCR4 >= period_ticks) {
+        TIM4->CCR4 = period_ticks - 1U;
     }
 
-    TIM2->CCMR1 = TIM_CCMR1_OC2PE |
-                  TIM_CCMR1_OC2M_1 |
-                  TIM_CCMR1_OC2M_2;
-    TIM2->CCER = TIM_CCER_CC2E;
+    TIM4->CCMR2 = TIM_CCMR2_OC4PE |
+                  TIM_CCMR2_OC4M_1 |
+                  TIM_CCMR2_OC4M_2;
+    TIM4->CCER = TIM_CCER_CC4E;
 
-    // TIM2 resets from TIM1 TRGO on every TIM1 update event.
-    TIM2->SMCR = TIM_SMCR_SMS_2;
-    TIM2->CR1 = TIM_CR1_ARPE;
-    TIM2->EGR = TIM_EGR_UG;
-    TIM2->CR1 |= TIM_CR1_CEN;
+    // TIM4 slaves off TIM1 TRGO via ITR0 (= TIM1 on STM32G4), reset mode.
+    TIM4->SMCR = TIM_SMCR_SMS_2;
+    TIM4->CR1 = TIM_CR1_ARPE;
+    TIM4->EGR = TIM_EGR_UG;
+    TIM4->CR1 |= TIM_CR1_CEN;
 }
 
-void deinit_tim2_trigger()
+void deinit_tim4_trigger()
 {
-    TIM2->CR1 = 0U;
-    TIM2->DIER = 0U;
-    TIM2->CCER = 0U;
-    rccDisableTIM2();
+    TIM4->CR1 = 0U;
+    TIM4->DIER = 0U;
+    TIM4->CCER = 0U;
+    rccDisableTIM4();
 }
 
 void calibrate_adc(ADC_TypeDef *adc)
@@ -175,16 +176,23 @@ void init_adc_unit(ADC_TypeDef *adc)
 {
     calibrate_adc(adc);
 
+    adc->CR = ADC_CR_ADVREGEN;
     adc->ISR = adc->ISR;
-    adc->IER = 0U;
-    adc->CFGR = ADC_CFGR_OVRMOD | PHASE_CURRENT_ADC_TRIGGER_TIM2_CC2;
-    adc->CFGR2 = 0U;
-    adc->SMPR1 = (adc->SMPR1 & ~ADC_SMPR1_SMP3_Msk) | ADC_SMPR1_SMP_AN3(PHASE_CURRENT_SAMPLE_TIME);
-    adc->SQR1 = ADC_SQR1_SQ1_N(PHASE_CURRENT_ADC_CHANNEL);
-    adc->IER = ADC_IER_EOCIE;
+    adc->SMPR1 =
+        (adc->SMPR1 & ~ADC_SMPR1_SMP3_Msk) |
+        ADC_SMPR1_SMP_AN3(ADC_SMPR_SMP_47P5);
+    adc->JSQR =
+        (0U << ADC_JSQR_JL_Pos) |                  // 1 injected conversion
+        ADC_JSQR_JSQ1 |         // injected rank 1
+        (6U << ADC_JSQR_JEXTSEL_Pos) |             // TIM4_CC4 on STM32G4 ADC1/2 injected
+        ADC_JSQR_JEXTEN_0;                         // rising edge trigger
+    adc->IER = ADC_IER_JEOCIE | ADC_IER_JEOSIE;
     adc->CR |= ADC_CR_ADEN;
-    while ((adc->ISR & ADC_ISR_ADRDY) == 0U) {
-    }
+    while ((adc->ISR & ADC_ISR_ADRDY) == 0U) {}
+
+
+    nvicEnableVector(ADC1_2_IRQn, STM32_ADC_ADC3_IRQ_PRIORITY);
+    adc->CR |= ADC_CR_JADSTART;
 }
 
 void stop_adc_unit(ADC_TypeDef *adc)
@@ -213,6 +221,7 @@ bool init_current_sense()
 
     init_adc_unit(ADC1);
     init_adc_unit(ADC2);
+
     return true;
 #else
     return false;
@@ -249,7 +258,7 @@ void handle_phase_current_sample_isr(uint16_t sample, uint8_t mask)
     }
 }
 
-} // namespace
+}
 
 extern "C" void motor_control_adc1_irq_hook(uint32_t isr);
 extern "C" void motor_control_adc2_irq_hook(uint32_t isr);
@@ -314,7 +323,7 @@ Stm32FocMotorControlInitResult stm32_foc_motor_control_init(const Stm32FocMotorC
     TIM1->SMCR |= TIM_SMCR_MSM;
 
     init_opamps();
-    init_tim2_trigger(driver_state.period_ticks, driver_state.current_sample_delay_ticks);
+    init_tim4_trigger(driver_state.period_ticks, driver_state.current_sample_delay_ticks);
     driver_state.current_sense_ok = init_current_sense();
 
     set_phase_ticks_hw(0U, 0U, 0U);
@@ -344,7 +353,7 @@ void stm32_foc_motor_control_deinit()
     pwmDisablePeriodicNotification(&PWMD1);
     stm32_foc_motor_control_disable_outputs();
     pwmStop(&PWMD1);
-    deinit_tim2_trigger();
+    deinit_tim4_trigger();
     deinit_current_sense();
     deinit_opamps();
 
@@ -408,18 +417,18 @@ void stm32_foc_motor_control_set_phase_ticks_isr(uint16_t phase_u, uint16_t phas
 
 extern "C" void motor_control_adc1_irq_hook(uint32_t isr)
 {
-    if ((isr & ADC_ISR_EOC) == 0U) {
+    if ((isr & ADC_ISR_JEOC) == 0U) {
         return;
     }
-    handle_phase_current_sample_isr(uint16_t(ADC1->DR & 0xFFFFU), PHASE_CURRENT_PENDING_U);
+    handle_phase_current_sample_isr(uint16_t(ADC1->JDR1 & 0xFFFFU), PHASE_CURRENT_PENDING_U);
 }
 
 extern "C" void motor_control_adc2_irq_hook(uint32_t isr)
 {
-    if ((isr & ADC_ISR_EOC) == 0U) {
+    if ((isr & ADC_ISR_JEOC) == 0U) {
         return;
     }
-    handle_phase_current_sample_isr(uint16_t(ADC2->DR & 0xFFFFU), PHASE_CURRENT_PENDING_V);
+    handle_phase_current_sample_isr(uint16_t(ADC2->JDR1 & 0xFFFFU), PHASE_CURRENT_PENDING_V);
 }
 
 } // namespace ChibiOS

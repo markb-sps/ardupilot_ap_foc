@@ -354,6 +354,7 @@ void MotorControl::pwm_period_callback(void *ctx)
     motor->update_open_loop_isr();
 }
 
+// NOTE: Called from interrupt.
 void MotorControl::current_sample_callback(void *ctx, uint16_t sample_u, uint16_t sample_v)
 {
     auto *motor = static_cast<MotorControl *>(ctx);
