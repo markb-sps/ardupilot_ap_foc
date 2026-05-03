@@ -155,8 +155,7 @@ void AP_Periph_FW::init()
                                            phase_current_shunt_input_attenuation *
                                            phase_current_opamp_gain);
         motor_control.init(motor_cfg);
-        vesc_debug.init(hal.serial(0));
-        vesc_debug.set_motor_control(&motor_control);
+
     }
 #endif
 
@@ -626,7 +625,7 @@ void AP_Periph_FW::update()
 
 #if CONFIG_HAL_BOARD == HAL_BOARD_CHIBIOS
     update_motor_test(now);
-    vesc_debug.update();
+
 #endif
 
 #if AP_PERIPH_BATTERY_BALANCE_ENABLED
