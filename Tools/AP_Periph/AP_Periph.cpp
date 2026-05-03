@@ -52,8 +52,8 @@ constexpr uint8_t motor_test_pole_pairs = 14;
 constexpr uint16_t motor_test_zero_settle_ms = 250;
 constexpr uint16_t motor_test_align_hold_ms = 750;
 constexpr uint16_t motor_test_ramp_duration_ms = 40000;
-constexpr uint16_t motor_test_start_rpm = 5;
-constexpr uint16_t motor_test_target_rpm = 10;
+constexpr uint16_t motor_test_start_rpm = 10;
+constexpr uint16_t motor_test_target_rpm = 30;
 }
 
 // not only will the code not compile without features this enables,
@@ -142,11 +142,21 @@ void AP_Periph_FW::init()
         ChibiOS::MotorControl::Config motor_cfg;
         motor_cfg.pwm_clock_hz = 20000000;
         motor_cfg.pwm_frequency_hz = 20000;
-        motor_cfg.current_sample_delay_ticks = 5; //
+        motor_cfg.current_sample_delay_ticks = 5;
         motor_cfg.deadtime_ticks = 3;
         motor_cfg.center_aligned = true;
         motor_cfg.break_input_enabled = false;
+        // Motor electrical parameters — tune to match the specific motor
+        motor_cfg.motor_Rs = 0.1f;    // stator resistance [Ω]
+        motor_cfg.motor_Ls = 50e-6f;  // stator inductance [H]
+        motor_cfg.vbus     = 12.0f;   // nominal DC bus voltage [V]
+        // Exact scale from hardware: 1 / (Rshunt * input_attenuation * opamp_gain)
+        motor_cfg.current_scale = 1.0f / (phase_current_shunt_ohms *
+                                           phase_current_shunt_input_attenuation *
+                                           phase_current_opamp_gain);
         motor_control.init(motor_cfg);
+        vesc_debug.init(hal.serial(0));
+        vesc_debug.set_motor_control(&motor_control);
     }
 #endif
 
@@ -616,6 +626,7 @@ void AP_Periph_FW::update()
 
 #if CONFIG_HAL_BOARD == HAL_BOARD_CHIBIOS
     update_motor_test(now);
+    vesc_debug.update();
 #endif
 
 #if AP_PERIPH_BATTERY_BALANCE_ENABLED
