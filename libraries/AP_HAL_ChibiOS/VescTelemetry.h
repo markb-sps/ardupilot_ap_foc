@@ -36,6 +36,7 @@ private:
 
     void handle_fw_version();
     void handle_get_values();
+    void handle_set_rpm();
 
     static uint16_t crc16(const uint8_t *data, uint16_t len);
 

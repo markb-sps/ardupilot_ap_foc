@@ -477,9 +477,7 @@ void AP_Periph_FW::update_motor_test(uint32_t now_ms)
         return;
     }
 
-    motor_control.set_open_loop_target(2.0f, motor_test_modulation, false);
-
-    printf("adc sample count %d\n\r", motor_control._adc_sample_cb_count);
+    // Setpoint is driven by VESC Tool via VescTelemetry COMM_SET_RPM.
     // if (motor_test_last_cycle_ms == 0) {
     //     motor_test_start_ms = now_ms;
     //     motor_test_last_cycle_ms = now_ms;

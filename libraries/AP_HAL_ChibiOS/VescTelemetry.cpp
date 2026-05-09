@@ -15,6 +15,11 @@ namespace {
 
 constexpr uint8_t COMM_FW_VERSION = 0;
 constexpr uint8_t COMM_GET_VALUES = 4;
+constexpr uint8_t COMM_SET_RPM    = 8;
+
+// Fixed modulation used when VESC Tool issues an RPM setpoint.
+// Open-loop drive — no current control loop yet.
+constexpr float SET_RPM_MODULATION = 0.1f;
 
 constexpr uint8_t FW_MAJOR = 6;
 constexpr uint8_t FW_MINOR = 0;
@@ -154,6 +159,9 @@ void VescTelemetry::dispatch()
     case COMM_GET_VALUES:
         handle_get_values();
         break;
+    case COMM_SET_RPM:
+        handle_set_rpm();
+        break;
     default:
         break; // silently drop everything else
     }
@@ -261,6 +269,22 @@ void VescTelemetry::handle_get_values()
     put_u8 (p, 0);                 // status
 
     send_packet(buf, uint16_t(p - buf));
+}
+
+// COMM_SET_RPM: payload = [cmd, int32 erpm] (big-endian).
+// VESC Tool sends electrical RPM. Convert to electrical Hz and drive open loop.
+void VescTelemetry::handle_set_rpm()
+{
+    if (_payload_len < 5) return;
+    const int32_t erpm = (int32_t(_payload[1]) << 24) |
+                         (int32_t(_payload[2]) << 16) |
+                         (int32_t(_payload[3]) <<  8) |
+                          int32_t(_payload[4]);
+
+    const float electrical_hz = float(erpm) / 60.0f;
+    const float hz_abs = electrical_hz < 0.0f ? -electrical_hz : electrical_hz;
+    const float mod = (erpm == 0) ? 0.0f : SET_RPM_MODULATION;
+    _mc.set_open_loop_target(hz_abs, mod, false);
 }
 
 } // namespace ChibiOS
