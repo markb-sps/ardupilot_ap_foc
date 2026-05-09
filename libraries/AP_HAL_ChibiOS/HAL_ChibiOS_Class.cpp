@@ -99,7 +99,7 @@ static ChibiOS::Storage storageDriver;
 static ChibiOS::GPIO gpioDriver;
 static ChibiOS::RCInput rcinDriver;
 
-#if HAL_USE_PWM == TRUE
+#if HAL_USE_PWM == TRUE && HAL_USE_AP_HAL_RCOUTPUT == TRUE
 static ChibiOS::RCOutput rcoutDriver;
 #else
 static Empty::RCOutput rcoutDriver;

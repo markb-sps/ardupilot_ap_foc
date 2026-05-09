@@ -332,6 +332,7 @@ void AP_Periph_FW::handle_param_getset(CanardInstance* canard_instance, CanardRx
                    total_size);
 }
 
+#if AP_PERIPH_PARAM_EXECUTEOPCODE_ENABLED
 /*
   handle parameter executeopcode request
  */
@@ -380,6 +381,7 @@ void AP_Periph_FW::handle_param_executeopcode(CanardInstance* canard_instance, C
                    &buffer[0],
                    total_size);
 }
+#endif // AP_PERIPH_PARAM_EXECUTEOPCODE_ENABLED
 
 void AP_Periph_FW::handle_begin_firmware_update(CanardInstance* canard_instance, CanardRxTransfer* transfer)
 {
@@ -511,6 +513,7 @@ void AP_Periph_FW::handle_safety_state(CanardInstance* canard_instance, CanardRx
 }
 #endif // HAL_GPIO_PIN_SAFE_LED
 
+#if AP_PERIPH_ARMING_STATUS_ENABLED
 /*
   handle ArmingStatus
  */
@@ -522,6 +525,7 @@ void AP_Periph_FW::handle_arming_status(CanardInstance* canard_instance, CanardR
     }
     hal.util->set_soft_armed(req.status == UAVCAN_EQUIPMENT_SAFETY_ARMINGSTATUS_STATUS_FULLY_ARMED);
 }
+#endif
 
 
 #if AP_PERIPH_RTC_GLOBALTIME_ENABLED
@@ -842,9 +846,11 @@ void AP_Periph_FW::onTransferReceived(CanardInstance* canard_instance,
         handle_param_getset(canard_instance, transfer);
         break;
 
+#if AP_PERIPH_PARAM_EXECUTEOPCODE_ENABLED
     case UAVCAN_PROTOCOL_PARAM_EXECUTEOPCODE_ID:
         handle_param_executeopcode(canard_instance, transfer);
         break;
+#endif
 
 #if AP_PERIPH_BUZZER_WITHOUT_NOTIFY_ENABLED || AP_PERIPH_NOTIFY_ENABLED
     case UAVCAN_EQUIPMENT_INDICATION_BEEPCOMMAND_ID:
@@ -858,9 +864,11 @@ void AP_Periph_FW::onTransferReceived(CanardInstance* canard_instance,
         break;
 #endif
 
+#if AP_PERIPH_ARMING_STATUS_ENABLED
     case UAVCAN_EQUIPMENT_SAFETY_ARMINGSTATUS_ID:
         handle_arming_status(canard_instance, transfer);
         break;
+#endif
 
 #if AP_PERIPH_GPS_ENABLED
     case UAVCAN_EQUIPMENT_GNSS_RTCMSTREAM_ID:
@@ -969,9 +977,11 @@ bool AP_Periph_FW::shouldAcceptTransfer(const CanardInstance* canard_instance,
     case UAVCAN_PROTOCOL_PARAM_GETSET_ID:
         *out_data_type_signature = UAVCAN_PROTOCOL_PARAM_GETSET_SIGNATURE;
         return true;
+#if AP_PERIPH_PARAM_EXECUTEOPCODE_ENABLED
     case UAVCAN_PROTOCOL_PARAM_EXECUTEOPCODE_ID:
         *out_data_type_signature = UAVCAN_PROTOCOL_PARAM_EXECUTEOPCODE_SIGNATURE;
         return true;
+#endif
 #if AP_PERIPH_BUZZER_WITHOUT_NOTIFY_ENABLED || AP_PERIPH_NOTIFY_ENABLED
     case UAVCAN_EQUIPMENT_INDICATION_BEEPCOMMAND_ID:
         *out_data_type_signature = UAVCAN_EQUIPMENT_INDICATION_BEEPCOMMAND_SIGNATURE;
@@ -982,9 +992,11 @@ bool AP_Periph_FW::shouldAcceptTransfer(const CanardInstance* canard_instance,
         *out_data_type_signature = ARDUPILOT_INDICATION_SAFETYSTATE_SIGNATURE;
         return true;
 #endif
+#if AP_PERIPH_ARMING_STATUS_ENABLED
     case UAVCAN_EQUIPMENT_SAFETY_ARMINGSTATUS_ID:
         *out_data_type_signature = UAVCAN_EQUIPMENT_SAFETY_ARMINGSTATUS_SIGNATURE;
         return true;
+#endif
 #if AP_PERIPH_HAVE_LED_WITHOUT_NOTIFY || AP_PERIPH_NOTIFY_ENABLED
     case UAVCAN_EQUIPMENT_INDICATION_LIGHTSCOMMAND_ID:
         *out_data_type_signature = UAVCAN_EQUIPMENT_INDICATION_LIGHTSCOMMAND_SIGNATURE;

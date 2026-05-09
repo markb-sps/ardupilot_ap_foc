@@ -103,7 +103,7 @@ void Util::free_type(void *ptr, size_t size, AP_HAL::Util::Memory_Type mem_type)
  */
 Util::safety_state Util::safety_switch_state(void)
 {
-#if HAL_USE_PWM == TRUE
+#if HAL_USE_PWM == TRUE && HAL_USE_AP_HAL_RCOUTPUT == TRUE
     return ((RCOutput *)hal.rcout)->_safety_switch_state();
 #else
     return SAFETY_NONE;

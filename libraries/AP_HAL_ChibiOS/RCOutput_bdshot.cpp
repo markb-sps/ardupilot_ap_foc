@@ -23,6 +23,11 @@
 #include <AP_Vehicle/AP_Vehicle_Type.h>
 #include <AP_BoardConfig/AP_BoardConfig.h>
 
+// Entire file is a no-op when the AP_HAL_ChibiOS RCOutput layer is disabled,
+// since all symbols here are members of ChibiOS::RCOutput which then is not
+// declared.
+#if HAL_USE_AP_HAL_RCOUTPUT == TRUE
+
 #if HAL_WITH_IO_MCU
 #include <AP_IOMCU/AP_IOMCU.h>
 extern AP_IOMCU iomcu;
@@ -873,3 +878,5 @@ uint32_t RCOutput::read_erpm(uint16_t* erpm, uint8_t len)
 }
 
 #endif // HAL_WITH_BIDIR_DSHOT
+
+#endif // HAL_USE_AP_HAL_RCOUTPUT

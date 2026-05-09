@@ -46,7 +46,7 @@
 #include <AP_HAL/SIMState.h>
 #endif
 
-#if HAL_USE_PWM == TRUE
+#if HAL_USE_PWM == TRUE && HAL_USE_AP_HAL_RCOUTPUT == TRUE
 #include <SRV_Channel/SRV_Channel.h>
 
 using namespace ChibiOS;
@@ -2862,4 +2862,4 @@ void RCOutput::timer_info(ExpandingString &str)
 #endif
 }
 
-#endif // HAL_USE_PWM
+#endif // HAL_USE_PWM && HAL_USE_AP_HAL_RCOUTPUT

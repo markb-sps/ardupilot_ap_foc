@@ -91,6 +91,12 @@ PA14 JTCK-SWCLK SWD
 
 define HAL_USE_ADC TRUE
 define HAL_DISABLE_ADC_DRIVER TRUE
+
+# Keep ChibiOS low-level PWM driver (the FOC code uses pwmStart on TIM1) but
+# disable the AP_HAL_ChibiOS RCOutput layer (NeoPixel/DShot/serial-LED/Shared_DMA).
+# HAL_ChibiOS_Class then uses Empty::RCOutput, freeing several KB of flash.
+define HAL_USE_AP_HAL_RCOUTPUT FALSE
+
 define STM32_ADC_USE_ADC1 TRUE
 define STM32_ADC_USE_ADC2 TRUE
 define STM32_ADC_ADC1_DMA_STREAM STM32_DMA_STREAM_ID(1, 4)
@@ -188,6 +194,11 @@ define AP_SCRIPTING_ENABLED 0
 define AP_NETWORKING_ENABLED 0
 define AP_NETWORKING_BACKEND_DEFAULT_ENABLED 0
 define AP_PERIPH_NETWORKING_ENABLED 0
+
+# DroneCAN message trim: drop ArmingStatus and ExecuteOpcode handlers and codecs
+# (FOC firmware doesn't act on armed state and GetSet already saves params).
+define AP_PERIPH_ARMING_STATUS_ENABLED 0
+define AP_PERIPH_PARAM_EXECUTEOPCODE_ENABLED 0
 
 define HAL_NO_TIMER_THREAD
 define HAL_NO_RCOUT_THREAD

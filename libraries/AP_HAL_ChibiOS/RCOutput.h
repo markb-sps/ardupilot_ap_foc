@@ -23,7 +23,17 @@
 
 #include "shared_dma.h"
 
-#if HAL_USE_PWM == TRUE
+// Allow boards (e.g. dedicated motor-control firmware that drives timers
+// directly) to disable the AP_HAL_ChibiOS RCOutput implementation while
+// keeping the underlying ChibiOS PWM low-level driver enabled. When set
+// FALSE, HAL_ChibiOS_Class falls back to Empty::RCOutput and the heavy
+// RCOutput.cpp body (NeoPixel/DShot/serial-LED/Shared_DMA usage) is not
+// compiled.
+#ifndef HAL_USE_AP_HAL_RCOUTPUT
+#define HAL_USE_AP_HAL_RCOUTPUT TRUE
+#endif
+
+#if HAL_USE_PWM == TRUE && HAL_USE_AP_HAL_RCOUTPUT == TRUE
 
 #if defined(STM32F1)
 #ifdef HAL_WITH_BIDIR_DSHOT
@@ -786,4 +796,4 @@ private:
 #define TOGGLE_PIN_DEBUG(pin) do {} while (0)
 #endif
 
-#endif // HAL_USE_PWM
+#endif // HAL_USE_PWM && HAL_USE_AP_HAL_RCOUTPUT

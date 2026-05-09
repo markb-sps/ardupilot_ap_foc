@@ -102,6 +102,20 @@
 #define AP_PERIPH_SAFETY_SWITCH_ENABLED AP_PERIPH_RC_OUT_ENABLED
 #endif
 
+// Boards that don't act on the vehicle armed state (e.g. self-contained
+// motor-control firmware) can disable this to drop the ArmingStatus
+// handler and codec.
+#ifndef AP_PERIPH_ARMING_STATUS_ENABLED
+#define AP_PERIPH_ARMING_STATUS_ENABLED 1
+#endif
+
+// Param save and erase via ExecuteOpcode are independent of GetSet (which
+// already persists with set_and_save_ifchanged). Boards that don't need
+// remote erase-all can drop this to free a few hundred bytes.
+#ifndef AP_PERIPH_PARAM_EXECUTEOPCODE_ENABLED
+#define AP_PERIPH_PARAM_EXECUTEOPCODE_ENABLED 1
+#endif
+
 #ifndef HAL_PERIPH_CAN_MIRROR
 #define HAL_PERIPH_CAN_MIRROR 0
 #endif
@@ -569,11 +583,15 @@ public:
     // handlers for incoming messages
     void handle_get_node_info(CanardInstance* canard_instance, CanardRxTransfer* transfer);
     void handle_param_getset(CanardInstance* canard_instance, CanardRxTransfer* transfer);
+#if AP_PERIPH_PARAM_EXECUTEOPCODE_ENABLED
     void handle_param_executeopcode(CanardInstance* canard_instance, CanardRxTransfer* transfer);
+#endif
     void handle_begin_firmware_update(CanardInstance* canard_instance, CanardRxTransfer* transfer);
     void handle_allocation_response(CanardInstance* canard_instance, CanardRxTransfer* transfer);
     void handle_safety_state(CanardInstance* canard_instance, CanardRxTransfer* transfer);
+#if AP_PERIPH_ARMING_STATUS_ENABLED
     void handle_arming_status(CanardInstance* canard_instance, CanardRxTransfer* transfer);
+#endif
     void handle_RTCMStream(CanardInstance* canard_instance, CanardRxTransfer* transfer);
     void handle_MovingBaselineData(CanardInstance* canard_instance, CanardRxTransfer* transfer);
     void handle_esc_rawcommand(CanardInstance* canard_instance, CanardRxTransfer* transfer);

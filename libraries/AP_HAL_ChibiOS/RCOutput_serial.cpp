@@ -21,7 +21,7 @@
 #include <AP_InternalError/AP_InternalError.h>
 #include <AP_Vehicle/AP_Vehicle_Type.h>
 
-#if HAL_USE_PWM == TRUE
+#if HAL_USE_PWM == TRUE && HAL_USE_AP_HAL_RCOUTPUT == TRUE
 #if HAL_DSHOT_ENABLED
 
 #if HAL_WITH_IO_MCU
@@ -186,4 +186,4 @@ void RCOutput::update_channel_masks() {
 }
 
 #endif // HAL_DSHOT_ENABLED
-#endif // HAL_USE_PWM
+#endif // HAL_USE_PWM && HAL_USE_AP_HAL_RCOUTPUT
