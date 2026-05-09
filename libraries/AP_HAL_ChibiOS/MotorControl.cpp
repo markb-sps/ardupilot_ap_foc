@@ -189,6 +189,7 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v)
         return;
     }
 
+    _adc_sample_cb_count++;
     // ── Phase current sensing ──────────────────────────────────────────────
     const float u_v = float(int32_t(sample_u) - int32_t(_current_zero_raw[0])) * ADC_LSB_VOLTS;
     const float v_v = float(int32_t(sample_v) - int32_t(_current_zero_raw[1])) * ADC_LSB_VOLTS;

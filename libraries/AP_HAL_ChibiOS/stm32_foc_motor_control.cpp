@@ -31,8 +31,11 @@ constexpr uint32_t PHASE_CURRENT_OPAMP_ENABLED_CSR =
     OPAMP_CSR_PGA_GAIN_16 |
     OPAMP_CSR_OPAMPxEN;
 
-// TIM4_CH4 injected trigger for ADC1/ADC2 on STM32G4: JEXTSEL = 6, rising edge
+// TIM4_TRGO injected trigger for ADC1/ADC2 on STM32G4: JEXTSEL = 5, rising edge.
+// (TIM4_CC4 itself is wired only to ADC3/4/5 on G4; routing CC4 through TIM4_TRGO
+// via MMS = OC4REF gives ADC1/ADC2 the same delayed trigger.)
 constexpr uint32_t PHASE_CURRENT_ADC_CHANNEL    = ADC_CHANNEL_IN3;
+constexpr uint32_t PHASE_CURRENT_ADC_JEXTSEL    = 5U;
 constexpr uint8_t  PHASE_CURRENT_PENDING_U      = 1U;
 constexpr uint8_t  PHASE_CURRENT_PENDING_V      = 2U;
 
@@ -109,10 +112,14 @@ void init_tim4_trigger(uint16_t period_ticks, uint16_t delay_ticks)
         TIM4->CCR4 = period_ticks - 1U;
     }
 
-    // PWM mode 2 on OC4 with preload
-    TIM4->CCMR2 = TIM_CCMR2_OC4PE | TIM_CCMR2_OC4M_1 | TIM_CCMR2_OC4M_2;
+    // PWM mode 2 on OC4 with preload: OC4REF goes high at CNT == CCR4, giving
+    // a rising edge after `delay_ticks` from the TIM1-driven counter reset.
+    TIM4->CCMR2 = TIM_CCMR2_OC4PE | TIM_CCMR2_OC4M_0 | TIM_CCMR2_OC4M_1 | TIM_CCMR2_OC4M_2;
     TIM4->CCER  = TIM_CCER_CC4E;
 
+    // TRGO follows OC4REF so ADC1/ADC2 (which can't see TIM4_CC4 directly on
+    // STM32G4) get the delayed trigger via TIM4_TRGO.
+    TIM4->CR2  = STM32_TIM_CR2_MMS(7U);
     // TIM4 slaves off TIM1 ITR0 in reset mode
     TIM4->SMCR = TIM_SMCR_SMS_2;
     TIM4->CR1  = TIM_CR1_ARPE;
@@ -158,10 +165,10 @@ void init_adc_unit(ADC_TypeDef *adc)
     adc->SMPR1 = (adc->SMPR1 & ~ADC_SMPR1_SMP3_Msk) |
                   ADC_SMPR1_SMP_AN3(ADC_SMPR_SMP_47P5);
     adc->JSQR =
-        (0U << ADC_JSQR_JL_Pos)        |  // 1 injected conversion
-        ADC_JSQR_JSQ1                   |  // rank 1 = IN3
-        (6U << ADC_JSQR_JEXTSEL_Pos)    |  // TIM4_CH4 trigger (STM32G4 ADC1/2)
-        ADC_JSQR_JEXTEN_0;                 // rising edge
+        (0U << ADC_JSQR_JL_Pos)                              |  // 1 injected conversion
+        (PHASE_CURRENT_ADC_CHANNEL << ADC_JSQR_JSQ1_Pos)     |  // rank 1 = IN3
+        (PHASE_CURRENT_ADC_JEXTSEL << ADC_JSQR_JEXTSEL_Pos)  |  // TIM4_TRGO (STM32G4 ADC1/2)
+        ADC_JSQR_JEXTEN_0;                                      // rising edge
     adc->IER = ADC_IER_JEOCIE | ADC_IER_JEOSIE;
     adc->CR |= ADC_CR_ADEN;
     while ((adc->ISR & ADC_ISR_ADRDY) == 0U) {}
@@ -246,8 +253,7 @@ Stm32FocMotorControlInitResult stm32_foc_motor_control_init(const Stm32FocMotorC
         result.ok              = true;
         result.current_sense_ok = driver_state.current_sense_ok;
         result.period_ticks    = driver_state.period_ticks;
-        result.update_rate_hz  = driver_state.period_ticks == 0U ? 0U :
-                                 (setup.pwm_clock_hz / driver_state.period_ticks);
+        result.update_rate_hz  = setup.pwm_frequency_hz;
         return result;
     }
 
@@ -315,7 +321,7 @@ Stm32FocMotorControlInitResult stm32_foc_motor_control_init(const Stm32FocMotorC
     result.ok              = true;
     result.current_sense_ok = driver_state.current_sense_ok;
     result.period_ticks    = driver_state.period_ticks;
-    result.update_rate_hz  = setup.pwm_clock_hz / driver_state.period_ticks;
+    result.update_rate_hz  = setup.pwm_frequency_hz;
 #else
     (void)setup;
     (void)callbacks;

@@ -22,7 +22,7 @@ public:
         float    smo_gain                   = 1.5f;    // switching gain k [A]
         float    smo_cutoff_hz              = 100.0f;  // back-EMF LPF cutoff [Hz]
     };
-
+    volatile uint32_t _adc_sample_cb_count{0};
     MotorControl() = default;
 
     bool init();
@@ -62,6 +62,7 @@ private:
     bool     _current_sense_initialized = false;
     uint16_t _period_ticks              = 0;
     uint32_t _pwm_update_rate_hz        = 0;
+
 
     // Zero calibration
     volatile uint32_t _zero_accum[2]{};

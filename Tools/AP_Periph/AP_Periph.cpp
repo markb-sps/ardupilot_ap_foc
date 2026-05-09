@@ -476,51 +476,54 @@ void AP_Periph_FW::update_motor_test(uint32_t now_ms)
         return;
     }
 
-    if (motor_test_last_cycle_ms == 0) {
-        motor_test_start_ms = now_ms;
-        motor_test_last_cycle_ms = now_ms;
-        printf("motor test zero captured\n\r");
-        return;
-    }
+    motor_control.set_open_loop_target(10.0f, motor_test_modulation, false);
 
-    const uint32_t test_ms = now_ms - motor_test_start_ms;
-    uint16_t target_rpm = 0;
-    if (test_ms < motor_test_align_hold_ms) {
-        motor_control.set_open_loop_target(0.0f, motor_test_modulation, true);
-    } else {
-        const uint32_t ramp_elapsed_ms = test_ms - motor_test_align_hold_ms;
-        if (ramp_elapsed_ms < motor_test_ramp_duration_ms) {
-            target_rpm = motor_test_start_rpm +
-                         uint16_t((uint32_t(motor_test_target_rpm - motor_test_start_rpm) * ramp_elapsed_ms) /
-                                  motor_test_ramp_duration_ms);
-        } else {
-            target_rpm = motor_test_target_rpm;
-        }
-        const float electrical_hz = float(target_rpm * motor_test_pole_pairs) / 60.0f;
-        motor_control.set_open_loop_target(electrical_hz, motor_test_modulation);
-    }
-
-    if (now_ms - motor_test_last_cycle_ms < 1000U) {
-        return;
-    }
-    motor_test_last_cycle_ms = now_ms;
-
-    float u_volts = 0.0f, v_volts = 0.0f, w_volts = 0.0f;
-    motor_control.get_filtered_phase_volts(u_volts, v_volts, w_volts);
-
-    const float phase_current_volts_to_amps =
-        1.0f / (phase_current_shunt_ohms *
-                phase_current_shunt_input_attenuation *
-                phase_current_opamp_gain);
-    const float electrical_hz = float(target_rpm * motor_test_pole_pairs) / 60.0f;
-    printf("motor test %s %uRPM %.2fHz %.1f%%, phase current: U=%.3fA V=%.3fA W=%.3fA\n\r",
-           test_ms < motor_test_align_hold_ms ? "align" : "spin",
-           (unsigned)target_rpm,
-           (double)electrical_hz,
-           (double)(motor_test_modulation * 100.0f),
-           (double)(u_volts * phase_current_volts_to_amps),
-           (double)(v_volts * phase_current_volts_to_amps),
-           (double)(w_volts * phase_current_volts_to_amps));
+    printf("adc sample count %d\n\r", motor_control._adc_sample_cb_count);
+    // if (motor_test_last_cycle_ms == 0) {
+    //     motor_test_start_ms = now_ms;
+    //     motor_test_last_cycle_ms = now_ms;
+    //     printf("motor test zero captured\n\r");
+    //     return;
+    // }
+    //
+    // const uint32_t test_ms = now_ms - motor_test_start_ms;
+    // uint16_t target_rpm = 0;
+    // if (test_ms < motor_test_align_hold_ms) {
+    //     motor_control.set_open_loop_target(0.0f, motor_test_modulation, true);
+    // } else {
+    //     const uint32_t ramp_elapsed_ms = test_ms - motor_test_align_hold_ms;
+    //     if (ramp_elapsed_ms < motor_test_ramp_duration_ms) {
+    //         target_rpm = motor_test_start_rpm +
+    //                      uint16_t((uint32_t(motor_test_target_rpm - motor_test_start_rpm) * ramp_elapsed_ms) /
+    //                               motor_test_ramp_duration_ms);
+    //     } else {
+    //         target_rpm = motor_test_target_rpm;
+    //     }
+    //     const float electrical_hz = float(target_rpm * motor_test_pole_pairs) / 60.0f;
+    //     motor_control.set_open_loop_target(electrical_hz, motor_test_modulation);
+    // }
+    //
+    // if (now_ms - motor_test_last_cycle_ms < 1000U) {
+    //     return;
+    // }
+    // motor_test_last_cycle_ms = now_ms;
+    //
+    // float u_volts = 0.0f, v_volts = 0.0f, w_volts = 0.0f;
+    // motor_control.get_filtered_phase_volts(u_volts, v_volts, w_volts);
+    //
+    // const float phase_current_volts_to_amps =
+    //     1.0f / (phase_current_shunt_ohms *
+    //             phase_current_shunt_input_attenuation *
+    //             phase_current_opamp_gain);
+    // const float electrical_hz = float(target_rpm * motor_test_pole_pairs) / 60.0f;
+    // printf("motor test %s %uRPM %.2fHz %.1f%%, phase current: U=%.3fA V=%.3fA W=%.3fA\n\r",
+    //        test_ms < motor_test_align_hold_ms ? "align" : "spin",
+    //        (unsigned)target_rpm,
+    //        (double)electrical_hz,
+    //        (double)(motor_test_modulation * 100.0f),
+    //        (double)(u_volts * phase_current_volts_to_amps),
+    //        (double)(v_volts * phase_current_volts_to_amps),
+    //        (double)(w_volts * phase_current_volts_to_amps));
 }
 #endif
 
