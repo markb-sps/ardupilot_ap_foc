@@ -164,6 +164,31 @@ bool MotorControl::get_filtered_phase_volts(float &u, float &v, float &w) const
     return true;
 }
 
+bool MotorControl::get_phase_currents(float &ia, float &ib, float &ic) const
+{
+    float u, v, w;
+    if (!get_filtered_phase_volts(u, v, w)) {
+        return false;
+    }
+    ia = u * _current_scale;
+    ib = v * _current_scale;
+    ic = w * _current_scale;
+    return true;
+}
+
+bool MotorControl::get_idq(float &id, float &iq) const
+{
+    float ia, ib, ic;
+    if (!get_phase_currents(ia, ib, ic)) {
+        return false;
+    }
+    float i_alpha, i_beta;
+    FOC::clarke(ia, ib, i_alpha, i_beta);
+    const float theta = _smo_theta;
+    FOC::park(i_alpha, i_beta, sinf(theta), cosf(theta), id, iq);
+    return true;
+}
+
 // ── ISR path ────────────────────────────────────────────────────────────────
 
 void MotorControl::adc_sample_callback(void *ctx, uint16_t sample_u, uint16_t sample_v)

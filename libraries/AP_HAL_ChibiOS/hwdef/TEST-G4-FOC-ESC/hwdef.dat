@@ -65,7 +65,8 @@ PA15 LED OUTPUT LOW
 #PA12 LED_B OUTPUT LOW
 
 # allow for reboot command for faster development
-define HAL_PERIPH_LISTEN_FOR_SERIAL_UART_REBOOT_CMD_PORT 0
+# disabled while VESC telemetry owns USB CDC (serial 0)
+#define HAL_PERIPH_LISTEN_FOR_SERIAL_UART_REBOOT_CMD_PORT 0
 
 # debugger support
 PA13 JTMS-SWDIO SWD

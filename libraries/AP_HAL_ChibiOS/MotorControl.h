@@ -40,6 +40,8 @@ public:
     uint16_t period_ticks()          const { return _initialized ? _period_ticks : 0U; }
     bool     current_sense_ready()   const { return _current_sense_initialized; }
     bool     get_filtered_phase_volts(float &u, float &v, float &w) const;
+    bool     get_phase_currents(float &ia, float &ib, float &ic) const;
+    bool     get_idq(float &id, float &iq) const;
     float    get_estimated_angle()   const { return _smo_theta; }
     float    get_open_loop_hz()      const {
         if (_pwm_update_rate_hz == 0) return 0.0f;

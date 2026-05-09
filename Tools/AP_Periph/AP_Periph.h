@@ -52,6 +52,7 @@
 #include <AP_DAC/AP_DAC.h>
 #if CONFIG_HAL_BOARD == HAL_BOARD_CHIBIOS
 #include <AP_HAL_ChibiOS/MotorControl.h>
+#include <AP_HAL_ChibiOS/VescTelemetry.h>
 #endif
 
 #if AP_PERIPH_RELAY_ENABLED
@@ -466,6 +467,7 @@ public:
 
 #if CONFIG_HAL_BOARD == HAL_BOARD_CHIBIOS
     ChibiOS::MotorControl motor_control;
+    ChibiOS::VescTelemetry vesc_telem{motor_control, 7};
     uint32_t motor_test_last_cycle_ms;
     uint32_t motor_test_start_ms;
 #endif

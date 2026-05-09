@@ -156,6 +156,7 @@ void AP_Periph_FW::init()
                                            phase_current_opamp_gain);
         motor_control.init(motor_cfg);
 
+        vesc_telem.init(hal.serial(0));
     }
 #endif
 
@@ -476,7 +477,7 @@ void AP_Periph_FW::update_motor_test(uint32_t now_ms)
         return;
     }
 
-    motor_control.set_open_loop_target(10.0f, motor_test_modulation, false);
+    motor_control.set_open_loop_target(2.0f, motor_test_modulation, false);
 
     printf("adc sample count %d\n\r", motor_control._adc_sample_cb_count);
     // if (motor_test_last_cycle_ms == 0) {
@@ -628,7 +629,7 @@ void AP_Periph_FW::update()
 
 #if CONFIG_HAL_BOARD == HAL_BOARD_CHIBIOS
     update_motor_test(now);
-
+    vesc_telem.update();
 #endif
 
 #if AP_PERIPH_BATTERY_BALANCE_ENABLED
