@@ -19,7 +19,7 @@ constexpr uint8_t COMM_SET_RPM    = 8;
 
 // Fixed modulation used when VESC Tool issues an RPM setpoint.
 // Open-loop drive — no current control loop yet.
-constexpr float SET_RPM_MODULATION = 0.1f;
+constexpr float SET_RPM_MODULATION = 0.05f;
 
 constexpr uint8_t FW_MAJOR = 6;
 constexpr uint8_t FW_MINOR = 0;

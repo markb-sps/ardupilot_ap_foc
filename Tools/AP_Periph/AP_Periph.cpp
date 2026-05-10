@@ -147,9 +147,9 @@ void AP_Periph_FW::init()
         motor_cfg.center_aligned = true;
         motor_cfg.break_input_enabled = false;
         // Motor electrical parameters — tune to match the specific motor
-        motor_cfg.motor_Rs = 0.1f;    // stator resistance [Ω]
-        motor_cfg.motor_Ls = 50e-6f;  // stator inductance [H]
-        motor_cfg.vbus     = 12.0f;   // nominal DC bus voltage [V]
+        motor_cfg.motor_Rs = 0.04f;    // stator resistance [Ω]
+        motor_cfg.motor_Ls = 40e-6f;  // stator inductance [H]
+        motor_cfg.vbus     = 18.0f;   // nominal DC bus voltage [V]
         // Exact scale from hardware: 1 / (Rshunt * input_attenuation * opamp_gain)
         motor_cfg.current_scale = 1.0f / (phase_current_shunt_ohms *
                                            phase_current_shunt_input_attenuation *

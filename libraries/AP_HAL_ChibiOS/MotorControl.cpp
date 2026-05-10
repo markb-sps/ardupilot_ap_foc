@@ -112,7 +112,7 @@ void MotorControl::set_open_loop_target(float electrical_hz, float modulation, b
         return;
     }
 
-    _open_loop_amplitude = (modulation <= 0.0f) ? 0.0f : (modulation > 1.0f ? 1.0f : modulation);
+    _open_loop_amplitude = (modulation <= 0.0f) ? 0.0f : (modulation > 0.1 ? 0.1f : modulation);
 
     if (reset_phase) {
         _open_loop_phase = 0;
