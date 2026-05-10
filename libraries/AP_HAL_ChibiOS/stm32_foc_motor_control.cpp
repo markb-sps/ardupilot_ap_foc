@@ -31,11 +31,12 @@ constexpr uint32_t PHASE_CURRENT_OPAMP_ENABLED_CSR =
     OPAMP_CSR_PGA_GAIN_16 |
     OPAMP_CSR_OPAMPxEN;
 
-// TIM4_TRGO injected trigger for ADC1/ADC2 on STM32G4: JEXTSEL = 5, rising edge.
-// (TIM4_CC4 itself is wired only to ADC3/4/5 on G4; routing CC4 through TIM4_TRGO
-// via MMS = OC4REF gives ADC1/ADC2 the same delayed trigger.)
+// TIM1_TRGO2 injected trigger for ADC1/ADC2 on STM32G4: JEXTSEL = 8, rising edge.
+// TRGO2 sources OC4REF; with centre-aligned PWM mode 1 the OC4REF level has a
+// single rising edge per period (when CNT counts down through CCR4), giving one
+// ADC trigger per PWM cycle without needing an auxiliary timer.
 constexpr uint32_t PHASE_CURRENT_ADC_CHANNEL    = ADC_CHANNEL_IN3;
-constexpr uint32_t PHASE_CURRENT_ADC_JEXTSEL    = 5U;
+constexpr uint32_t PHASE_CURRENT_ADC_JEXTSEL    = 8U;
 constexpr uint8_t  PHASE_CURRENT_PENDING_U      = 1U;
 constexpr uint8_t  PHASE_CURRENT_PENDING_V      = 2U;
 
@@ -92,47 +93,23 @@ void deinit_opamps()
 #endif
 }
 
-void init_tim4_trigger(uint16_t period_ticks, uint16_t delay_ticks)
+void init_tim1_adc_trigger(uint16_t period_ticks, uint16_t delay_ticks)
 {
-    rccEnableTIM4(true);
-    rccResetTIM4();
+    // OC4REF in PWM mode 1: high while CNT < CCR4.  In centre-aligned mode
+    // OC4REF has exactly one rising edge per period (when the down-counter
+    // crosses CCR4).  Place that edge `delay_ticks` past the peak so the ADC
+    // samples while the low-side FETs are still conducting.
+    const uint16_t ccr4 = (period_ticks > delay_ticks)
+                              ? uint16_t(period_ticks - delay_ticks)
+                              : uint16_t((period_ticks > 1U) ? (period_ticks - 1U) : 1U);
 
-    TIM4->CR1   = 0U;
-    TIM4->CR2   = 0U;
-    TIM4->SMCR  = 0U;
-    TIM4->DIER  = 0U;
-    TIM4->CCER  = 0U;
-    TIM4->CCMR2 = 0U;
-    TIM4->CNT   = 0U;
-    TIM4->PSC   = 0U;
-    TIM4->ARR   = 0xFFFFU;
-    TIM4->CCR4  = (delay_ticks == 0U) ? 1U : delay_ticks;
-
-    if (period_ticks > 1U && TIM4->CCR4 >= period_ticks) {
-        TIM4->CCR4 = period_ticks - 1U;
-    }
-
-    // PWM mode 2 on OC4 with preload: OC4REF goes high at CNT == CCR4, giving
-    // a rising edge after `delay_ticks` from the TIM1-driven counter reset.
-    TIM4->CCMR2 = TIM_CCMR2_OC4PE | TIM_CCMR2_OC4M_0 | TIM_CCMR2_OC4M_1 | TIM_CCMR2_OC4M_2;
-    TIM4->CCER  = TIM_CCER_CC4E;
-
-    // TRGO follows OC4REF so ADC1/ADC2 (which can't see TIM4_CC4 directly on
-    // STM32G4) get the delayed trigger via TIM4_TRGO.
-    TIM4->CR2  = STM32_TIM_CR2_MMS(7U);
-    // TIM4 slaves off TIM1 ITR0 in reset mode
-    TIM4->SMCR = TIM_SMCR_SMS_2;
-    TIM4->CR1  = TIM_CR1_ARPE;
-    TIM4->EGR  = TIM_EGR_UG;
-    TIM4->CR1 |= TIM_CR1_CEN;
-}
-
-void deinit_tim4_trigger()
-{
-    TIM4->CR1  = 0U;
-    TIM4->DIER = 0U;
-    TIM4->CCER = 0U;
-    rccDisableTIM4();
+    TIM1->CCR4   = ccr4;
+    TIM1->CCMR2  = (TIM1->CCMR2 & ~(TIM_CCMR2_CC4S | TIM_CCMR2_OC4M |
+                                    TIM_CCMR2_OC4PE | TIM_CCMR2_OC4FE | TIM_CCMR2_OC4CE))
+                   | TIM_CCMR2_OC4M_1 | TIM_CCMR2_OC4M_2;            // PWM mode 1
+    TIM1->CCER  |= TIM_CCER_CC4E;
+    TIM1->CR2    = (TIM1->CR2 & ~TIM_CR2_MMS2)
+                   | TIM_CR2_MMS2_0 | TIM_CR2_MMS2_1 | TIM_CR2_MMS2_2;  // TRGO2 = OC4REF
 }
 
 void calibrate_adc(ADC_TypeDef *adc)
@@ -300,13 +277,8 @@ Stm32FocMotorControlInitResult stm32_foc_motor_control_init(const Stm32FocMotorC
         TIM1->CR1 |=  STM32_TIM_CR1_CMS(1);
     }
 
-    // TIM1 TRGO = Update event; enable master sync for TIM4
-    TIM1->CR2  &= ~TIM_CR2_MMS;
-    TIM1->CR2  |= STM32_TIM_CR2_MMS(2U);
-    TIM1->SMCR |= TIM_SMCR_MSM;
-
     init_opamps();
-    init_tim4_trigger(driver_state.period_ticks, driver_state.current_sample_delay_ticks);
+    init_tim1_adc_trigger(driver_state.period_ticks, driver_state.current_sample_delay_ticks);
     driver_state.current_sense_ok = init_current_sense();
 
     // Zero duty, outputs gated (MOE cleared)
@@ -338,7 +310,6 @@ void stm32_foc_motor_control_deinit()
     }
     stm32_foc_motor_control_disable_outputs();
     pwmStop(&PWMD1);
-    deinit_tim4_trigger();
     deinit_current_sense();
     deinit_opamps();
     driver_state = {};

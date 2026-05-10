@@ -196,8 +196,8 @@ void MotorControl::adc_sample_callback(void *ctx, uint16_t sample_u, uint16_t sa
     static_cast<MotorControl *>(ctx)->adc_sample_isr(sample_u, sample_v);
 }
 
-// Called from ADC JEOC ISR at _pwm_update_rate_hz (typically 40 kHz for
-// centre-aligned 20 kHz carrier).  Performs the full FOC cycle:
+// Called from ADC JEOC ISR once per PWM period (e.g. 20 kHz for a 20 kHz
+// centre-aligned carrier).  Performs the full FOC cycle:
 //   1. zero calibration  2. current sensing  3. SMO update
 //   4. open-loop phase advance  5. SVPWM  6. CCR write
 void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v)
