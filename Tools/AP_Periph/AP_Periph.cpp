@@ -48,7 +48,7 @@ constexpr float phase_current_shunt_input_attenuation =
      (1.0f / phase_current_pullup_ohms) +
      (1.0f / phase_current_pulldown_ohms));
 constexpr float motor_test_modulation = 0.1f;
-constexpr uint8_t motor_test_pole_pairs = 14;
+constexpr uint8_t motor_test_pole_pairs = 7;   // BDUAV 6374-170kv: 14 magnets = 7 pole pairs
 constexpr uint16_t motor_test_zero_settle_ms = 250;
 constexpr uint16_t motor_test_align_hold_ms = 750;
 constexpr uint16_t motor_test_ramp_duration_ms = 40000;
@@ -146,10 +146,12 @@ void AP_Periph_FW::init()
         motor_cfg.deadtime_ticks = 3;
         motor_cfg.center_aligned = true;
         motor_cfg.break_input_enabled = false;
-        // Motor electrical parameters — tune to match the specific motor
-        motor_cfg.motor_Rs = 0.04f;    // stator resistance [Ω]
-        motor_cfg.motor_Ls = 40e-6f;  // stator inductance [H]
-        motor_cfg.vbus     = 18.0f;   // nominal DC bus voltage [V]
+        // Motor electrical parameters — used only by the SMO observer.
+        // BDUAV 6374-170kv: ballpark from typical 6374 low-Kv class. Re-tune if
+        // SMO ê fails to respond to a hand-loaded rotor.
+        motor_cfg.motor_Rs          = 0.06f;    // stator resistance [Ω]
+        motor_cfg.motor_Ls          = 80e-6f;   // stator inductance [H]
+        motor_cfg.smo_vbus_nominal  = 18.0f;    // assumed bus for SMO physics only [V]
         // Exact scale from hardware: 1 / (Rshunt * input_attenuation * opamp_gain)
         motor_cfg.current_scale = 1.0f / (phase_current_shunt_ohms *
                                            phase_current_shunt_input_attenuation *
