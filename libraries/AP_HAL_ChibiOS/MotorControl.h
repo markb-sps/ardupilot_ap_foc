@@ -103,10 +103,6 @@ public:
     void  get_phase_currents(float &ia, float &ib, float &ic) const {
         ia = _t_ia; ib = _t_ib; ic = -(_t_ia + _t_ib);
     }
-    // Raw ADC counts and captured zero offsets — current-sense path diagnostics.
-    void  get_raw_adc(uint16_t &u, uint16_t &v, uint16_t &zu, uint16_t &zv) const {
-        u = _t_raw_u; v = _t_raw_v; zu = _current_zero_raw[0]; zv = _current_zero_raw[1];
-    }
     float get_motor_current() const { return _t_iq; }      // q-axis ≈ torque current
     float get_duty()          const { return _t_duty; }    // modulation [0..1]
     float get_erpm()          const { return _t_erpm; }    // electrical RPM
@@ -204,8 +200,6 @@ private:
     volatile float   _t_erpm  = 0.0f;
     volatile float   _t_theta = 0.0f;
     volatile float   _t_obs_theta = 0.0f;
-    volatile uint16_t _t_raw_u = 0;  // latest raw ADC count, phase U
-    volatile uint16_t _t_raw_v = 0;  // latest raw ADC count, phase V
 };
 
 } // namespace ChibiOS

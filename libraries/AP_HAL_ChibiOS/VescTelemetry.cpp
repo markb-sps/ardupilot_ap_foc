@@ -242,31 +242,24 @@ void VescTelemetry::handle_get_values()
     const float duty    = _mc.get_duty();
     const float erpm    = _mc.get_erpm();          // electrical RPM (VESC convention)
 
-    // Raw ADC diagnostics (overloaded into unused fields, scale 1 = plain count).
-    uint16_t raw_u = 0, raw_v = 0, zero_u = 0, zero_v = 0;
-    _mc.get_raw_adc(raw_u, raw_v, zero_u, zero_v);
-
     put_u8 (p, COMM_GET_VALUES);
-    put_f16(p, 25.0f,    10.0f);   // temp_mos
-    put_f16(p, 25.0f,    10.0f);   // temp_motor
+    put_f16(p, 25.0f,    10.0f);   // temp_mos   (no sensor yet — placeholder)
+    put_f16(p, 25.0f,    10.0f);   // temp_motor (no sensor yet — placeholder)
     put_f32(p, i_motor,  100.0f);  // current_motor [A * 100]
-    put_f32(p, float(raw_u), 1.0f);// current_in  ← raw_u count
+    put_f32(p, 0.0f,     100.0f);  // current_in (not measured)
     put_f32(p, id,       100.0f);  // id
     put_f32(p, iq,       100.0f);  // iq
     put_f16(p, duty,     1000.0f); // duty
     put_f32(p, erpm,     1.0f);    // rpm (electrical)
     put_f16(p, v_in,     10.0f);   // v_in
-    put_f32(p, float(raw_v),  1.0f);// amp_hours          ← raw_v count
-    put_f32(p, float(zero_u), 1.0f);// amp_hours_charged  ← zero_u count
-    put_f32(p, float(zero_v), 1.0f);// watt_hours         ← zero_v count
+    put_f32(p, 0.0f,     10000.0f);// amp_hours
+    put_f32(p, 0.0f,     10000.0f);// amp_hours_charged
+    put_f32(p, 0.0f,     10000.0f);// watt_hours
     put_f32(p, 0.0f,     10000.0f);// watt_hours_charged
     put_i32(p, _mc.get_state());   // tachometer ← FOC state (0=IDLE 1=ALIGN 2=OPENLOOP 3=BLEND 4=CLOSED 5=FAULT 6=DEBUG)
     put_i32(p, 0);                 // tachometer_abs
     put_u8 (p, _mc.get_fault());   // fault_code
-    // pid_pos repurposed: observer rotor angle [deg, 0..360] for sensorless debug.
-    float obs_deg = _mc.get_observer_angle() * 57.2957795f;
-    if (obs_deg < 0.0f) obs_deg += 360.0f;
-    put_f32(p, obs_deg,  1000000.0f); // pid_pos ← observer angle [deg]
+    put_f32(p, 0.0f,     1000000.0f); // pid_pos (position control not used)
     put_u8 (p, 0);                 // controller_id (vesc_id)
     put_f16(p, 25.0f,    10.0f);   // temp_mos_1
     put_f16(p, 25.0f,    10.0f);   // temp_mos_2

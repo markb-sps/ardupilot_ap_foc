@@ -262,8 +262,6 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v)
         return;
     }
     _adc_sample_cb_count++;
-    _t_raw_u = sample_u;   // raw counts for current-sense diagnostics
-    _t_raw_v = sample_v;
 
     // ── Phase currents ──────────────────────────────────────────────────────
     // Low-side shunt polarity: positive phase current pulls the amplified ADC
