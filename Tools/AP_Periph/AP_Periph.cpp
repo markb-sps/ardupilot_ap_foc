@@ -47,13 +47,6 @@ constexpr float phase_current_shunt_input_attenuation =
     ((1.0f / phase_current_input_resistor_ohms) +
      (1.0f / phase_current_pullup_ohms) +
      (1.0f / phase_current_pulldown_ohms));
-constexpr float motor_test_modulation = 0.1f;
-constexpr uint8_t motor_test_pole_pairs = 7;   // BDUAV 6374-170kv: 14 magnets = 7 pole pairs
-constexpr uint16_t motor_test_zero_settle_ms = 250;
-constexpr uint16_t motor_test_align_hold_ms = 750;
-constexpr uint16_t motor_test_ramp_duration_ms = 40000;
-constexpr uint16_t motor_test_start_rpm = 10;
-constexpr uint16_t motor_test_target_rpm = 30;
 }
 
 // not only will the code not compile without features this enables,
@@ -146,12 +139,18 @@ void AP_Periph_FW::init()
         motor_cfg.deadtime_ticks = 3;
         motor_cfg.center_aligned = true;
         motor_cfg.break_input_enabled = false;
-        // Motor electrical parameters — used only by the SMO observer.
-        // BDUAV 6374-170kv: ballpark from typical 6374 low-Kv class. Re-tune if
-        // SMO ê fails to respond to a hand-loaded rotor.
-        motor_cfg.motor_Rs          = 0.06f;    // stator resistance [Ω]
-        motor_cfg.motor_Ls          = 80e-6f;   // stator inductance [H]
-        motor_cfg.smo_vbus_nominal  = 18.0f;    // assumed bus for SMO physics only [V]
+        // BDUAV 6374-170kv electrical parameters (tune on hardware via VESC Tool).
+        motor_cfg.motor_Rs   = 0.06f;    // phase resistance [Ω]
+        motor_cfg.motor_Ls   = 80e-6f;   // phase inductance [H]
+        motor_cfg.motor_flux = 4.6e-3f;  // PM flux linkage λ [Wb] (≈60/(√3·π·Kv·poles))
+        motor_cfg.vbus       = 18.0f;    // DC bus [V] (fixed until bus ADC added)
+        // Conservative limits for first bring-up — raise once verified.
+        motor_cfg.current_max      = 15.0f;
+        motor_cfg.overcurrent_trip = 30.0f;
+        motor_cfg.openloop_current = 8.0f;
+        // Outer speed PI — strong enough to reject load (tune: ↑ if sluggish, ↓ if hunting).
+        motor_cfg.speed_kp = 0.005f;   // [A per eRPM]
+        motor_cfg.speed_ki = 0.05f;    // [A per eRPM·s]
         // Exact scale from hardware: 1 / (Rshunt * input_attenuation * opamp_gain)
         motor_cfg.current_scale = 1.0f / (phase_current_shunt_ohms *
                                            phase_current_shunt_input_attenuation *
@@ -466,65 +465,21 @@ void AP_Periph_FW::show_stack_free()
 #endif
 
 #if CONFIG_HAL_BOARD == HAL_BOARD_CHIBIOS
+// Manage the output stage from thread context. Set-points (current / RPM) come
+// from VESC Tool through VescTelemetry; the FOC control cycle itself runs in the
+// ADC ISR. The bridge is gated off until zero-current calibration completes and
+// is cut on any latched fault.
 void AP_Periph_FW::update_motor_test(uint32_t now_ms)
 {
     if (!motor_control.is_initialized()) {
         return;
     }
-
-    motor_control.enable_outputs();
-
-    if (!motor_control.zero_valid()) {
-        motor_control.set_open_loop_target(0.0f, 0.0f, false);
-        return;
+    motor_control.check_command_timeout(now_ms);  // coast if host stopped commanding
+    if (motor_control.is_active()) {
+        motor_control.enable_outputs();
+    } else {
+        motor_control.disable_outputs();
     }
-
-    // Setpoint is driven by VESC Tool via VescTelemetry COMM_SET_RPM.
-    // if (motor_test_last_cycle_ms == 0) {
-    //     motor_test_start_ms = now_ms;
-    //     motor_test_last_cycle_ms = now_ms;
-    //     printf("motor test zero captured\n\r");
-    //     return;
-    // }
-    //
-    // const uint32_t test_ms = now_ms - motor_test_start_ms;
-    // uint16_t target_rpm = 0;
-    // if (test_ms < motor_test_align_hold_ms) {
-    //     motor_control.set_open_loop_target(0.0f, motor_test_modulation, true);
-    // } else {
-    //     const uint32_t ramp_elapsed_ms = test_ms - motor_test_align_hold_ms;
-    //     if (ramp_elapsed_ms < motor_test_ramp_duration_ms) {
-    //         target_rpm = motor_test_start_rpm +
-    //                      uint16_t((uint32_t(motor_test_target_rpm - motor_test_start_rpm) * ramp_elapsed_ms) /
-    //                               motor_test_ramp_duration_ms);
-    //     } else {
-    //         target_rpm = motor_test_target_rpm;
-    //     }
-    //     const float electrical_hz = float(target_rpm * motor_test_pole_pairs) / 60.0f;
-    //     motor_control.set_open_loop_target(electrical_hz, motor_test_modulation);
-    // }
-    //
-    // if (now_ms - motor_test_last_cycle_ms < 1000U) {
-    //     return;
-    // }
-    // motor_test_last_cycle_ms = now_ms;
-    //
-    // float u_volts = 0.0f, v_volts = 0.0f, w_volts = 0.0f;
-    // motor_control.get_filtered_phase_volts(u_volts, v_volts, w_volts);
-    //
-    // const float phase_current_volts_to_amps =
-    //     1.0f / (phase_current_shunt_ohms *
-    //             phase_current_shunt_input_attenuation *
-    //             phase_current_opamp_gain);
-    // const float electrical_hz = float(target_rpm * motor_test_pole_pairs) / 60.0f;
-    // printf("motor test %s %uRPM %.2fHz %.1f%%, phase current: U=%.3fA V=%.3fA W=%.3fA\n\r",
-    //        test_ms < motor_test_align_hold_ms ? "align" : "spin",
-    //        (unsigned)target_rpm,
-    //        (double)electrical_hz,
-    //        (double)(motor_test_modulation * 100.0f),
-    //        (double)(u_volts * phase_current_volts_to_amps),
-    //        (double)(v_volts * phase_current_volts_to_amps),
-    //        (double)(w_volts * phase_current_volts_to_amps));
 }
 #endif
 

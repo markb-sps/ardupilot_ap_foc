@@ -33,6 +33,9 @@ void stm32_foc_motor_control_deinit();
 void stm32_foc_motor_control_enable_outputs();
 void stm32_foc_motor_control_disable_outputs();
 
+// ISR-safe output cut: bare MOE clear, no OS lock. Call only from ISR context.
+void stm32_foc_motor_control_disable_outputs_isr();
+
 // Write CCR values directly — must be called from ISR context (no syslock).
 void stm32_foc_motor_control_write_pwm(uint16_t phase_u, uint16_t phase_v, uint16_t phase_w);
 

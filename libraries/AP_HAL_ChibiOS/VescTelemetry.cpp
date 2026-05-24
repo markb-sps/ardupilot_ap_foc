@@ -15,11 +15,9 @@ namespace {
 
 constexpr uint8_t COMM_FW_VERSION = 0;
 constexpr uint8_t COMM_GET_VALUES = 4;
+constexpr uint8_t COMM_SET_DUTY   = 5;
+constexpr uint8_t COMM_SET_CURRENT = 6;
 constexpr uint8_t COMM_SET_RPM    = 8;
-
-// Fixed modulation used when VESC Tool issues an RPM setpoint.
-// Open-loop drive — no current control loop yet.
-constexpr float SET_RPM_MODULATION = 0.05f;
 
 constexpr uint8_t FW_MAJOR = 6;
 constexpr uint8_t FW_MINOR = 0;
@@ -152,12 +150,21 @@ void VescTelemetry::feed_byte(uint8_t b)
 void VescTelemetry::dispatch()
 {
     if (_payload_len < 1) return;
+    // Any CRC-valid packet (set-point, GET_VALUES poll, COMM_ALIVE) means the
+    // host is alive — pet the comms failsafe so it only coasts on real loss.
+    _mc.notify_host_alive();
     switch (_payload[0]) {
     case COMM_FW_VERSION:
         handle_fw_version();
         break;
     case COMM_GET_VALUES:
         handle_get_values();
+        break;
+    case COMM_SET_DUTY:
+        handle_set_duty();
+        break;
+    case COMM_SET_CURRENT:
+        handle_set_current();
         break;
     case COMM_SET_RPM:
         handle_set_rpm();
@@ -225,54 +232,79 @@ void VescTelemetry::handle_get_values()
     uint8_t buf[80];
     uint8_t *p = buf;
 
-    float ia = 0, ib = 0, ic = 0;
-    _mc.get_phase_currents(ia, ib, ic);
-
     float id = 0, iq = 0;
     _mc.get_idq(id, iq);
+    float vd = 0, vq = 0;
+    _mc.get_vdq(vd, vq);
 
-    // Motor current: VESC graphs this as the headline RT current.
-    // Use peak phase magnitude (max |ia|,|ib|,|ic|) so the user sees real amps.
-    float i_motor = fabsf(ia);
-    if (fabsf(ib) > i_motor) i_motor = fabsf(ib);
-    if (fabsf(ic) > i_motor) i_motor = fabsf(ic);
+    const float i_motor = _mc.get_motor_current(); // q-axis (torque) current [A]
+    const float v_in    = _mc.get_vbus();
+    const float duty    = _mc.get_duty();
+    const float erpm    = _mc.get_erpm();          // electrical RPM (VESC convention)
 
-    const float v_in   = _mc.get_vbus();
-    const float duty   = _mc.get_open_loop_amplitude();
-    const float erpm   = _mc.get_open_loop_hz() * 60.0f;
-    const float rpm    = (_pole_pairs > 0) ? (erpm / float(_pole_pairs)) : erpm;
+    // Raw ADC diagnostics (overloaded into unused fields, scale 1 = plain count).
+    uint16_t raw_u = 0, raw_v = 0, zero_u = 0, zero_v = 0;
+    _mc.get_raw_adc(raw_u, raw_v, zero_u, zero_v);
 
     put_u8 (p, COMM_GET_VALUES);
     put_f16(p, 25.0f,    10.0f);   // temp_mos
     put_f16(p, 25.0f,    10.0f);   // temp_motor
     put_f32(p, i_motor,  100.0f);  // current_motor [A * 100]
-    put_f32(p, 0.0f,     100.0f);  // current_in
+    put_f32(p, float(raw_u), 1.0f);// current_in  ← raw_u count
     put_f32(p, id,       100.0f);  // id
     put_f32(p, iq,       100.0f);  // iq
     put_f16(p, duty,     1000.0f); // duty
-    put_f32(p, rpm,      1.0f);    // rpm
+    put_f32(p, erpm,     1.0f);    // rpm (electrical)
     put_f16(p, v_in,     10.0f);   // v_in
-    put_f32(p, 0.0f,     10000.0f);// amp_hours
-    put_f32(p, 0.0f,     10000.0f);// amp_hours_charged
-    put_f32(p, 0.0f,     10000.0f);// watt_hours
+    put_f32(p, float(raw_v),  1.0f);// amp_hours          ← raw_v count
+    put_f32(p, float(zero_u), 1.0f);// amp_hours_charged  ← zero_u count
+    put_f32(p, float(zero_v), 1.0f);// watt_hours         ← zero_v count
     put_f32(p, 0.0f,     10000.0f);// watt_hours_charged
-    put_i32(p, 0);                 // tachometer
+    put_i32(p, _mc.get_state());   // tachometer ← FOC state (0=IDLE 1=ALIGN 2=OPENLOOP 3=BLEND 4=CLOSED 5=FAULT 6=DEBUG)
     put_i32(p, 0);                 // tachometer_abs
-    put_u8 (p, 0);                 // fault_code
-    put_f32(p, 0.0f,     1000000.0f); // pid_pos
+    put_u8 (p, _mc.get_fault());   // fault_code
+    // pid_pos repurposed: observer rotor angle [deg, 0..360] for sensorless debug.
+    float obs_deg = _mc.get_observer_angle() * 57.2957795f;
+    if (obs_deg < 0.0f) obs_deg += 360.0f;
+    put_f32(p, obs_deg,  1000000.0f); // pid_pos ← observer angle [deg]
     put_u8 (p, 0);                 // controller_id (vesc_id)
     put_f16(p, 25.0f,    10.0f);   // temp_mos_1
     put_f16(p, 25.0f,    10.0f);   // temp_mos_2
     put_f16(p, 25.0f,    10.0f);   // temp_mos_3
-    put_f32(p, 0.0f,     1000.0f); // vd
-    put_f32(p, 0.0f,     1000.0f); // vq
-    put_u8 (p, 0);                 // status
+    put_f32(p, vd,       1000.0f); // vd
+    put_f32(p, vq,       1000.0f); // vq
+    put_u8 (p, _mc.get_state());   // status (reuse for FOC state machine)
 
     send_packet(buf, uint16_t(p - buf));
 }
 
-// COMM_SET_RPM: payload = [cmd, int32 erpm] (big-endian).
-// VESC Tool sends electrical RPM. Convert to electrical Hz and drive open loop.
+// COMM_SET_CURRENT: payload = [cmd, int32 current_mA] — direct iq (torque)
+// control. Best for bench-debugging the current loop in isolation.
+void VescTelemetry::handle_set_current()
+{
+    if (_payload_len < 5) return;
+    const int32_t ma = (int32_t(_payload[1]) << 24) |
+                       (int32_t(_payload[2]) << 16) |
+                       (int32_t(_payload[3]) <<  8) |
+                        int32_t(_payload[4]);
+    _mc.set_current(float(ma) / 1000.0f);
+}
+
+// COMM_SET_DUTY: payload = [cmd, int32 duty·1e5]. Repurposed as the open-loop
+// voltage BRING-UP control: |duty|→modulation, sign→direction, fixed slow spin.
+// Use VESC Tool's Duty slider at a few % to verify current sign/scale and that
+// the observer angle tracks, before trusting the closed loop.
+void VescTelemetry::handle_set_duty()
+{
+    if (_payload_len < 5) return;
+    const int32_t d = (int32_t(_payload[1]) << 24) |
+                      (int32_t(_payload[2]) << 16) |
+                      (int32_t(_payload[3]) <<  8) |
+                       int32_t(_payload[4]);
+    _mc.set_debug_voltage(float(d) / 100000.0f);
+}
+
+// COMM_SET_RPM: payload = [cmd, int32 erpm] (big-endian, electrical RPM).
 void VescTelemetry::handle_set_rpm()
 {
     if (_payload_len < 5) return;
@@ -280,11 +312,7 @@ void VescTelemetry::handle_set_rpm()
                          (int32_t(_payload[2]) << 16) |
                          (int32_t(_payload[3]) <<  8) |
                           int32_t(_payload[4]);
-
-    const float electrical_hz = float(erpm) / 60.0f;
-    const float hz_abs = electrical_hz < 0.0f ? -electrical_hz : electrical_hz;
-    const float mod = (erpm == 0) ? 0.0f : SET_RPM_MODULATION;
-    _mc.set_open_loop_target(hz_abs, mod, false);
+    _mc.set_rpm(float(erpm));
 }
 
 } // namespace ChibiOS

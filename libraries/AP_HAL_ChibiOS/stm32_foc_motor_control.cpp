@@ -23,10 +23,14 @@ constexpr uint32_t OPAMP_CSR_PGA_EXTERNAL_VINM0 = OPAMP_CSR_PGGAIN_3;
 constexpr uint32_t OPAMP_CSR_PGA_GAIN_16        = OPAMP_CSR_PGA_EXTERNAL_VINM0 |
                                                    OPAMP_CSR_PGGAIN_0 |
                                                    OPAMP_CSR_PGGAIN_1;
+// NOTE: OPAMPINTEN (OPAINTOEN, bit 8) is intentionally NOT set. On STM32G4 that
+// bit routes the OpAmp output to a dedicated *internal* ADC channel and
+// DISCONNECTS it from the VOUT pin. This board samples the external pins
+// PA2/PA6 = ADC1_IN3/ADC2_IN3 (see hwdef), so the output must reach the pin —
+// i.e. OPAINTOEN must be 0. Setting it left IN3 reading an undriven pin (~0).
 constexpr uint32_t PHASE_CURRENT_OPAMP_ENABLED_CSR =
     OPAMP_CSR_HIGHSPEEDEN |
     OPAMP_CSR_VPSEL_VINP0 |
-    OPAMP_CSR_OPAMPINTEN  |
     OPAMP_CSR_PGA_MODE    |
     OPAMP_CSR_PGA_GAIN_16 |
     OPAMP_CSR_OPAMPxEN;
@@ -337,6 +341,14 @@ void stm32_foc_motor_control_disable_outputs()
     osalSysLock();
     TIM1->BDTR &= ~TIM_BDTR_MOE;
     osalSysUnlock();
+#endif
+}
+
+void stm32_foc_motor_control_disable_outputs_isr()
+{
+#if HAL_USE_PWM == TRUE && STM32_PWM_USE_TIM1 == TRUE
+    // Single register write; safe to call from ISR without an OS lock.
+    TIM1->BDTR &= ~TIM_BDTR_MOE;
 #endif
 }
 
