@@ -19,6 +19,7 @@ constexpr float TWO_PI          = 6.28318530718f;
 constexpr float PI_F            = 3.14159265359f;
 constexpr float SPEED_LPF       = 0.02f;    // observer-speed low-pass α
 constexpr float HANDOVER_DROP   = 0.6f;     // closed→open re-sync hysteresis
+constexpr float DT_COMP_I_BAND  = 1.0f;     // [A] current band over which dead-time sign() is softened
 
 inline float wrap_pi(float a)
 {
@@ -90,6 +91,9 @@ bool MotorControl::init(const Config &cfg)
     _oc_trip       = cfg.overcurrent_trip;
     _v_max         = cfg.max_modulation * cfg.vbus * 0.57735026919f; // /√3
     _inv_vbus_half = 2.0f / cfg.vbus;
+    // Dead-time comp: convert the lost voltage [V] into a per-phase duty step
+    // (phase-to-midpoint voltage = (duty-0.5)·vbus, so Δduty = ΔV / vbus).
+    _dt_comp_duty  = (cfg.vbus > 0.0f) ? (cfg.deadtime_comp_volts / cfg.vbus) : 0.0f;
 
     _erpm_to_w = TWO_PI / 60.0f;
     _w_to_erpm = 60.0f / TWO_PI;
@@ -452,10 +456,36 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v)
     float da, db, dc;
     FOC::svpwm(va, vb, vc, da, db, dc);
 
+    // ── Dead-time compensation ──────────────────────────────────────────────
+    // During the bridge's dead-time (both FETs briefly off at each switch-over)
+    // the phase current — not the PWM — sets the output: a phase sourcing
+    // current (i>0) gets pulled low, so it delivers LESS voltage than commanded;
+    // a phase sinking current (i<0) gets pulled high and delivers MORE. The
+    // error is a roughly fixed magnitude (_dt_comp_duty, = V_dt/vbus) whose sign
+    // follows the phase current. We cancel it by nudging each phase's duty in
+    // the SAME direction as its current: add duty where i>0, subtract where i<0.
+    //
+    // sign(i) is softened to a linear ramp across ±DT_COMP_I_BAND amps so the
+    // correction doesn't chatter at the current zero-crossing, where both the
+    // current sign and the dead-time effect itself are ill-defined.
+    //
+    // This makes the *delivered* voltage match the desired v_alpha/v_beta, which
+    // is exactly what the observer assumes — so the observer's angle estimate
+    // stays accurate even at low speed, where the lost ~0.1V was otherwise a
+    // large fraction of the back-EMF and pushed the sensorless floor up.
+    if (_dt_comp_duty > 0.0f) {
+        constexpr float inv_band = 1.0f / DT_COMP_I_BAND;
+        da = clampf(da + clampf(ia * inv_band, -1.0f, 1.0f) * _dt_comp_duty, 0.0f, 1.0f);
+        db = clampf(db + clampf(ib * inv_band, -1.0f, 1.0f) * _dt_comp_duty, 0.0f, 1.0f);
+        dc = clampf(dc + clampf(ic * inv_band, -1.0f, 1.0f) * _dt_comp_duty, 0.0f, 1.0f);
+    }
+
     const float pf = float(_period_ticks);
     stm32_foc_motor_control_write_pwm(uint16_t(da * pf), uint16_t(db * pf), uint16_t(dc * pf));
 
-    // Applied voltage for the next observer iteration.
+    // Applied voltage for the next observer iteration. With dead-time comp on,
+    // the delivered voltage ≈ this desired value, so no separate correction is
+    // needed on the observer input.
     _v_alpha_prev = v_alpha;
     _v_beta_prev  = v_beta;
 

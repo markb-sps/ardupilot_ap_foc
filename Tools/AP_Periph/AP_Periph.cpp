@@ -140,7 +140,7 @@ void AP_Periph_FW::init()
         motor_cfg.center_aligned = true;
         motor_cfg.break_input_enabled = false;
         // BDUAV 6374-170kv electrical parameters (tune on hardware via VESC Tool).
-        motor_cfg.motor_Rs   = 0.06f;    // phase resistance [Ω]
+        motor_cfg.motor_Rs   = 0.05f;    // phase resistance [Ω] (2-point measured, deadtime-cancelled)
         motor_cfg.motor_Ls   = 80e-6f;   // phase inductance [H]
         motor_cfg.motor_flux = 4.6e-3f;  // PM flux linkage λ [Wb] (≈60/(√3·π·Kv·poles))
         motor_cfg.vbus       = 18.0f;    // DC bus [V] (fixed until bus ADC added)

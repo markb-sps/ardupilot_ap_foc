@@ -42,6 +42,10 @@ public:
         float    current_max       = 15.0f;   // iq command limit [A]
         float    overcurrent_trip  = 30.0f;   // per-phase hard trip [A]
         float    max_modulation    = 0.90f;   // SVPWM duty ceiling [0..~0.95]
+        // Dead-time voltage error to cancel, in volts (0 disables). This is the
+        // ~fixed voltage the bridge loses to dead-time per phase; measure it with
+        // the 2-point static debug method (slope fit gives V_dt). ~0.10V here.
+        float    deadtime_comp_volts = 0.10f;
         uint16_t command_timeout_ms = 1000;   // coast if no host packet within this (comms failsafe)
 
         // ── Sensorless I/f startup ─────────────────────────────────────────
@@ -58,7 +62,7 @@ public:
 
         // ── Open-loop voltage debug mode (current loop + observer bypassed) ─
         float    debug_openloop_hz    = 0.0f;   // fixed electrical rotation [Hz]
-        float    debug_max_modulation = 0.02f;  // hard duty clamp (≈V/R bound, no heatsink)
+        float    debug_max_modulation = 0.06f;  // hard duty clamp (≈V/R bound, no heatsink)
     };
 
     MotorControl() = default;
@@ -154,6 +158,7 @@ private:
     float _oc_trip         = 30.0f;
     float _v_max           = 0.0f;   // max |v_dq| = max_mod·vbus/√3
     float _inv_vbus_half   = 0.0f;   // 2/vbus
+    float _dt_comp_duty    = 0.0f;   // dead-time comp expressed as a per-phase duty step
     float _open_current    = 5.0f;
     float _open_handover_w = 0.0f;   // handover electrical speed [rad/s]
     float _open_accel_w    = 0.0f;   // ramp step per cycle [rad/s]
