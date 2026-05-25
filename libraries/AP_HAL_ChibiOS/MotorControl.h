@@ -48,17 +48,27 @@ public:
         float    deadtime_comp_volts = 0.10f;
         uint16_t command_timeout_ms = 1000;   // coast if no host packet within this (comms failsafe)
 
-        // ── Sensorless I/f startup ─────────────────────────────────────────
-        float    openloop_current      = 5.0f;    // forced-commutation current [A]
-        float    openloop_erpm         = 600.0f;  // handover speed [electrical RPM]
-        float    openloop_accel_erpm_s = 3000.0f; // ramp rate [eRPM/s]
-        uint16_t align_ms              = 500;      // rotor pre-align time [ms]
-        uint16_t blend_ms              = 100;      // open→observer angle blend [ms]
+        // ── Sensorless open-loop override (models VESC mcpwm_foc control_current)
+        float    openloop_current      = 5.0f;    // boost current added during the override [A] (VESC boost_q)
+        float    openloop_erpm         = 600.0f;  // open-loop speed threshold [eRPM] (VESC foc_openloop_rpm)
+        float    openloop_rpm_low_frac = 0.0f;    // threshold at zero current, fraction of openloop_erpm (VESC rpm_low)
+        float    openloop_hyst_s       = 0.1f;    // time below threshold before override fires [s] (VESC hyst)
+        float    openloop_lock_s       = 0.0f;    // hold-angle lock time at sequence start [s] (VESC t_lock)
+        float    openloop_ramp_s       = 0.1f;    // forced-speed ramp-up time [s] (VESC t_ramp)
+        float    openloop_const_s      = 0.05f;   // forced-speed hold time after ramp [s] (VESC t_const)
+        float    openloop_max_q        = 3.0f;    // open-loop iq cap [A] (VESC foc_sl_openloop_max_q) — limits startup heat
 
         // ── Observer / speed loop ──────────────────────────────────────────
-        float    observer_gain = 9.0e6f;   // Ortega γ (bw ≈ γ·λ²); tune
+        float    observer_gain = 2.5e7f;   // Ortega γ (bw ≈ γ·λ²); VESC-equivalent (9e7·(λ_vesc/λ)²)
         float    speed_kp      = 0.0005f;  // outer speed PI [A per eRPM]
         float    speed_ki      = 0.001f;   // outer speed PI [A per eRPM·s]
+        // PLL that tracks the observer angle to produce a clean speed estimate
+        // (VESC foc_pll_run). Replaces noisy angle-differentiation. Tuned for
+        // ωn≈500 rad/s (~80 Hz), ζ≈1: kp=2·ζ·ωn, ki=ωn². Fast enough to follow
+        // the open-loop ramp without lag (slower gains push the floor UP), but
+        // still smoother than differentiation.
+        float    pll_kp        = 1000.0f;
+        float    pll_ki        = 250000.0f;
 
         // ── Open-loop voltage debug mode (current loop + observer bypassed) ─
         float    debug_openloop_hz    = 0.0f;   // fixed electrical rotation [Hz]
@@ -69,7 +79,6 @@ public:
 
     bool init();
     bool init(const Config &cfg);
-    void deinit();
 
     bool is_initialized()   const { return _initialized; }
     bool zero_valid()       const { return _current_zero_valid; }
@@ -159,29 +168,36 @@ private:
     float _v_max           = 0.0f;   // max |v_dq| = max_mod·vbus/√3
     float _inv_vbus_half   = 0.0f;   // 2/vbus
     float _dt_comp_duty    = 0.0f;   // dead-time comp expressed as a per-phase duty step
-    float _open_current    = 5.0f;
-    float _open_handover_w = 0.0f;   // handover electrical speed [rad/s]
-    float _open_accel_w    = 0.0f;   // ramp step per cycle [rad/s]
-    uint16_t _align_cycles = 0;
-    uint16_t _blend_cycles = 0;
+    // VESC-style open-loop override constants
+    float _ol_boost_q        = 0.0f; // boost current during override [A]
+    float _ol_max_q          = 3.0f; // open-loop iq cap [A]
+    float _open_handover_erpm = 0.0f;// open-loop speed threshold [eRPM]
+    float _ol_rpm_low        = 0.0f; // threshold-at-zero-current fraction
+    float _ol_hyst           = 0.1f; // time below threshold to trigger [s]
+    float _ol_t_lock         = 0.0f; // lock phase duration [s]
+    float _ol_t_ramp         = 0.1f; // forced-speed ramp duration [s]
+    float _ol_t_total        = 0.15f;// lock + ramp + const [s]
+    float _obs_lambda        = 0.0f; // PM flux linkage λ [Wb] (observer seed)
     float _obs_L           = 0.0f;   // 1.5·Ls
     float _obs_R           = 0.0f;   // 1.5·Rs
     float _obs_lambda2     = 0.0f;   // λ²
     float _obs_gamma_half  = 0.0f;   // γ/2
     float _spd_kp          = 0.0f;
     float _spd_ki_dt       = 0.0f;
+    float _pll_kp          = 0.0f;   // observer-angle PLL gains (speed estimate)
+    float _pll_ki          = 0.0f;
     float _erpm_to_w       = 0.0f;   // 2π/60
     float _w_to_erpm       = 0.0f;   // 60/2π
     float _debug_phase_step = 0.0f;  // |Δθ| per cycle in debug mode
     float _debug_max_mod    = 0.10f; // debug modulation clamp
 
     // ── Control state (ISR-only) ───────────────────────────────────────────
-    float    _open_theta   = 0.0f;
-    float    _open_omega   = 0.0f;
     float    _integ_d      = 0.0f;
     float    _integ_q      = 0.0f;
     float    _integ_spd    = 0.0f;
-    uint16_t _stage_cnt    = 0;
+    float    _override_ang = 0.0f;   // forced open-loop angle [rad]
+    float    _hyst_timer   = 0.0f;   // time spent below open-loop speed [s]
+    float    _ol_timer     = 0.0f;   // remaining open-loop override time [s]
     float    _debug_theta  = 0.0f;
     float    _v_alpha_prev = 0.0f;   // applied αβ volts, fed to observer next cycle
     float    _v_beta_prev  = 0.0f;
@@ -190,7 +206,8 @@ private:
     float _obs_x1     = 0.0f;
     float _obs_x2     = 0.0f;
     float _obs_theta  = 0.0f;
-    float _obs_omega  = 0.0f;   // filtered electrical speed [rad/s]
+    float _obs_omega  = 0.0f;   // electrical speed [rad/s] — PLL output
+    float _pll_theta  = 0.0f;   // PLL tracked angle (follows _obs_theta)
 
     // ── Telemetry snapshots (ISR → thread) ─────────────────────────────────
     volatile State   _state      = State::IDLE;

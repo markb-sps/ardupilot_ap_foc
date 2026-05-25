@@ -17,8 +17,6 @@ constexpr float ADC_LSB_VOLTS   = 3.3f / 4095.0f;
 constexpr uint16_t ZERO_SAMPLES = 64;       // zero-current calibration window
 constexpr float TWO_PI          = 6.28318530718f;
 constexpr float PI_F            = 3.14159265359f;
-constexpr float SPEED_LPF       = 0.02f;    // observer-speed low-pass α
-constexpr float HANDOVER_DROP   = 0.6f;     // closed→open re-sync hysteresis
 constexpr float DT_COMP_I_BAND  = 1.0f;     // [A] current band over which dead-time sign() is softened
 
 inline float wrap_pi(float a)
@@ -38,6 +36,15 @@ inline float step_towards(float v, float target, float step)
     if (v < target) return (v + step > target) ? target : v + step;
     if (v > target) return (v - step < target) ? target : v - step;
     return v;
+}
+
+// Linear map x:[in_lo,in_hi] → [out_lo,out_hi], clamped to the output range
+// (matches VESC utils_map usage here).
+inline float mapf(float x, float in_lo, float in_hi, float out_lo, float out_hi)
+{
+    if (in_hi == in_lo) return out_lo;
+    const float t = clampf((x - in_lo) / (in_hi - in_lo), 0.0f, 1.0f);
+    return out_lo + (out_hi - out_lo) * t;
 }
 } // namespace
 
@@ -98,20 +105,25 @@ bool MotorControl::init(const Config &cfg)
     _erpm_to_w = TWO_PI / 60.0f;
     _w_to_erpm = 60.0f / TWO_PI;
 
-    _open_current    = cfg.openloop_current;
-    _open_handover_w = cfg.openloop_erpm * _erpm_to_w;
-    _open_accel_w    = cfg.openloop_accel_erpm_s * _erpm_to_w * _dt;
-    _align_cycles    = uint16_t(float(cfg.align_ms) * 1e-3f * float(_pwm_update_rate_hz));
-    _blend_cycles    = uint16_t(float(cfg.blend_ms) * 1e-3f * float(_pwm_update_rate_hz));
-    if (_blend_cycles == 0) _blend_cycles = 1;
+    _ol_boost_q         = cfg.openloop_current;
+    _ol_max_q           = cfg.openloop_max_q;
+    _open_handover_erpm = cfg.openloop_erpm;
+    _ol_rpm_low         = cfg.openloop_rpm_low_frac;
+    _ol_hyst            = cfg.openloop_hyst_s;
+    _ol_t_lock          = cfg.openloop_lock_s;
+    _ol_t_ramp          = cfg.openloop_ramp_s;
+    _ol_t_total         = cfg.openloop_lock_s + cfg.openloop_ramp_s + cfg.openloop_const_s;
 
     _obs_L          = 1.5f * cfg.motor_Ls;
     _obs_R          = 1.5f * cfg.motor_Rs;
+    _obs_lambda     = cfg.motor_flux;
     _obs_lambda2    = cfg.motor_flux * cfg.motor_flux;
     _obs_gamma_half = 0.5f * cfg.observer_gain;
 
     _spd_kp    = cfg.speed_kp;
     _spd_ki_dt = cfg.speed_ki * _dt;
+    _pll_kp    = cfg.pll_kp;
+    _pll_ki    = cfg.pll_ki;
     _cmd_timeout_ms = cfg.command_timeout_ms;
     _last_cmd_ms    = 0;
 
@@ -131,26 +143,15 @@ bool MotorControl::init(const Config &cfg)
 #endif
 }
 
-void MotorControl::deinit()
-{
-#if HAL_USE_PWM == TRUE && STM32_PWM_USE_TIM1 == TRUE
-    if (!_initialized) {
-        return;
-    }
-    stm32_foc_motor_control_deinit();
-    _current_sense_initialized = false;
-    _current_zero_valid        = false;
-    _initialized               = false;
-#endif
-}
-
 void MotorControl::reset_control()
 {
-    _open_theta = _open_omega = 0.0f;
     _integ_d = _integ_q = _integ_spd = 0.0f;
-    _stage_cnt = 0;
+    _override_ang = 0.0f;
+    _hyst_timer = 0.0f;
+    _ol_timer = 0.0f;
     _v_alpha_prev = _v_beta_prev = 0.0f;
     _obs_x1 = _obs_x2 = _obs_theta = _obs_omega = 0.0f;
+    _pll_theta = 0.0f;
 }
 
 void MotorControl::trip_fault(uint8_t code)
@@ -335,93 +336,93 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v)
         return;
     }
 
-    // Re-entering closed loop from a non-FOC state → restart from alignment.
-    if (_state == State::FAULT || _state == State::DEBUG) {
-        _state = State::IDLE;
+    // First running cycle after STOP / fault / debug → arm the open-loop
+    // sequence immediately so a standstill start runs the forced lock→ramp.
+    bool started_now = false;
+    if (_state != State::OPENLOOP && _state != State::CLOSED) {
+        _override_ang = _obs_theta;
+        _integ_spd    = 0.0f;
+        _hyst_timer   = 0.0f;
+        _ol_timer     = _ol_t_total;
+        started_now   = true;
     }
 
     const float dir = (mode == Mode::SPEED)
                           ? (_cmd_erpm >= 0.0f ? 1.0f : -1.0f)
                           : (_cmd_current >= 0.0f ? 1.0f : -1.0f);
 
-    // ── State machine → electrical angle θ and dq set-points ────────────────
+    // ── Outer command: torque current (speed PI for RPM mode, direct otherwise)
+    float iq_cmd;
+    if (mode == Mode::SPEED) {
+        const float erpm_err = _cmd_erpm - _obs_omega * _w_to_erpm;
+        _integ_spd = clampf(_integ_spd + erpm_err * _spd_ki_dt, -_current_max, _current_max);
+        iq_cmd = clampf(erpm_err * _spd_kp + _integ_spd, -_current_max, _current_max);
+    } else {
+        iq_cmd = clampf(_cmd_current, -_current_max, _current_max);
+    }
+
+    // ── VESC-style sensorless open-loop override (mcpwm_foc control_current) ──
+    // The observer ALWAYS commutates. While too slow, we instead force the angle
+    // through a timed lock→ramp→const sequence AND overwrite the observer flux
+    // to match it, so the observer is already tracking when the override
+    // releases — seamless, no blend / agreement gate / fallback bounce.
+    //
+    // Open-loop speed threshold scales with commanded current (more torque →
+    // wider open-loop band), like VESC's openloop_rpm_max map.
+    const float ol_cur = fabsf(iq_cmd) + _ol_boost_q;
+    float ol_rpm_max = mapf(ol_cur, 0.0f, _current_max,
+                            _ol_rpm_low * _open_handover_erpm, _open_handover_erpm);
+    ol_rpm_max = clampf(ol_rpm_max, 0.0f, _open_handover_erpm);
+
+    // Hysteresis TIMER: accumulate the time spent below the open-loop speed.
+    if (fabsf(_obs_omega) < ol_rpm_max * _erpm_to_w && _hyst_timer < _ol_hyst) {
+        _hyst_timer += _dt;
+    } else if (_hyst_timer > 0.0f) {
+        _hyst_timer -= _dt;
+    }
+    // Re-trigger a fresh sequence after a stall (skipped if just armed above).
+    if (_hyst_timer >= _ol_hyst && _ol_timer <= 1e-4f) {
+        _ol_timer   = _ol_t_total;
+        started_now = true;
+    }
+
     float theta;
     float id_set = 0.0f;
-    float iq_set = 0.0f;
+    float iq_set = iq_cmd;
 
-    switch (_state) {
-    case State::IDLE:
-        _state = State::ALIGN;
-        _stage_cnt = 0;
-        _open_theta = 0.0f;
-        _open_omega = 0.0f;
-        // fallthrough
-    case State::ALIGN:
-        // Park stator field at θ=0 and pull the rotor there with d-axis current.
-        theta  = 0.0f;
-        id_set = _open_current;
-        if (++_stage_cnt >= _align_cycles) {
-            _state = State::OPENLOOP;
-            _stage_cnt = 0;
+    if (_ol_timer > 0.0f) {
+        // Forced rotation: 0 during lock, ramped 0→max during ramp, then full.
+        const float time_fwd = _ol_t_total - _ol_timer;
+        float rpm = ol_rpm_max;
+        if (time_fwd < _ol_t_lock) {
+            rpm = 0.0f;
+        } else if (time_fwd < _ol_t_lock + _ol_t_ramp) {
+            rpm = mapf(time_fwd, _ol_t_lock, _ol_t_lock + _ol_t_ramp, 0.0f, ol_rpm_max);
         }
-        break;
+        _override_ang = wrap_pi(_override_ang + dir * rpm * _erpm_to_w * _dt);
+        if (started_now) {
+            _override_ang = wrap_pi(_override_ang + dir * 1.04719755f); // +60° anti-stuck kick
+        }
 
-    case State::OPENLOOP: {
-        const float target_w = (mode == Mode::SPEED)
-                                   ? _cmd_erpm * _erpm_to_w
-                                   : dir * (_open_handover_w * 1.2f);
-        _open_omega  = step_towards(_open_omega, target_w, _open_accel_w);
-        _open_theta  = wrap_pi(_open_theta + _open_omega * _dt);
-        theta  = _open_theta;
-        iq_set = dir * _open_current;
-        // Hand over only past the floor AND once the observer agrees with the
-        // forced rotation — same direction and speed within 50% — sustained for
-        // the debounce window. Without this, a marginal low-speed observer can
-        // hand over to a wrong angle and the motor runs backwards / desyncs.
-        // If it never agrees we stay in open loop (correct direction, safe).
-        const bool fast_enough = fabsf(_open_omega) >= _open_handover_w;
-        const bool obs_agrees  = (_obs_omega * _open_omega > 0.0f) &&
-                                 (fabsf(_obs_omega - _open_omega) < 0.5f * fabsf(_open_omega));
-        if (fast_enough && obs_agrees) {
-            if (++_stage_cnt >= _blend_cycles) {
-                _state = State::BLEND;
-                _stage_cnt = 0;
-            }
-        } else {
-            _stage_cnt = 0;
-        }
-        break;
-    }
+        theta  = _override_ang;
+        // Cap the open-loop torque current (VESC foc_sl_openloop_max_q) to limit
+        // heating during forced commutation, and clamp the speed-PI integrator to
+        // the same so it can't wind up (→ over-current / overshoot) while forced.
+        iq_set = clampf(iq_cmd + dir * _ol_boost_q, -_ol_max_q, _ol_max_q);
+        _integ_spd = clampf(_integ_spd, -_ol_max_q, _ol_max_q);
 
-    case State::BLEND: {
-        _open_theta = wrap_pi(_open_theta + _open_omega * _dt);
-        const float k = float(_stage_cnt) / float(_blend_cycles);
-        theta  = wrap_pi(_open_theta + k * wrap_pi(_obs_theta - _open_theta));
-        iq_set = dir * _open_current;
-        if (++_stage_cnt >= _blend_cycles) {
-            _state = State::CLOSED;
-            _integ_spd = dir * _open_current; // seed speed PI to current iq
-        }
-        break;
-    }
+        // Seed observer flux to the forced angle (+45° lead, VESC) so it is
+        // already tracking when the override releases.
+        _obs_x1 = cosf(_override_ang + dir * 0.78539816f) * _obs_lambda;
+        _obs_x2 = sinf(_override_ang + dir * 0.78539816f) * _obs_lambda;
 
-    case State::CLOSED:
-    default:
-        theta = _obs_theta;
-        if (mode == Mode::SPEED) {
-            const float erpm_err = _cmd_erpm - _obs_omega * _w_to_erpm;
-            _integ_spd = clampf(_integ_spd + erpm_err * _spd_ki_dt, -_current_max, _current_max);
-            iq_set = clampf(erpm_err * _spd_kp + _integ_spd, -_current_max, _current_max);
-        } else {
-            iq_set = clampf(_cmd_current, -_current_max, _current_max);
-        }
-        // Loss of sync / stall → fall back to forced commutation.
-        if (fabsf(_obs_omega) < _open_handover_w * HANDOVER_DROP) {
-            _state = State::OPENLOOP;
-            _open_theta = _obs_theta;
-            _open_omega = _obs_omega;
-        }
-        break;
+        _ol_timer  -= _dt;
+        _hyst_timer = 0.0f;
+        _state = State::OPENLOOP;
+    } else {
+        _override_ang = _obs_theta;
+        theta  = _obs_theta;   // pure sensorless
+        _state = State::CLOSED;
     }
 
     // ── dq current PI (Kp = L·ωbw, Ki = R·ωbw) with anti-windup ─────────────
@@ -516,12 +517,16 @@ void MotorControl::observer_update(float v_alpha, float v_beta, float i_alpha, f
 
     const float theta = atan2f(_obs_x2 - L_ib, _obs_x1 - L_ia);
 
-    // Electrical speed from the angle derivative (wrapped), low-pass filtered.
-    const float dtheta = wrap_pi(theta - _obs_theta);
-    const float omega  = dtheta / _dt;
-    _obs_omega += SPEED_LPF * (omega - _obs_omega);
-    _obs_theta  = theta;
-    _t_obs_theta = theta;   // snapshot for diagnostics
+    // Speed via a VESC-style PLL (foc_pll_run): a tracking loop locks _pll_theta
+    // onto the observer angle, and its integrator IS the speed estimate. Unlike
+    // differentiating the angle, this stays clean at low speed (small back-EMF),
+    // which is what lets the lock survive far below the old ~900 erpm floor.
+    const float delta = wrap_pi(theta - _pll_theta);
+    _pll_theta  = wrap_pi(_pll_theta + (_obs_omega + _pll_kp * delta) * _dt);
+    _obs_omega += _pll_ki * delta * _dt;
+
+    _obs_theta   = theta;   // commutation still uses the raw observer angle, not the PLL angle
+    _t_obs_theta = theta;
 }
 
 } // namespace ChibiOS

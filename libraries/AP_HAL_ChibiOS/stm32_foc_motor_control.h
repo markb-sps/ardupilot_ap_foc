@@ -29,7 +29,6 @@ struct Stm32FocMotorControlInitResult {
 
 Stm32FocMotorControlInitResult stm32_foc_motor_control_init(const Stm32FocMotorControlSetup &setup,
                                                             const Stm32FocMotorControlCallbacks &callbacks);
-void stm32_foc_motor_control_deinit();
 void stm32_foc_motor_control_enable_outputs();
 void stm32_foc_motor_control_disable_outputs();
 

@@ -88,15 +88,6 @@ void init_opamps()
 #endif
 }
 
-void deinit_opamps()
-{
-#if defined(STM32G4)
-    OPAMP1->CSR = 0U;
-    OPAMP2->CSR = 0U;
-    OPAMP3->CSR = 0U;
-#endif
-}
-
 void init_tim1_adc_trigger(uint16_t period_ticks, uint16_t delay_ticks)
 {
     // OC4REF in PWM mode 1: high while CNT < CCR4.  In centre-aligned mode
@@ -158,21 +149,6 @@ void init_adc_unit(ADC_TypeDef *adc)
     adc->CR |= ADC_CR_JADSTART;
 }
 
-void stop_adc_unit(ADC_TypeDef *adc)
-{
-    adc->IER = 0U;
-    if ((adc->CR & ADC_CR_ADSTART) != 0U) {
-        adc->CR |= ADC_CR_ADSTP;
-        while ((adc->CR & ADC_CR_ADSTP) != 0U) {}
-    }
-    if ((adc->CR & ADC_CR_ADEN) != 0U) {
-        adc->CR |= ADC_CR_ADDIS;
-        while ((adc->CR & ADC_CR_ADEN) != 0U) {}
-    }
-    adc->CR = 0U;
-    adc->CR = ADC_CR_DEEPPWD;
-}
-
 bool init_current_sense()
 {
 #if HAL_USE_ADC == TRUE && STM32_ADC_USE_ADC1 == TRUE && STM32_ADC_USE_ADC2 == TRUE
@@ -184,15 +160,6 @@ bool init_current_sense()
     return true;
 #else
     return false;
-#endif
-}
-
-void deinit_current_sense()
-{
-#if HAL_USE_ADC == TRUE && STM32_ADC_USE_ADC1 == TRUE && STM32_ADC_USE_ADC2 == TRUE
-    stop_adc_unit(ADC1);
-    stop_adc_unit(ADC2);
-    rccDisableADC12();
 #endif
 }
 
@@ -304,20 +271,6 @@ Stm32FocMotorControlInitResult stm32_foc_motor_control_init(const Stm32FocMotorC
 #endif
 
     return result;
-}
-
-void stm32_foc_motor_control_deinit()
-{
-#if HAL_USE_PWM == TRUE && STM32_PWM_USE_TIM1 == TRUE
-    if (!driver_state.initialized) {
-        return;
-    }
-    stm32_foc_motor_control_disable_outputs();
-    pwmStop(&PWMD1);
-    deinit_current_sense();
-    deinit_opamps();
-    driver_state = {};
-#endif
 }
 
 void stm32_foc_motor_control_enable_outputs()
