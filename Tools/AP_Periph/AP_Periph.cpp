@@ -140,7 +140,7 @@ void AP_Periph_FW::init()
         motor_cfg.center_aligned = true;
         motor_cfg.break_input_enabled = false;
         // BDUAV 6374-170kv electrical parameters (tune on hardware via VESC Tool).
-        motor_cfg.motor_Rs   = 0.05f;    // phase resistance [Ω] (2-point measured, deadtime-cancelled)
+        motor_cfg.motor_Rs   = 0.055f;   // phase resistance [Ω] (Step-1 I–V slope: ≈0.055)
         motor_cfg.motor_Ls   = 80e-6f;   // phase inductance [H]
         motor_cfg.motor_flux = 4.6e-3f;  // PM flux linkage λ [Wb] (≈60/(√3·π·Kv·poles))
         motor_cfg.vbus       = 18.0f;    // DC bus [V] (fixed until bus ADC added)
@@ -148,6 +148,22 @@ void AP_Periph_FW::init()
         motor_cfg.current_max      = 15.0f;
         motor_cfg.overcurrent_trip = 30.0f;
         motor_cfg.openloop_current = 8.0f;
+        // Startup spin-up: the 6374 rotor can't follow a 0.1 s ramp on only 3 A,
+        // so it slips and the observer never sees coherent back-EMF. Give it real
+        // torque and a gentle, long ramp/hold so we can confirm it actually spins
+        // (watch `ferr`→small as back-EMF appears) before worrying about handover.
+        motor_cfg.openloop_max_q  = 10.0f;  // was 3 A — too weak to accelerate the rotor
+        motor_cfg.openloop_ramp_s = 0.5f;   // was 0.1 s — gentler so the rotor can keep up
+        motor_cfg.openloop_const_s = 1.0f;  // hold forced rotation long enough to observe
+        // Hand over to the observer at HIGHER speed so back-EMF is large enough for
+        // a clean lock (the −400 eRPM dip at handover is the observer converging for
+        // real for the first time; more back-EMF makes that converge faster, less
+        // backward). Note this is NOT the actual handover eRPM: like VESC
+        // (mcpwm_foc utils_map on iq vs current_max), the effective threshold is
+        //   map(|iq|+boost, 0, current_max, rpm_low_frac*openloop_erpm, openloop_erpm)
+        // so at our ~9.5 A of 15 A operating point handover lands at ≈0.63·this.
+        // 1500 → ≈950 eRPM handover (was 600 → ≈380, where the dip happened).
+        motor_cfg.openloop_erpm = 1500.0f;
         // Outer speed PI — strong enough to reject load (tune: ↑ if sluggish, ↓ if hunting).
         motor_cfg.speed_kp = 0.005f;   // [A per eRPM]
         motor_cfg.speed_ki = 0.05f;    // [A per eRPM·s]
@@ -155,6 +171,10 @@ void AP_Periph_FW::init()
         motor_cfg.current_scale = 1.0f / (phase_current_shunt_ohms *
                                            phase_current_shunt_input_attenuation *
                                            phase_current_opamp_gain);
+        // Bring-up: debug-voltage mode rotates the applied vector at this rate so
+        // the observer has real back-EMF to lock onto (Step 2 sign/tracking check).
+        // Set back to 0 for a static d-axis sign/scale test.
+        motor_cfg.debug_openloop_hz = 3.0f;   // ≈180 eRPM forced rotation
         motor_control.init(motor_cfg);
 
         vesc_telem.init(hal.serial(0));

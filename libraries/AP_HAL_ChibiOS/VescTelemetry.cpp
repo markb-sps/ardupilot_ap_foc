@@ -88,12 +88,16 @@ void VescTelemetry::feed_byte(uint8_t b)
 {
     switch (_state) {
     case RxState::WAIT_START:
+        // Only the short-packet start (0x02) is accepted. The host never sends
+        // long packets, and 0x03 is ALSO every frame's end byte — accepting it
+        // as a "long length" start makes a single misaligned byte latch onto a
+        // trailing 0x03, mis-read the next two bytes as a huge length, and
+        // swallow whole frames until it luckily realigns. Ignoring everything
+        // but 0x02 here means any junk byte just keeps us waiting for the next
+        // real start, so the stream resyncs within one packet.
         if (b == 0x02) {
             _state = RxState::WAIT_LEN_SHORT;
-        } else if (b == 0x03) {
-            _state = RxState::WAIT_LEN_LONG_HI;
         }
-        // 0x04 (3-byte length) not needed for our reply set; ignore
         break;
 
     case RxState::WAIT_LEN_SHORT:
@@ -229,13 +233,16 @@ void VescTelemetry::handle_fw_version()
 
 void VescTelemetry::handle_get_values()
 {
-    uint8_t buf[80];
+    uint8_t buf[96];
     uint8_t *p = buf;
 
     float id = 0, iq = 0;
     _mc.get_idq(id, iq);
     float vd = 0, vq = 0;
     _mc.get_vdq(vd, vq);
+    const float theta     = _mc.get_estimated_angle();      // control angle [rad]
+    const float obs_theta = _mc.get_observer_angle();       // observer angle [rad]
+    const float free_theta = _mc.get_free_observer_angle(); // unseeded shadow observer [rad]
 
     const float i_motor = _mc.get_motor_current(); // q-axis (torque) current [A]
     const float v_in    = _mc.get_vbus();
@@ -267,6 +274,11 @@ void VescTelemetry::handle_get_values()
     put_f32(p, vd,       1000.0f); // vd
     put_f32(p, vq,       1000.0f); // vq
     put_u8 (p, _mc.get_state());   // status (reuse for FOC state machine)
+    // Bring-up extras appended past the standard packet (VESC Tool ignores the
+    // trailing bytes; our bench scripts read them). Both angles in rad·10000.
+    put_f32(p, theta,      10000.0f); // control/commanded angle      (offset 74)
+    put_f32(p, obs_theta,  10000.0f); // observer-estimated angle     (offset 78)
+    put_f32(p, free_theta, 10000.0f); // unseeded shadow observer     (offset 82)
 
     send_packet(buf, uint16_t(p - buf));
 }

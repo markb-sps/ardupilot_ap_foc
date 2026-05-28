@@ -119,9 +119,12 @@ bool MotorControl::init(const Config &cfg)
     _obs_lambda     = cfg.motor_flux;
     _obs_lambda2    = cfg.motor_flux * cfg.motor_flux;
     _obs_gamma_half = 0.5f * cfg.observer_gain;
+    _obs_gain_mod_inv   = (cfg.observer_gain_mod_full > 1e-3f) ? (1.0f / cfg.observer_gain_mod_full) : 1e6f;
+    _obs_gain_slow_frac = cfg.observer_gain_slow_frac;
 
     _spd_kp    = cfg.speed_kp;
     _spd_ki_dt = cfg.speed_ki * _dt;
+    _spd_ramp_erpm_s = cfg.speed_ramp_erpm_s;
     _pll_kp    = cfg.pll_kp;
     _pll_ki    = cfg.pll_ki;
     _cmd_timeout_ms = cfg.command_timeout_ms;
@@ -151,6 +154,7 @@ void MotorControl::reset_control()
     _ol_timer = 0.0f;
     _v_alpha_prev = _v_beta_prev = 0.0f;
     _obs_x1 = _obs_x2 = _obs_theta = _obs_omega = 0.0f;
+    _free_x1 = _free_x2 = 0.0f;
     _pll_theta = 0.0f;
 }
 
@@ -344,6 +348,7 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v)
         _integ_spd    = 0.0f;
         _hyst_timer   = 0.0f;
         _ol_timer     = _ol_t_total;
+        _spd_set_erpm = _obs_omega * _w_to_erpm;  // VESC: init setpoint to current speed
         started_now   = true;
     }
 
@@ -354,7 +359,17 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v)
     // ── Outer command: torque current (speed PI for RPM mode, direct otherwise)
     float iq_cmd;
     if (mode == Mode::SPEED) {
-        const float erpm_err = _cmd_erpm - _obs_omega * _w_to_erpm;
+        // VESC-style ramped setpoint (foc_run_pid_control_speed): slew toward the
+        // command at an accel limit, and while still in open loop clamp it to the
+        // handover speed. So at handover the setpoint ≈ actual speed (no error step
+        // → no kick) and afterwards it ramps up under control (observer/PLL keep
+        // up → no desync on big speed commands).
+        _spd_set_erpm = step_towards(_spd_set_erpm, _cmd_erpm, _spd_ramp_erpm_s * _dt);
+        float set_erpm = _spd_set_erpm;
+        if (_ol_timer > 0.0f) {
+            set_erpm = clampf(set_erpm, -_open_handover_erpm, _open_handover_erpm);
+        }
+        const float erpm_err = set_erpm - _obs_omega * _w_to_erpm;
         _integ_spd = clampf(_integ_spd + erpm_err * _spd_ki_dt, -_current_max, _current_max);
         iq_cmd = clampf(erpm_err * _spd_kp + _integ_spd, -_current_max, _current_max);
     } else {
@@ -411,8 +426,11 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v)
         iq_set = clampf(iq_cmd + dir * _ol_boost_q, -_ol_max_q, _ol_max_q);
         _integ_spd = clampf(_integ_spd, -_ol_max_q, _ol_max_q);
 
-        // Seed observer flux to the forced angle (+45° lead, VESC) so it is
-        // already tracking when the override releases.
+        // Seed observer flux to the forced angle (+45° lead, VESC
+        // m_observer_x1/x2_override) so it is already tracking when the override
+        // releases. VESC clobbers this every override cycle, then hard-switches
+        // to the observer angle; the post-handover convergence is kept gentle by
+        // the speed-scaled observer gain (see observer_update), not by a blend.
         _obs_x1 = cosf(_override_ang + dir * 0.78539816f) * _obs_lambda;
         _obs_x2 = sinf(_override_ang + dir * 0.78539816f) * _obs_lambda;
 
@@ -506,14 +524,23 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v)
 // L and R are the per-phase values pre-scaled by 3/2 in init.
 void MotorControl::observer_update(float v_alpha, float v_beta, float i_alpha, float i_beta)
 {
+    // VESC-style speed/duty-scaled observer gain (m_gamma_now duty map): gain is
+    // cut at low modulation (low speed) so the angle converges GENTLY after the
+    // open-loop hard switch, ramping to full as back-EMF grows. This is what
+    // keeps the OL→CLOSED handover from blipping, without any angle blend.
+    const float mod    = sqrtf(v_alpha * v_alpha + v_beta * v_beta) * _inv_vbus_half;
+    const float gscale = clampf(mod * _obs_gain_mod_inv, _obs_gain_slow_frac, 1.0f);
+    const float gamma_half = _obs_gamma_half * gscale;
+
     const float L_ia = _obs_L * i_alpha;
     const float L_ib = _obs_L * i_beta;
     const float e1   = _obs_x1 - L_ia;
     const float e2   = _obs_x2 - L_ib;
-    const float err  = _obs_lambda2 - (e1 * e1 + e2 * e2);
+    float err        = _obs_lambda2 - (e1 * e1 + e2 * e2);
+    if (err > 0.0f) err = 0.0f;   // VESC: forcing err ≤ 0 aids observer convergence
 
-    _obs_x1 += (v_alpha - _obs_R * i_alpha + _obs_gamma_half * e1 * err) * _dt;
-    _obs_x2 += (v_beta  - _obs_R * i_beta  + _obs_gamma_half * e2 * err) * _dt;
+    _obs_x1 += (v_alpha - _obs_R * i_alpha + gamma_half * e1 * err) * _dt;
+    _obs_x2 += (v_beta  - _obs_R * i_beta  + gamma_half * e2 * err) * _dt;
 
     const float theta = atan2f(_obs_x2 - L_ib, _obs_x1 - L_ia);
 
@@ -527,6 +554,21 @@ void MotorControl::observer_update(float v_alpha, float v_beta, float i_alpha, f
 
     _obs_theta   = theta;   // commutation still uses the raw observer angle, not the PLL angle
     _t_obs_theta = theta;
+
+    // ── Shadow observer (diagnostic) ────────────────────────────────────────
+    // Identical Ortega dynamics, but its state is NEVER seeded/clobbered by the
+    // open-loop override. So during forced startup this angle is the estimate
+    // the sensorless observer reaches on its own — comparing it to the forced
+    // angle shows whether the rotor is actually being tracked before handover.
+    const float fL_ia = _obs_L * i_alpha;
+    const float fL_ib = _obs_L * i_beta;
+    const float fe1   = _free_x1 - fL_ia;
+    const float fe2   = _free_x2 - fL_ib;
+    float ferr        = _obs_lambda2 - (fe1 * fe1 + fe2 * fe2);
+    if (ferr > 0.0f) ferr = 0.0f;
+    _free_x1 += (v_alpha - _obs_R * i_alpha + gamma_half * fe1 * ferr) * _dt;
+    _free_x2 += (v_beta  - _obs_R * i_beta  + gamma_half * fe2 * ferr) * _dt;
+    _t_free_theta = atan2f(_free_x2 - fL_ib, _free_x1 - fL_ia);
 }
 
 } // namespace ChibiOS

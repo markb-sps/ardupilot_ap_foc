@@ -60,8 +60,19 @@ public:
 
         // ── Observer / speed loop ──────────────────────────────────────────
         float    observer_gain = 2.5e7f;   // Ortega γ (bw ≈ γ·λ²); VESC-equivalent (9e7·(λ_vesc/λ)²)
+        // VESC scales the observer gain with duty/speed (m_gamma_now duty map) so
+        // it is gentle at low speed and full once back-EMF is large. Gain scales
+        // linearly with modulation depth, reaching full `observer_gain` at
+        // `observer_gain_mod_full` and floored at `observer_gain_slow_frac` below.
+        // This is what keeps the open-loop hard-switch convergence from blipping.
+        float    observer_gain_mod_full  = 0.4f;   // modulation at which gain hits full
+        float    observer_gain_slow_frac = 0.25f;  // floor fraction at standstill (VESC foc_observer_gain_slow)
         float    speed_kp      = 0.0005f;  // outer speed PI [A per eRPM]
         float    speed_ki      = 0.001f;   // outer speed PI [A per eRPM·s]
+        // VESC s_pid_ramp_erpms_s: slew the speed setpoint toward the command at
+        // this accel limit. Keeps the post-handover acceleration controlled so the
+        // observer/PLL can track it (no desync on large speed commands).
+        float    speed_ramp_erpm_s = 5000.0f; // setpoint slew rate [eRPM/s]
         // PLL that tracks the observer angle to produce a clean speed estimate
         // (VESC foc_pll_run). Replaces noisy angle-differentiation. Tuned for
         // ωn≈500 rad/s (~80 Hz), ζ≈1: kp=2·ζ·ωn, ki=ωn². Fast enough to follow
@@ -121,6 +132,7 @@ public:
     float get_erpm()          const { return _t_erpm; }    // electrical RPM
     float get_estimated_angle() const { return _t_theta; }     // control angle [rad]
     float get_observer_angle()  const { return _t_obs_theta; } // observer angle [rad]
+    float get_free_observer_angle() const { return _t_free_theta; } // unseeded shadow observer [rad]
     float get_vbus()          const { return _vbus; }
     uint8_t get_fault()       const { return _fault_code; }
     uint8_t get_state()       const { return uint8_t(_state); }
@@ -181,9 +193,13 @@ private:
     float _obs_L           = 0.0f;   // 1.5·Ls
     float _obs_R           = 0.0f;   // 1.5·Rs
     float _obs_lambda2     = 0.0f;   // λ²
-    float _obs_gamma_half  = 0.0f;   // γ/2
+    float _obs_gamma_half  = 0.0f;   // γ/2 (base, scaled by modulation each cycle)
+    float _obs_gain_mod_inv = 0.0f;  // 1 / observer_gain_mod_full
+    float _obs_gain_slow_frac = 0.25f; // gain floor fraction at low speed
     float _spd_kp          = 0.0f;
     float _spd_ki_dt       = 0.0f;
+    float _spd_ramp_erpm_s = 0.0f;   // speed-setpoint slew rate [eRPM/s]
+    float _spd_set_erpm    = 0.0f;   // ramped speed setpoint (follows _cmd_erpm)
     float _pll_kp          = 0.0f;   // observer-angle PLL gains (speed estimate)
     float _pll_ki          = 0.0f;
     float _erpm_to_w       = 0.0f;   // 2π/60
@@ -208,6 +224,8 @@ private:
     float _obs_theta  = 0.0f;
     float _obs_omega  = 0.0f;   // electrical speed [rad/s] — PLL output
     float _pll_theta  = 0.0f;   // PLL tracked angle (follows _obs_theta)
+    float _free_x1    = 0.0f;   // shadow observer — never seeded/clobbered (diagnostic)
+    float _free_x2    = 0.0f;
 
     // ── Telemetry snapshots (ISR → thread) ─────────────────────────────────
     volatile State   _state      = State::IDLE;
@@ -222,6 +240,7 @@ private:
     volatile float   _t_erpm  = 0.0f;
     volatile float   _t_theta = 0.0f;
     volatile float   _t_obs_theta = 0.0f;
+    volatile float   _t_free_theta = 0.0f;
 };
 
 } // namespace ChibiOS
