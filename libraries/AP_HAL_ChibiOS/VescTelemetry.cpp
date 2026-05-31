@@ -245,7 +245,7 @@ void VescTelemetry::handle_get_values()
     const float free_theta = _mc.get_free_observer_angle(); // unseeded shadow observer [rad]
 
     const float i_motor = _mc.get_motor_current(); // q-axis (torque) current [A]
-    const float v_in    = _mc.get_vbus();
+    const float v_in    = _mc.read_vbus();   // fresh ADC sample (PA0 divider)
     const float duty    = _mc.get_duty();
     const float erpm    = _mc.get_erpm();          // electrical RPM (VESC convention)
 

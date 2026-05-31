@@ -335,6 +335,32 @@ extern "C" void motor_control_adc2_irq_hook(uint32_t isr)
     handle_phase_current_sample_isr(uint16_t(ADC2->JDR1 & 0xFFFFU), PHASE_CURRENT_PENDING_V);
 }
 
+// VBUS sense: PA0 → ADC1_IN1, divider 357k over 22k, 3.3V Vref, 12-bit.
+float stm32_foc_vbus_read_volts()
+{
+#if HAL_USE_ADC == TRUE && STM32_ADC_USE_ADC1 == TRUE
+    static bool vbus_inited = false;
+    constexpr float VBUS_SCALE = 3.3f * (357.0f + 22.0f) / (22.0f * 4096.0f);
+
+    if (!driver_state.current_sense_ok) {
+        return 0.0f;
+    }
+    if (!vbus_inited) {
+        palSetLineMode(PAL_LINE(GPIOA, 0U), PAL_MODE_INPUT_ANALOG);
+        ADC1->SMPR1 = (ADC1->SMPR1 & ~ADC_SMPR1_SMP1_Msk) |
+                       ADC_SMPR1_SMP_AN1(PHASE_CURRENT_SAMPLE_TIME);
+        ADC1->SQR1  = (1U << ADC_SQR1_SQ1_Pos);  // L=0 (one conv), SQ1 = channel 1
+        vbus_inited = true;
+    }
+    ADC1->ISR  = ADC_ISR_EOC;
+    ADC1->CR  |= ADC_CR_ADSTART;
+    while ((ADC1->ISR & ADC_ISR_EOC) == 0U) {}
+    return float(ADC1->DR & 0xFFFFU) * VBUS_SCALE;
+#else
+    return 0.0f;
+#endif
+}
+
 } // namespace ChibiOS
 
 #endif // CONFIG_HAL_BOARD == HAL_BOARD_CHIBIOS

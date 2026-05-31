@@ -38,4 +38,10 @@ void stm32_foc_motor_control_disable_outputs_isr();
 // Write CCR values directly — must be called from ISR context (no syslock).
 void stm32_foc_motor_control_write_pwm(uint16_t phase_u, uint16_t phase_v, uint16_t phase_w);
 
+// Single-shot VBUS read via ADC1 IN1 (PA0). Returns DC-bus volts after the
+// 357k/22k divider. Blocking (~1 µs); coexists with the injected current-sense
+// channel, which has priority and will preempt the regular conversion.
+// Call from thread context at low rate.
+float stm32_foc_vbus_read_volts();
+
 } // namespace ChibiOS

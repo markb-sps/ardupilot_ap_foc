@@ -195,6 +195,17 @@ void MotorControl::disable_outputs()
 #endif
 }
 
+float MotorControl::read_vbus()
+{
+    if (_current_sense_initialized) {
+        const float v = stm32_foc_vbus_read_volts();
+        if (v > 1.0f) {
+            _vbus = v;
+        }
+    }
+    return _vbus;
+}
+
 void MotorControl::set_current(float amps)
 {
     _last_cmd_ms = AP_HAL::millis();

@@ -39,8 +39,10 @@ public:
 
         // ── Current loop / limits ──────────────────────────────────────────
         float    current_bw_rad    = 1000.0f; // current-loop bandwidth [rad/s]
-        float    current_max       = 15.0f;   // iq command limit [A]
-        float    overcurrent_trip  = 30.0f;   // per-phase hard trip [A]
+        // EPC23102 GaN HB: 100 V / 65 A pulsed, ~35 A continuous (cooling-bound).
+        // Iq cap is approx peak phase current; keep below continuous with margin.
+        float    current_max       = 30.0f;   // iq command limit [A]
+        float    overcurrent_trip  = 50.0f;   // per-phase hard trip [A]
         float    max_modulation    = 0.90f;   // SVPWM duty ceiling [0..~0.95]
         // Dead-time voltage error to cancel, in volts (0 disables). This is the
         // ~fixed voltage the bridge loses to dead-time per phase; measure it with
@@ -134,6 +136,9 @@ public:
     float get_observer_angle()  const { return _t_obs_theta; } // observer angle [rad]
     float get_free_observer_angle() const { return _t_free_theta; } // unseeded shadow observer [rad]
     float get_vbus()          const { return _vbus; }
+    // Refresh _vbus from the on-board divider (PA0). Thread context only;
+    // safe to call alongside the current-sense ISR. Returns the new volts.
+    float read_vbus();
     uint8_t get_fault()       const { return _fault_code; }
     uint8_t get_state()       const { return uint8_t(_state); }
 
