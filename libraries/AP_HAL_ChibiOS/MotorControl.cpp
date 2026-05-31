@@ -167,10 +167,14 @@ void MotorControl::trip_fault(uint8_t code)
     reset_control();
 }
 
-// Bridge held off (STOP / latched fault): zero duty, clean control state.
+// Bridge held off (STOP / latched fault): truly high-Z the outputs (MOE=0) so
+// the rotor freewheels rather than being short-braked by PWM(0,0,0) — which
+// would tie all three phases to GND via the low-side FETs and damp/jitter the
+// rotor against cogging. Outputs are re-enabled by the next spin-up command.
 void MotorControl::hold_off(State s)
 {
     reset_control();
+    stm32_foc_motor_control_disable_outputs_isr();
     stm32_foc_motor_control_write_pwm(0, 0, 0);
     _state = s;
     _t_id = _t_iq = _t_vd = _t_vq = _t_duty = _t_erpm = 0.0f;
@@ -209,12 +213,35 @@ float MotorControl::read_vbus()
 void MotorControl::set_current(float amps)
 {
     _last_cmd_ms = AP_HAL::millis();
-    if (fabsf(amps) < 0.01f) {   // zero command = explicit stop (also clears a latched fault)
-        stop();
+    _fault_code  = FAULT_NONE;        // any host current command clears a latched trip
+    if (fabsf(amps) < 0.01f) {
+        // Zero command: while running keep the loop alive at iq=0 (current loop
+        // drives vd/vq to hold zero current → smooth coast, no bridge cliff-cut).
+        // From idle/fault, stay idle so a zero command can't spin the motor up.
+        _cmd_current = 0.0f;
+        _mode = (_state == State::CLOSED || _state == State::OPENLOOP) ? Mode::CURRENT : Mode::STOP;
         return;
     }
     _cmd_current = clampf(amps, -_current_max, _current_max);
-    _mode = Mode::CURRENT;
+    _mode = Mode::CURRENT;                      // set mode first so a racing ISR sees CURRENT not STOP
+    stm32_foc_motor_control_enable_outputs();   // re-arm bridge if previously released
+}
+
+// VESC COMM_SET_CURRENT_BRAKE: apply iq opposite to rotation for regenerative
+// braking. Loop stays active so back-EMF energy returns to the bus in a controlled
+// way (no high-Z body-diode rectification). Auto-releases the bridge once speed
+// drops below the safe-release threshold (see adc_sample_isr).
+void MotorControl::set_brake_current(float amps)
+{
+    _last_cmd_ms = AP_HAL::millis();
+    _fault_code  = FAULT_NONE;
+    const float mag = fabsf(amps);
+    if (mag < 0.01f) {           // zero brake ≡ coast
+        set_current(0.0f);
+        return;
+    }
+    _cmd_current = (mag > _current_max) ? _current_max : mag;  // magnitude only
+    _mode = Mode::BRAKE;
 }
 
 void MotorControl::set_rpm(float erpm)
@@ -226,6 +253,7 @@ void MotorControl::set_rpm(float erpm)
     }
     _cmd_erpm = erpm;
     _mode = Mode::SPEED;
+    stm32_foc_motor_control_enable_outputs();
 }
 
 void MotorControl::check_command_timeout(uint32_t now_ms)
@@ -258,6 +286,7 @@ void MotorControl::set_debug_voltage(float duty)
     _debug_dir = (duty >= 0.0f) ? 1.0f : -1.0f;
     _fault_code = FAULT_NONE;   // a fresh debug command clears a latched trip
     _mode = Mode::DEBUG_VOLTAGE;
+    stm32_foc_motor_control_enable_outputs();
 }
 
 // ── ISR path ────────────────────────────────────────────────────────────────
@@ -351,10 +380,26 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v)
         return;
     }
 
+    // ── Coast (CURRENT @ iq=0) / Brake: hold the loop alive, never let OL
+    //    re-arm and re-spin the motor, auto-release once safely slow. Without
+    //    this, a coasting motor that drops below the OL hysteresis threshold
+    //    would be kicked back up by the boost sequence → endless OL/CLOSED loop.
+    const bool coasting = (mode == Mode::BRAKE) ||
+                          (mode == Mode::CURRENT && _cmd_current == 0.0f);
+    if (coasting) {
+        constexpr float RELEASE_OMEGA = 10.47f;          // ~100 eRPM (rad/s)
+        if (fabsf(_obs_omega) < RELEASE_OMEGA) {
+            hold_off(State::IDLE);                       // safe to high-Z now
+            return;
+        }
+        _ol_timer = 0.0f;
+        _hyst_timer = 0.0f;
+    }
+
     // First running cycle after STOP / fault / debug → arm the open-loop
     // sequence immediately so a standstill start runs the forced lock→ramp.
     bool started_now = false;
-    if (_state != State::OPENLOOP && _state != State::CLOSED) {
+    if (_state != State::OPENLOOP && _state != State::CLOSED && !coasting) {
         _override_ang = _obs_theta;
         _integ_spd    = 0.0f;
         _hyst_timer   = 0.0f;
@@ -383,6 +428,10 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v)
         const float erpm_err = set_erpm - _obs_omega * _w_to_erpm;
         _integ_spd = clampf(_integ_spd + erpm_err * _spd_ki_dt, -_current_max, _current_max);
         iq_cmd = clampf(erpm_err * _spd_kp + _integ_spd, -_current_max, _current_max);
+    } else if (mode == Mode::BRAKE) {
+        // _cmd_current holds the brake magnitude; sign opposes rotation.
+        iq_cmd = clampf((_obs_omega >= 0.0f ? -1.0f : 1.0f) * _cmd_current,
+                        -_current_max, _current_max);
     } else {
         iq_cmd = clampf(_cmd_current, -_current_max, _current_max);
     }
@@ -406,8 +455,9 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v)
     } else if (_hyst_timer > 0.0f) {
         _hyst_timer -= _dt;
     }
-    // Re-trigger a fresh sequence after a stall (skipped if just armed above).
-    if (_hyst_timer >= _ol_hyst && _ol_timer <= 1e-4f) {
+    // Re-trigger a fresh sequence after a stall (skipped if just armed above,
+    // and never while coasting/braking — must not auto-re-spin the motor).
+    if (_hyst_timer >= _ol_hyst && _ol_timer <= 1e-4f && !coasting) {
         _ol_timer   = _ol_t_total;
         started_now = true;
     }

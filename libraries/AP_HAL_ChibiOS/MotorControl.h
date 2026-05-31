@@ -106,9 +106,10 @@ public:
     void disable_outputs();
 
     // ── Set-points (thread context) ────────────────────────────────────────
-    void set_current(float amps);  // torque control (signed iq)
-    void set_rpm(float erpm);      // speed control (signed electrical RPM)
-    void stop();                   // coast + clear latched fault
+    void set_current(float amps);        // torque control (signed iq). 0 = hold iq=0 (smooth coast) if running, else idle.
+    void set_brake_current(float amps);  // regen brake: iq opposite to rotation, |iq|=amps; auto-releases at low speed.
+    void set_rpm(float erpm);            // speed control (signed electrical RPM)
+    void stop();                         // coast + clear latched fault
 
     // Host failsafe: coast if no host packet arrived within command_timeout_ms.
     // Call periodically from thread context with the current millis() timestamp.
@@ -167,7 +168,7 @@ private:
     volatile bool     _current_zero_valid = false;
 
     // ── Commands (written from thread, read in ISR) ────────────────────────
-    enum class Mode : uint8_t { STOP, CURRENT, SPEED, DEBUG_VOLTAGE };
+    enum class Mode : uint8_t { STOP, CURRENT, SPEED, BRAKE, DEBUG_VOLTAGE };
     volatile Mode  _mode        = Mode::STOP;
     volatile float _cmd_current = 0.0f;   // [A]
     volatile float _cmd_erpm    = 0.0f;   // [electrical RPM]

@@ -38,6 +38,7 @@ private:
     void handle_get_values();
     void handle_set_rpm();
     void handle_set_current();
+    void handle_set_current_brake();
     void handle_set_duty();
 
     static uint16_t crc16(const uint8_t *data, uint16_t len);

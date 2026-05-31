@@ -17,6 +17,7 @@ constexpr uint8_t COMM_FW_VERSION = 0;
 constexpr uint8_t COMM_GET_VALUES = 4;
 constexpr uint8_t COMM_SET_DUTY   = 5;
 constexpr uint8_t COMM_SET_CURRENT = 6;
+constexpr uint8_t COMM_SET_CURRENT_BRAKE = 7;
 constexpr uint8_t COMM_SET_RPM    = 8;
 
 constexpr uint8_t FW_MAJOR = 6;
@@ -170,6 +171,9 @@ void VescTelemetry::dispatch()
     case COMM_SET_CURRENT:
         handle_set_current();
         break;
+    case COMM_SET_CURRENT_BRAKE:
+        handle_set_current_brake();
+        break;
     case COMM_SET_RPM:
         handle_set_rpm();
         break;
@@ -293,6 +297,18 @@ void VescTelemetry::handle_set_current()
                        (int32_t(_payload[3]) <<  8) |
                         int32_t(_payload[4]);
     _mc.set_current(float(ma) / 1000.0f);
+}
+
+// COMM_SET_CURRENT_BRAKE: payload = [cmd, int32 brake_mA] — regen brake
+// magnitude; sign auto-applied opposite to rotation in the ISR.
+void VescTelemetry::handle_set_current_brake()
+{
+    if (_payload_len < 5) return;
+    const int32_t ma = (int32_t(_payload[1]) << 24) |
+                       (int32_t(_payload[2]) << 16) |
+                       (int32_t(_payload[3]) <<  8) |
+                        int32_t(_payload[4]);
+    _mc.set_brake_current(float(ma) / 1000.0f);
 }
 
 // COMM_SET_DUTY: payload = [cmd, int32 duty·1e5]. Repurposed as the open-loop

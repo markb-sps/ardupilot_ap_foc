@@ -136,7 +136,7 @@ void AP_Periph_FW::init()
         motor_cfg.pwm_clock_hz = 20000000;
         motor_cfg.pwm_frequency_hz = 20000;
         motor_cfg.current_sample_delay_ticks = 5;
-        motor_cfg.deadtime_ticks = 3;
+        motor_cfg.deadtime_ticks = 8;
         motor_cfg.center_aligned = true;
         motor_cfg.break_input_enabled = false;
         // BDUAV 6374-170kv electrical parameters (tune on hardware via VESC Tool).
@@ -485,21 +485,16 @@ void AP_Periph_FW::show_stack_free()
 #endif
 
 #if CONFIG_HAL_BOARD == HAL_BOARD_CHIBIOS
-// Manage the output stage from thread context. Set-points (current / RPM) come
-// from VESC Tool through VescTelemetry; the FOC control cycle itself runs in the
-// ADC ISR. The bridge is gated off until zero-current calibration completes and
-// is cut on any latched fault.
+// Set-points (current / RPM) come from VESC Tool through VescTelemetry; the FOC
+// cycle runs in the ADC ISR. MotorControl manages MOE internally — spin-up
+// commands enable it, hold_off()/trip_fault() disable it — so the thread side
+// only has to enforce the host-comms failsafe here.
 void AP_Periph_FW::update_motor_test(uint32_t now_ms)
 {
     if (!motor_control.is_initialized()) {
         return;
     }
     motor_control.check_command_timeout(now_ms);  // coast if host stopped commanding
-    if (motor_control.is_active()) {
-        motor_control.enable_outputs();
-    } else {
-        motor_control.disable_outputs();
-    }
 }
 #endif
 
