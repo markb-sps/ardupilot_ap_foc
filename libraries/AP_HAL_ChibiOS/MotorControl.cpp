@@ -437,13 +437,16 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v)
         iq_set = clampf(iq_cmd + dir * _ol_boost_q, -_ol_max_q, _ol_max_q);
         _integ_spd = clampf(_integ_spd, -_ol_max_q, _ol_max_q);
 
-        // Seed observer flux to the forced angle (+45° lead, VESC
-        // m_observer_x1/x2_override) so it is already tracking when the override
-        // releases. VESC clobbers this every override cycle, then hard-switches
+        // Seed observer flux to where the rotor d-axis actually sits in I/f:
+        // current is applied on the forced q-axis, so under sufficient torque the
+        // rotor d-axis (PM flux) aligns with the current vector at forced_angle +
+        // dir·π/2 — and the observer state x = λ·(cos,sin)(rotor_angle). Matches
+        // VESC m_observer_x1/x2_override (offset -π/2 in VESC's opposite sign
+        // convention). VESC clobbers this every override cycle, then hard-switches
         // to the observer angle; the post-handover convergence is kept gentle by
         // the speed-scaled observer gain (see observer_update), not by a blend.
-        _obs_x1 = cosf(_override_ang + dir * 0.78539816f) * _obs_lambda;
-        _obs_x2 = sinf(_override_ang + dir * 0.78539816f) * _obs_lambda;
+        _obs_x1 = cosf(_override_ang + dir * 1.57079633f) * _obs_lambda;
+        _obs_x2 = sinf(_override_ang + dir * 1.57079633f) * _obs_lambda;
 
         _ol_timer  -= _dt;
         _hyst_timer = 0.0f;
