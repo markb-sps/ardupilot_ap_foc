@@ -4,13 +4,14 @@
 #undef IMU
 
 # MCU class and specific type
-MCU STM32G431 STM32G431xx
+MCU STM32G474 STM32G474xx
 
 # Flash reserved for bootloader
 FLASH_RESERVE_START_KB 26
 
-# Flash page where storage starts (should be the end of the physical flash)
-STORAGE_FLASH_PAGE 62
+# Flash page where storage starts (should be the end of the physical flash).
+# G474 = 512 KB in 2 KB pages -> 256 pages (0..255); use the second-to-last.
+STORAGE_FLASH_PAGE 254
 define HAL_STORAGE_SIZE 400
 
 # board ID. See Tools/AP_Bootloader/board_types.txt
@@ -29,7 +30,7 @@ define HAL_CHPRINTF_USE_FLOAT 0
 STM32_ST_USE_TIMER 2
 
 # Total chip flash size
-FLASH_SIZE_KB 128
+FLASH_SIZE_KB 512
 
 # order of UARTs
 SERIAL_ORDER OTG1
@@ -108,13 +109,12 @@ define STM32_ADC_ADC2_IRQ_HOOK do { extern void motor_control_adc2_irq_hook(uint
 #PA4 VSENSE50  ADC2 SCALE(18.39416)
 #PA5 VSENSE3v3 ADC2 SCALE(1)
 
-# phase current sensing uses the STM32G4 internal opamps:
-# OPAMP1: PA1/PA3 -> PA2 (ADC1_IN3)
-# OPAMP2: PA7/PA5 -> PA6 (ADC2_IN3)
-# OPAMP3: PB0/PB2 -> PB1 (ADC1_IN12)
-# MotorControl samples only OPAMP1/ADC1_IN3 and OPAMP2/ADC2_IN3.
-# Phase W is derived from U and V, so OPAMP3/ADC1_IN12 is left unused.
-# These pins are configured directly by MotorControl at runtime.
+# phase current sensing (v2 PCB): external INA181A1 amps (gain 20 V/V) across
+# 1 mR low-side shunts, REF = 1.8 V. No STM32 internal OpAmps.
+#   PHASE_I1 -> PA1 (ADC1_IN2)
+#   PHASE_I2 -> PA7 (ADC2_IN4)
+#   PHASE_I3 -> PB0 (ADC1_IN15) - available, currently unused (W derived from U+V)
+# VBUS -> PA0 (ADC1_IN1). These pins are configured by MotorControl at runtime.
 
 # ESC interrupt
 #PC6 ESC_INT INPUT

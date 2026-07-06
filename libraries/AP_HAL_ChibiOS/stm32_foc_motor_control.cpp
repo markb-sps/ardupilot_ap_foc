@@ -4,7 +4,9 @@
 #include <hal.h>
 #include <string.h>
 
-#if CONFIG_HAL_BOARD == HAL_BOARD_CHIBIOS
+// The whole driver needs the PWM/ADC HAL (TIM1 + injected ADC). Builds without
+// them (e.g. the bootloader) compile this to an empty translation unit.
+#if CONFIG_HAL_BOARD == HAL_BOARD_CHIBIOS && (HAL_USE_PWM == TRUE)
 
 namespace ChibiOS {
 
@@ -13,46 +15,31 @@ namespace {
 constexpr uint32_t PHASE_CURRENT_SAMPLE_TIME =
 #if defined(ADC_SMPR_SMP_47P5)
     ADC_SMPR_SMP_47P5;
-#else
+#elif defined(ADC_SMPR_SMP_61P5)
     ADC_SMPR_SMP_61P5;
+#else
+    0U;  // ADC HAL not built (e.g. bootloader); value is unused there
 #endif
 
-constexpr uint32_t OPAMP_CSR_VPSEL_VINP0        = 0U;
-constexpr uint32_t OPAMP_CSR_PGA_MODE           = OPAMP_CSR_VMSEL_1;
-constexpr uint32_t OPAMP_CSR_PGA_EXTERNAL_VINM0 = OPAMP_CSR_PGGAIN_3;
-constexpr uint32_t OPAMP_CSR_PGA_GAIN_16        = OPAMP_CSR_PGA_EXTERNAL_VINM0 |
-                                                   OPAMP_CSR_PGGAIN_0 |
-                                                   OPAMP_CSR_PGGAIN_1;
-// NOTE: OPAMPINTEN (OPAINTOEN, bit 8) is intentionally NOT set. On STM32G4 that
-// bit routes the OpAmp output to a dedicated *internal* ADC channel and
-// DISCONNECTS it from the VOUT pin. This board samples the external pins
-// PA2/PA6 = ADC1_IN3/ADC2_IN3 (see hwdef), so the output must reach the pin —
-// i.e. OPAINTOEN must be 0. Setting it left IN3 reading an undriven pin (~0).
-constexpr uint32_t PHASE_CURRENT_OPAMP_ENABLED_CSR =
-    OPAMP_CSR_HIGHSPEEDEN |
-    OPAMP_CSR_VPSEL_VINP0 |
-    OPAMP_CSR_PGA_MODE    |
-    OPAMP_CSR_PGA_GAIN_16 |
-    OPAMP_CSR_OPAMPxEN;
+// v2 PCB: phase currents come from external INA181A1 amps (gain 20 V/V) on
+// plain ADC inputs — no STM32 internal OpAmps. The amp outputs are sampled
+// directly:
+//   PHASE_I1 -> PA1 = ADC1_IN2  (phase U, ADC1 injected)
+//   PHASE_I2 -> PA7 = ADC2_IN4  (phase V, ADC2 injected)
+// Phase W is derived from U+V (PHASE_I3/PB0 left unused).
 
 // TIM1_TRGO2 injected trigger for ADC1/ADC2 on STM32G4: JEXTSEL = 8, rising edge.
 // TRGO2 sources OC4REF; with centre-aligned PWM mode 1 the OC4REF level has a
 // single rising edge per period (when CNT counts down through CCR4), giving one
 // ADC trigger per PWM cycle without needing an auxiliary timer.
-constexpr uint32_t PHASE_CURRENT_ADC_CHANNEL    = ADC_CHANNEL_IN3;
+constexpr uint32_t PHASE_CURRENT_ADC1_CHANNEL   = 2U;   // PA1 = ADC1_IN2 (PHASE_I1)
+constexpr uint32_t PHASE_CURRENT_ADC2_CHANNEL   = 4U;   // PA7 = ADC2_IN4 (PHASE_I2)
 constexpr uint32_t PHASE_CURRENT_ADC_JEXTSEL    = 8U;
 constexpr uint8_t  PHASE_CURRENT_PENDING_U      = 1U;
 constexpr uint8_t  PHASE_CURRENT_PENDING_V      = 2U;
 
-const ioline_t OPAMP1_VINP_LINE = PAL_LINE(GPIOA, 1U);
-const ioline_t OPAMP1_VINM_LINE = PAL_LINE(GPIOA, 3U);
-const ioline_t OPAMP1_VOUT_LINE = PAL_LINE(GPIOA, 2U);
-const ioline_t OPAMP2_VINM_LINE = PAL_LINE(GPIOA, 5U);
-const ioline_t OPAMP2_VOUT_LINE = PAL_LINE(GPIOA, 6U);
-const ioline_t OPAMP2_VINP_LINE = PAL_LINE(GPIOA, 7U);
-const ioline_t OPAMP3_VINP_LINE = PAL_LINE(GPIOB, 0U);
-const ioline_t OPAMP3_VOUT_LINE = PAL_LINE(GPIOB, 1U);
-const ioline_t OPAMP3_VINM_LINE = PAL_LINE(GPIOB, 2U);
+const ioline_t PHASE_I1_LINE = PAL_LINE(GPIOA, 1U);  // ADC1_IN2
+const ioline_t PHASE_I2_LINE = PAL_LINE(GPIOA, 7U);  // ADC2_IN4
 
 struct DriverState {
     bool     initialized              = false;
@@ -71,27 +58,6 @@ struct DriverState {
     volatile uint16_t vbus_raw         = 0U;
 } driver_state;
 
-
-void init_opamps()
-{
-#if defined(STM32G4)
-    palSetLineMode(OPAMP1_VINP_LINE, PAL_MODE_INPUT_ANALOG);
-    palSetLineMode(OPAMP1_VINM_LINE, PAL_MODE_INPUT_ANALOG);
-    palSetLineMode(OPAMP1_VOUT_LINE, PAL_MODE_INPUT_ANALOG);
-    palSetLineMode(OPAMP2_VINP_LINE, PAL_MODE_INPUT_ANALOG);
-    palSetLineMode(OPAMP2_VINM_LINE, PAL_MODE_INPUT_ANALOG);
-    palSetLineMode(OPAMP2_VOUT_LINE, PAL_MODE_INPUT_ANALOG);
-    palSetLineMode(OPAMP3_VINP_LINE, PAL_MODE_INPUT_ANALOG);
-    palSetLineMode(OPAMP3_VINM_LINE, PAL_MODE_INPUT_ANALOG);
-    palSetLineMode(OPAMP3_VOUT_LINE, PAL_MODE_INPUT_ANALOG);
-
-    OPAMP1->CSR = PHASE_CURRENT_OPAMP_ENABLED_CSR;
-    OPAMP2->CSR = PHASE_CURRENT_OPAMP_ENABLED_CSR;
-    OPAMP3->CSR = 0U;
-
-    osalSysPolledDelayX(OSAL_US2RTC(STM32_HCLK, 20U));
-#endif
-}
 
 void init_tim1_adc_trigger(uint16_t period_ticks, uint16_t delay_ticks)
 {
@@ -133,18 +99,21 @@ void calibrate_adc(ADC_TypeDef *adc)
     osalSysPolledDelayX(OSAL_US2RTC(STM32_HCLK, 20U));
 }
 
-void init_adc_unit(ADC_TypeDef *adc)
+void init_adc_unit(ADC_TypeDef *adc, uint32_t channel)
 {
     calibrate_adc(adc);
 
     adc->CR   = ADC_CR_ADVREGEN;
     adc->ISR  = adc->ISR;  // clear all flags
-    adc->SMPR1 = (adc->SMPR1 & ~ADC_SMPR1_SMP3_Msk) |
-                  ADC_SMPR1_SMP_AN3(ADC_SMPR_SMP_47P5);
+    // Sample time for the injected channel. Channels 0..9 live in SMPR1, three
+    // bits each; PHASE_I1/2 are IN2 and IN4 so both land here.
+    const uint32_t smp_shift = channel * 3U;
+    adc->SMPR1 = (adc->SMPR1 & ~(0x7U << smp_shift)) |
+                  (uint32_t(PHASE_CURRENT_SAMPLE_TIME) << smp_shift);
     adc->JSQR =
         (0U << ADC_JSQR_JL_Pos)                              |  // 1 injected conversion
-        (PHASE_CURRENT_ADC_CHANNEL << ADC_JSQR_JSQ1_Pos)     |  // rank 1 = IN3
-        (PHASE_CURRENT_ADC_JEXTSEL << ADC_JSQR_JEXTSEL_Pos)  |  // TIM4_TRGO (STM32G4 ADC1/2)
+        (channel << ADC_JSQR_JSQ1_Pos)                       |  // rank 1 = INx
+        (PHASE_CURRENT_ADC_JEXTSEL << ADC_JSQR_JEXTSEL_Pos)  |  // TIM1_TRGO2 (STM32G4 ADC1/2)
         ADC_JSQR_JEXTEN_0;                                      // rising edge
     adc->IER = ADC_IER_JEOCIE | ADC_IER_JEOSIE;
     adc->CR |= ADC_CR_ADEN;
@@ -160,8 +129,13 @@ bool init_current_sense()
     rccResetADC12();
     rccEnableADC12(true);
     ADC12_COMMON->CCR = STM32_ADC_ADC12_PRESC | STM32_ADC_ADC12_CLOCK_MODE;
-    init_adc_unit(ADC1);
-    init_adc_unit(ADC2);
+
+    // INA181 outputs feed plain analog inputs; drive the pins as analog.
+    palSetLineMode(PHASE_I1_LINE, PAL_MODE_INPUT_ANALOG);  // PA1 -> ADC1_IN2
+    palSetLineMode(PHASE_I2_LINE, PAL_MODE_INPUT_ANALOG);  // PA7 -> ADC2_IN4
+
+    init_adc_unit(ADC1, PHASE_CURRENT_ADC1_CHANNEL);
+    init_adc_unit(ADC2, PHASE_CURRENT_ADC2_CHANNEL);
 
     // Configure ADC1 regular sequence for VBUS (PA0 = ADC1_IN1) and kick off
     // the first conversion. From here on the ADC1 ISR keeps re-arming a single
@@ -264,7 +238,6 @@ Stm32FocMotorControlInitResult stm32_foc_motor_control_init(const Stm32FocMotorC
         TIM1->CR1 |=  STM32_TIM_CR1_CMS(1);
     }
 
-    init_opamps();
     init_tim1_adc_trigger(driver_state.period_ticks, driver_state.current_sample_delay_ticks);
     driver_state.current_sense_ok = init_current_sense();
 
@@ -358,14 +331,14 @@ extern "C" void motor_control_adc2_irq_hook(uint32_t isr)
     handle_phase_current_sample_isr(uint16_t(ADC2->JDR1 & 0xFFFFU), PHASE_CURRENT_PENDING_V);
 }
 
-// VBUS sense: PA0 → ADC1_IN1, divider 357k over 22k, 3.3V Vref, 12-bit.
+// VBUS sense: PA0 → ADC1_IN1, divider 357k over 10k, 3.3V Vref, 12-bit.
 // Read is a pure cached load — the regular conversion is driven from the
 // ADC1 ISR (see motor_control_adc1_irq_hook), so this never blocks the
 // thread and never races the injected phase-current trigger.
 float stm32_foc_vbus_read_volts()
 {
 #if HAL_USE_ADC == TRUE && STM32_ADC_USE_ADC1 == TRUE
-    constexpr float VBUS_SCALE = 3.3f * (357.0f + 22.0f) / (22.0f * 4096.0f);
+    constexpr float VBUS_SCALE = 3.3f * (357.0f + 10.0f) / (10.0f * 4096.0f);
     if (!driver_state.current_sense_ok) {
         return 0.0f;
     }

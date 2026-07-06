@@ -37,16 +37,13 @@
 #endif
 
 namespace {
-constexpr float phase_current_shunt_ohms = 0.003f;
-constexpr float phase_current_input_resistor_ohms = 1500.0f;
-constexpr float phase_current_pullup_ohms = 22000.0f;
-constexpr float phase_current_pulldown_ohms = 2200.0f;
-constexpr float phase_current_opamp_gain = 16.0f;
-constexpr float phase_current_shunt_input_attenuation =
-    (1.0f / phase_current_input_resistor_ohms) /
-    ((1.0f / phase_current_input_resistor_ohms) +
-     (1.0f / phase_current_pullup_ohms) +
-     (1.0f / phase_current_pulldown_ohms));
+constexpr float phase_current_shunt_ohms = 0.001f;   // v2 PCB: R407 = 1 mR
+// v2 PCB: external INA181A1 current-sense amp (gain 20 V/V) sits directly
+// across the shunt — no external input-divider attenuation. Its REF = 1.8 V
+// zero-current bias is removed by the firmware's startup auto-calibration, so
+// it doesn't enter the scale.
+constexpr float phase_current_amp_gain = 20.0f;
+constexpr float phase_current_shunt_input_attenuation = 1.0f;
 }
 
 // not only will the code not compile without features this enables,
@@ -167,14 +164,15 @@ void AP_Periph_FW::init()
         // Outer speed PI — strong enough to reject load (tune: ↑ if sluggish, ↓ if hunting).
         motor_cfg.speed_kp = 0.005f;   // [A per eRPM]
         motor_cfg.speed_ki = 0.05f;    // [A per eRPM·s]
-        // Exact scale from hardware: 1 / (Rshunt * input_attenuation * opamp_gain)
+        // Exact scale from hardware: 1 / (Rshunt * input_attenuation * amp_gain)
+        // v2: 1 / (0.001 * 1.0 * 20) = 50 A/V.
         motor_cfg.current_scale = 1.0f / (phase_current_shunt_ohms *
                                            phase_current_shunt_input_attenuation *
-                                           phase_current_opamp_gain);
+                                           phase_current_amp_gain);
         // Bring-up: debug-voltage mode rotates the applied vector at this rate so
         // the observer has real back-EMF to lock onto (Step 2 sign/tracking check).
         // Set back to 0 for a static d-axis sign/scale test.
-        motor_cfg.debug_openloop_hz = 3.0f;   // ≈180 eRPM forced rotation
+        motor_cfg.debug_openloop_hz = 1.0f;   // ≈60 eRPM forced rotation (slow enough to pull in from rest)
         motor_control.init(motor_cfg);
 
         vesc_telem.init(hal.serial(0));

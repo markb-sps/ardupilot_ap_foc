@@ -183,6 +183,11 @@ private:
     float _cur_ki_dt       = 0.0f;   // R·ωbw·dt
     float _current_max     = 15.0f;
     float _oc_trip         = 30.0f;
+    // Overcurrent trip is debounced (needs OC_DEBOUNCE consecutive over-limit
+    // samples) and blanked for OC_BLANK_SAMPLES samples after each output enable
+    // to reject the switching-noise spike when the bridge first arms.
+    volatile uint16_t _oc_over_count = 0;
+    volatile uint16_t _oc_blank      = 0;
     float _v_max           = 0.0f;   // max |v_dq| = max_mod·vbus/√3
     float _inv_vbus_half   = 0.0f;   // 2/vbus
     float _dt_comp_duty    = 0.0f;   // dead-time comp expressed as a per-phase duty step

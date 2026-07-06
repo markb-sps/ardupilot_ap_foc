@@ -6,7 +6,9 @@
 #include <AP_HAL/AP_HAL.h>
 #include <hal.h>
 
-#if CONFIG_HAL_BOARD == HAL_BOARD_CHIBIOS
+// Needs the PWM/ADC HAL; builds without them (e.g. the bootloader) compile to
+// an empty translation unit.
+#if CONFIG_HAL_BOARD == HAL_BOARD_CHIBIOS && (HAL_USE_PWM == TRUE)
 
 #include <math.h>
 
@@ -15,6 +17,14 @@ namespace ChibiOS {
 namespace {
 constexpr float ADC_LSB_VOLTS   = 3.3f / 4095.0f;
 constexpr uint16_t ZERO_SAMPLES = 64;       // zero-current calibration window
+constexpr uint16_t OC_DEBOUNCE      = 3;    // consecutive over-limit samples before tripping
+constexpr uint16_t OC_BLANK_SAMPLES = 16;   // trip-blank window after the bridge arms
+// At zero current the INA181 outputs sit at the ~1.8 V reference (~2233 counts).
+// If the ref rail (VBUS-derived) is not up yet — e.g. the board booted on USB
+// before the motor supply was applied — the ADC reads ~0. Only begin the zero
+// calibration once both channels are clearly above this floor, otherwise a ~0
+// baseline would offset every reading by −1.8 V (≈ −90 A) and trip overcurrent.
+constexpr uint16_t SENSE_ALIVE_COUNTS = 1000;
 constexpr float TWO_PI          = 6.28318530718f;
 constexpr float PI_F            = 3.14159265359f;
 constexpr float DT_COMP_I_BAND  = 1.0f;     // [A] current band over which dead-time sign() is softened
@@ -42,7 +52,7 @@ inline float step_towards(float v, float target, float step)
 // (matches VESC utils_map usage here).
 inline float mapf(float x, float in_lo, float in_hi, float out_lo, float out_hi)
 {
-    if (in_hi == in_lo) return out_lo;
+    if (fabsf(in_hi - in_lo) < 1e-9f) return out_lo;
     const float t = clampf((x - in_lo) / (in_hi - in_lo), 0.0f, 1.0f);
     return out_lo + (out_hi - out_lo) * t;
 }
@@ -224,6 +234,7 @@ void MotorControl::set_current(float amps)
     }
     _cmd_current = clampf(amps, -_current_max, _current_max);
     _mode = Mode::CURRENT;                      // set mode first so a racing ISR sees CURRENT not STOP
+    _oc_over_count = 0; _oc_blank = OC_BLANK_SAMPLES;
     stm32_foc_motor_control_enable_outputs();   // re-arm bridge if previously released
 }
 
@@ -253,6 +264,7 @@ void MotorControl::set_rpm(float erpm)
     }
     _cmd_erpm = erpm;
     _mode = Mode::SPEED;
+    _oc_over_count = 0; _oc_blank = OC_BLANK_SAMPLES;
     stm32_foc_motor_control_enable_outputs();
 }
 
@@ -286,6 +298,7 @@ void MotorControl::set_debug_voltage(float duty)
     _debug_dir = (duty >= 0.0f) ? 1.0f : -1.0f;
     _fault_code = FAULT_NONE;   // a fresh debug command clears a latched trip
     _mode = Mode::DEBUG_VOLTAGE;
+    _oc_over_count = 0; _oc_blank = OC_BLANK_SAMPLES;
     stm32_foc_motor_control_enable_outputs();
 }
 
@@ -301,6 +314,13 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v)
 {
     // ── Zero-current calibration (outputs gated, no current flowing) ────────
     if (!_current_zero_valid) {
+        // Don't latch a baseline until the sense front-end (INA181 ref) is
+        // powered; restart accumulation if the rail dips mid-calibration.
+        if (sample_u < SENSE_ALIVE_COUNTS || sample_v < SENSE_ALIVE_COUNTS) {
+            _zero_accum[0] = _zero_accum[1] = 0;
+            _zero_count = 0;
+            return;
+        }
         _zero_accum[0] += sample_u;
         _zero_accum[1] += sample_v;
         if (++_zero_count == ZERO_SAMPLES) {
@@ -321,9 +341,19 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v)
     _t_ia = ia;
     _t_ib = ib;
 
-    // ── Hard overcurrent trip ───────────────────────────────────────────────
-    if (fabsf(ia) > _oc_trip || fabsf(ib) > _oc_trip || fabsf(ic) > _oc_trip) {
-        trip_fault(FAULT_ABS_OVERCURRENT);
+    // ── Hard overcurrent trip (blanked on arm, debounced) ───────────────────
+    // A single noisy sample must not latch a fault. Skip the first few samples
+    // after the bridge arms (switching-transient inrush on the sense line), then
+    // require OC_DEBOUNCE consecutive over-limit samples before tripping.
+    if (_oc_blank > 0) {
+        _oc_blank--;
+        _oc_over_count = 0;
+    } else if (fabsf(ia) > _oc_trip || fabsf(ib) > _oc_trip || fabsf(ic) > _oc_trip) {
+        if (++_oc_over_count >= OC_DEBOUNCE) {
+            trip_fault(FAULT_ABS_OVERCURRENT);
+        }
+    } else {
+        _oc_over_count = 0;
     }
 
     float i_alpha, i_beta;

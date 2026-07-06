@@ -237,11 +237,13 @@ void VescTelemetry::handle_fw_version()
 
 void VescTelemetry::handle_get_values()
 {
-    uint8_t buf[96];
+    uint8_t buf[104];
     uint8_t *p = buf;
 
     float id = 0, iq = 0;
     _mc.get_idq(id, iq);
+    float ia = 0, ib = 0, ic = 0;
+    _mc.get_phase_currents(ia, ib, ic);
     float vd = 0, vq = 0;
     _mc.get_vdq(vd, vq);
     const float theta     = _mc.get_estimated_angle();      // control angle [rad]
@@ -283,6 +285,8 @@ void VescTelemetry::handle_get_values()
     put_f32(p, theta,      10000.0f); // control/commanded angle      (offset 74)
     put_f32(p, obs_theta,  10000.0f); // observer-estimated angle     (offset 78)
     put_f32(p, free_theta, 10000.0f); // unseeded shadow observer     (offset 82)
+    put_f32(p, ia,           100.0f); // raw phase-U current [A]      (offset 86)
+    put_f32(p, ib,           100.0f); // raw phase-V current [A]      (offset 90)
 
     send_packet(buf, uint16_t(p - buf));
 }
