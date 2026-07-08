@@ -19,7 +19,13 @@ public:
     enum class State : uint8_t { IDLE, ALIGN, OPENLOOP, BLEND, CLOSED, FAULT, DEBUG };
 
     // VESC fault codes (subset) reported through telemetry.
-    enum Fault : uint8_t { FAULT_NONE = 0, FAULT_ABS_OVERCURRENT = 4 };
+    // FAULT_STALL is not a VESC code — 30 is outside the VESC enum range.
+    enum Fault : uint8_t {
+        FAULT_NONE            = 0,
+        FAULT_ABS_OVERCURRENT = 4,
+        FAULT_OVER_TEMP_FET   = 5,
+        FAULT_STALL           = 30,
+    };
 
     struct Config {
         // ── PWM / current sense ────────────────────────────────────────────
@@ -42,8 +48,37 @@ public:
         // EPC23102 GaN HB: 100 V / 65 A pulsed, ~35 A continuous (cooling-bound).
         // Iq cap is approx peak phase current; keep below continuous with margin.
         float    current_max       = 30.0f;   // iq command limit [A]
-        float    overcurrent_trip  = 50.0f;   // per-phase hard trip [A]
+        float    overcurrent_trip  = 50.0f;   // per-phase hard trip [A] (debounced)
+        // Instant trip [A]: no debounce and active even inside the post-arm
+        // blanking window, so an arm-into-a-short is caught within one sample.
+        float    overcurrent_trip_hard = 60.0f;
         float    max_modulation    = 0.90f;   // SVPWM duty ceiling [0..~0.95]
+        // Max braking/regen MOTOR current [A]. Caps the negative (decelerating)
+        // iq in SPEED mode and the magnitude in BRAKE mode. Keep conservative:
+        // braking energy returns to the bus, a bench PSU can't sink it, and
+        // there is no bus-OV handling yet. Raise once OV clamp / brake resistor.
+        float    regen_current_max = 5.0f;
+        // Bus over-voltage foldback: braking/regen current is scaled down
+        // proportionally as vbus rises through the band below vbus_max,
+        // reaching zero at vbus_max — keeps regen from pumping the bus past
+        // vbus_max even without a brake resistor / OV clamp.
+        float    vbus_max          = 40.0f;   // regen fully cut at this bus voltage [V]
+        float    vbus_fold_band    = 3.0f;    // foldback starts at vbus_max - band [V]
+        // FET thermal limit (PCB NTC next to the bridge): iq limit derates
+        // linearly from full at fet_temp_start to zero at fet_temp_max, where a
+        // FAULT_OVER_TEMP_FET also trips; the trip releases 10°C lower.
+        float    fet_temp_start    = 80.0f;   // derate onset [°C]
+        float    fet_temp_max      = 100.0f;  // hard trip [°C]
+        // Stall protection (CLOSED state only — open-loop has no real speed
+        // estimate): |erpm| below stall_erpm with |iq| above stall_current for
+        // stall_time_s → FAULT_STALL, bridge off.
+        float    stall_erpm        = 250.0f;
+        float    stall_current     = 2.0f;    // [A]
+        float    stall_time_s      = 1.0f;
+        // A CURRENT↔SPEED mode switch is refused while the peak phase current is
+        // at/above this [A] — forces a coast (zero command) between active modes
+        // so the loop never hot-swaps under load.
+        float    mode_switch_current = 1.0f;
         // Dead-time voltage error to cancel, in volts (0 disables). This is the
         // ~fixed voltage the bridge loses to dead-time per phase; measure it with
         // the 2-point static debug method (slope fit gives V_dt). ~0.10V here.
@@ -114,6 +149,10 @@ public:
     // Host failsafe: coast if no host packet arrived within command_timeout_ms.
     // Call periodically from thread context with the current millis() timestamp.
     void check_command_timeout(uint32_t now_ms);
+    // FET thermal protection: reads the board NTC, updates the derate factor
+    // applied to the iq limit and the over-temp trip flag. Thread context;
+    // call periodically (internally throttled to 10 Hz).
+    void update_thermal(uint32_t now_ms);
     // Mark the host as alive — call on receipt of any valid VESC packet
     // (set-points, GET_VALUES polling, COMM_ALIVE keepalives).
     void notify_host_alive();
@@ -128,8 +167,13 @@ public:
     void  get_idq(float &id, float &iq) const { id = _t_id; iq = _t_iq; }
     void  get_vdq(float &vd, float &vq) const { vd = _t_vd; vq = _t_vq; }
     void  get_phase_currents(float &ia, float &ib, float &ic) const {
-        ia = _t_ia; ib = _t_ib; ic = -(_t_ia + _t_ib);
+        ia = _t_ia; ib = _t_ib; ic = _t_ic;
     }
+    // Sum of the three measured phase currents [A]. ≈0 in healthy operation;
+    // a persistent non-zero value flags a dead phase / open shunt / bad amp.
+    // Reads 0 exactly when the W channel isn't live (ic falls back to -(ia+ib)).
+    float get_phase_residual() const { return _t_i_resid; }
+    bool  w_sense_ok()         const { return _w_sense_valid; }
     float get_motor_current() const { return _t_iq; }      // q-axis ≈ torque current
     float get_duty()          const { return _t_duty; }    // modulation [0..1]
     float get_erpm()          const { return _t_erpm; }    // electrical RPM
@@ -137,18 +181,25 @@ public:
     float get_observer_angle()  const { return _t_obs_theta; } // observer angle [rad]
     float get_free_observer_angle() const { return _t_free_theta; } // unseeded shadow observer [rad]
     float get_vbus()          const { return _vbus; }
-    // Refresh _vbus from the on-board divider (PA0). Thread context only;
-    // safe to call alongside the current-sense ISR. Returns the new volts.
-    float read_vbus();
+    // Filtered bus volts, maintained by the control ISR from the PA0 divider.
+    float read_vbus() { return _vbus; }
+    float get_fet_temp()      const { return _t_fet_temp; }  // board NTC [°C]
     uint8_t get_fault()       const { return _fault_code; }
     uint8_t get_state()       const { return uint8_t(_state); }
 
     volatile uint32_t _adc_sample_cb_count{0};
 
 private:
-    static void adc_sample_callback(void *ctx, uint16_t sample_u, uint16_t sample_v);
-    void        adc_sample_isr(uint16_t sample_u, uint16_t sample_v);
+    enum class Mode : uint8_t { STOP, CURRENT, SPEED, BRAKE, DEBUG_VOLTAGE };
+
+    static void adc_sample_callback(void *ctx, uint16_t sample_u, uint16_t sample_v, uint16_t sample_w);
+    void        adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t sample_w);
     void        observer_update(float v_alpha, float v_beta, float i_alpha, float i_beta);
+    // Largest |phase current| across U/V/W [A] (lock-free telemetry snapshot).
+    float       peak_phase_current() const;
+    // False if `target` would hot-swap between active drive modes (CURRENT/
+    // SPEED) while peak current is above _mode_switch_i.
+    bool        mode_change_allowed(Mode target) const;
     void        reset_control();
     void        trip_fault(uint8_t code);
     void        hold_off(State s);   // gate bridge off, park control state
@@ -158,17 +209,19 @@ private:
     bool     _current_sense_initialized = false;
     uint16_t _period_ticks              = 0;
     uint32_t _pwm_update_rate_hz        = 0;
-    float    _vbus                      = 18.0f;
+    volatile float _vbus                = 18.0f;  // filtered bus volts (ISR → thread)
     float    _current_scale             = 36.5f;
 
     // ── Zero-current calibration ───────────────────────────────────────────
-    volatile uint32_t _zero_accum[2]{};
-    volatile uint16_t _current_zero_raw[2]{};
+    // [0]=U, [1]=V, [2]=W. U/V gate the calibration (control depends on them);
+    // W is calibrated alongside but its absence never blocks start-up.
+    volatile uint32_t _zero_accum[3]{};
+    volatile uint16_t _current_zero_raw[3]{};
     volatile uint16_t _zero_count       = 0;
     volatile bool     _current_zero_valid = false;
+    volatile bool     _w_sense_valid    = false;  // W amp/ref present → use measured ic
 
     // ── Commands (written from thread, read in ISR) ────────────────────────
-    enum class Mode : uint8_t { STOP, CURRENT, SPEED, BRAKE, DEBUG_VOLTAGE };
     volatile Mode  _mode        = Mode::STOP;
     volatile float _cmd_current = 0.0f;   // [A]
     volatile float _cmd_erpm    = 0.0f;   // [electrical RPM]
@@ -183,14 +236,24 @@ private:
     float _cur_ki_dt       = 0.0f;   // R·ωbw·dt
     float _current_max     = 15.0f;
     float _oc_trip         = 30.0f;
+    float _oc_trip_hard    = 60.0f;  // instant trip, active during blanking too [A]
+    float _regen_max       = 5.0f;   // max braking/regen motor current [A]
+    float _vbus_max        = 40.0f;  // regen folds to zero at this bus voltage [V]
+    float _vbus_fold_inv   = 1.0f/3.0f; // 1 / vbus_fold_band
+    float _mode_switch_i   = 1.0f;   // CURRENT↔SPEED switch blocked above this |Iphase| [A]
     // Overcurrent trip is debounced (needs OC_DEBOUNCE consecutive over-limit
     // samples) and blanked for OC_BLANK_SAMPLES samples after each output enable
     // to reject the switching-noise spike when the bridge first arms.
     volatile uint16_t _oc_over_count = 0;
     volatile uint16_t _oc_blank      = 0;
+    // vbus-dependent constants: seeded from cfg.vbus in init, then recomputed
+    // every cycle in the ISR from the measured, filtered bus voltage.
     float _v_max           = 0.0f;   // max |v_dq| = max_mod·vbus/√3
     float _inv_vbus_half   = 0.0f;   // 2/vbus
     float _dt_comp_duty    = 0.0f;   // dead-time comp expressed as a per-phase duty step
+    float _vbus_flt        = 18.0f;  // ISR-side filtered bus volts
+    float _mod_to_vmax     = 0.0f;   // max_modulation/√3
+    float _dt_comp_volts   = 0.0f;   // cfg.deadtime_comp_volts
     // VESC-style open-loop override constants
     float _ol_boost_q        = 0.0f; // boost current during override [A]
     float _ol_max_q          = 3.0f; // open-loop iq cap [A]
@@ -218,10 +281,24 @@ private:
     float _debug_phase_step = 0.0f;  // |Δθ| per cycle in debug mode
     float _debug_max_mod    = 0.10f; // debug modulation clamp
 
+    // ── Thermal protection (thread computes, ISR applies) ─────────────────
+    float _fet_t_start     = 80.0f;
+    float _fet_t_max       = 100.0f;
+    uint32_t _last_temp_ms = 0;
+    volatile float _i_derate     = 1.0f;   // thermal iq-limit scale [0..1]
+    volatile bool  _thermal_trip = false;  // latched-by-temp over-temp trip
+
+    // ── Stall protection (ISR-only) ────────────────────────────────────────
+    float _stall_w         = 0.0f;   // |ω| threshold [rad/s]
+    float _stall_i         = 2.0f;   // |iq| threshold [A]
+    float _stall_t         = 1.0f;   // dwell [s]
+    float _stall_timer     = 0.0f;
+
     // ── Control state (ISR-only) ───────────────────────────────────────────
     float    _integ_d      = 0.0f;
     float    _integ_q      = 0.0f;
     float    _integ_spd    = 0.0f;
+    Mode     _prev_mode    = Mode::STOP; // ISR view of _mode last cycle (mode-entry detect)
     float    _override_ang = 0.0f;   // forced open-loop angle [rad]
     float    _hyst_timer   = 0.0f;   // time spent below open-loop speed [s]
     float    _ol_timer     = 0.0f;   // remaining open-loop override time [s]
@@ -247,11 +324,14 @@ private:
     volatile float   _t_vq    = 0.0f;
     volatile float   _t_ia    = 0.0f;
     volatile float   _t_ib    = 0.0f;
+    volatile float   _t_ic    = 0.0f;   // measured phase-W current (or -(ia+ib) fallback)
+    volatile float   _t_i_resid = 0.0f; // ia+ib+ic residual (0 when W not live)
     volatile float   _t_duty  = 0.0f;
     volatile float   _t_erpm  = 0.0f;
     volatile float   _t_theta = 0.0f;
     volatile float   _t_obs_theta = 0.0f;
     volatile float   _t_free_theta = 0.0f;
+    volatile float   _t_fet_temp = 0.0f;   // board NTC [°C] (thread-written)
 };
 
 } // namespace ChibiOS

@@ -25,6 +25,9 @@ constexpr uint16_t OC_BLANK_SAMPLES = 16;   // trip-blank window after the bridg
 // calibration once both channels are clearly above this floor, otherwise a ~0
 // baseline would offset every reading by −1.8 V (≈ −90 A) and trip overcurrent.
 constexpr uint16_t SENSE_ALIVE_COUNTS = 1000;
+// Upper bound of the plausible INA zero-reference band (~1.8 V ≈ 2233 counts).
+// A W baseline above this reads as a floating/unpopulated input → don't trust it.
+constexpr uint16_t SENSE_REF_MAX      = 3200;
 constexpr float TWO_PI          = 6.28318530718f;
 constexpr float PI_F            = 3.14159265359f;
 constexpr float DT_COMP_I_BAND  = 1.0f;     // [A] current band over which dead-time sign() is softened
@@ -106,14 +109,31 @@ bool MotorControl::init(const Config &cfg)
     _cur_ki_dt = cfg.current_bw_rad * cfg.motor_Rs * _dt;
     _current_max   = cfg.current_max;
     _oc_trip       = cfg.overcurrent_trip;
-    _v_max         = cfg.max_modulation * cfg.vbus * 0.57735026919f; // /√3
+    _oc_trip_hard  = cfg.overcurrent_trip_hard;
+    _regen_max     = cfg.regen_current_max;
+    _vbus_max      = cfg.vbus_max;
+    _vbus_fold_inv = (cfg.vbus_fold_band > 0.1f) ? (1.0f / cfg.vbus_fold_band) : 10.0f;
+    _mode_switch_i = cfg.mode_switch_current;
+    // vbus-dependent constants: seeded from cfg.vbus here, recomputed each ISR
+    // cycle from the measured, filtered bus voltage.
+    _vbus_flt      = cfg.vbus;
+    _mod_to_vmax   = cfg.max_modulation * 0.57735026919f; // /√3
+    _dt_comp_volts = cfg.deadtime_comp_volts;
+    _v_max         = _mod_to_vmax * cfg.vbus;
     _inv_vbus_half = 2.0f / cfg.vbus;
     // Dead-time comp: convert the lost voltage [V] into a per-phase duty step
     // (phase-to-midpoint voltage = (duty-0.5)·vbus, so Δduty = ΔV / vbus).
     _dt_comp_duty  = (cfg.vbus > 0.0f) ? (cfg.deadtime_comp_volts / cfg.vbus) : 0.0f;
 
+    _fet_t_start = cfg.fet_temp_start;
+    _fet_t_max   = (cfg.fet_temp_max > cfg.fet_temp_start + 1.0f)
+                       ? cfg.fet_temp_max : cfg.fet_temp_start + 1.0f;
+    _stall_i     = cfg.stall_current;
+    _stall_t     = cfg.stall_time_s;
+
     _erpm_to_w = TWO_PI / 60.0f;
     _w_to_erpm = 60.0f / TWO_PI;
+    _stall_w   = cfg.stall_erpm * _erpm_to_w;
 
     _ol_boost_q         = cfg.openloop_current;
     _ol_max_q           = cfg.openloop_max_q;
@@ -166,6 +186,7 @@ void MotorControl::reset_control()
     _obs_x1 = _obs_x2 = _obs_theta = _obs_omega = 0.0f;
     _free_x1 = _free_x2 = 0.0f;
     _pll_theta = 0.0f;
+    _stall_timer = 0.0f;
 }
 
 void MotorControl::trip_fault(uint8_t code)
@@ -209,15 +230,58 @@ void MotorControl::disable_outputs()
 #endif
 }
 
-float MotorControl::read_vbus()
+// FET thermal protection off the board NTC (3V3 → 10k → PB12 → NTC 10k B3435
+// → GND). Linearly derates the iq limit from full at fet_temp_start to zero at
+// fet_temp_max, where an over-temp fault also trips (released 10°C lower).
+// Thread context; the logf is throttled to 10 Hz.
+void MotorControl::update_thermal(uint32_t now_ms)
 {
-    if (_current_sense_initialized) {
-        const float v = stm32_foc_vbus_read_volts();
-        if (v > 1.0f) {
-            _vbus = v;
-        }
+    if (!_current_sense_initialized || (now_ms - _last_temp_ms) < 100U) {
+        return;
     }
-    return _vbus;
+    _last_temp_ms = now_ms;
+
+    const float ratio = stm32_foc_temp_read_ratio();  // Vpin/Vref
+    if (ratio < 0.01f || ratio > 0.99f) {
+        // Open/shorted sensor (e.g. NTC unpopulated → pulled to Vref): can't
+        // measure, don't derate — protection is advisory, absence must not
+        // brick the drive.
+        _i_derate     = 1.0f;
+        _thermal_trip = false;
+        return;
+    }
+    // Low-side NTC: ratio = Rntc/(Rntc+10k) → Rntc/10k = ratio/(1-ratio),
+    // then the Beta equation against 25°C/10k.
+    const float r_rel  = ratio / (1.0f - ratio);
+    const float temp_c = 1.0f / (1.0f / 298.15f + logf(r_rel) / 3435.0f) - 273.15f;
+    _t_fet_temp = temp_c;
+
+    _i_derate = clampf((_fet_t_max - temp_c) / (_fet_t_max - _fet_t_start), 0.0f, 1.0f);
+    if (temp_c >= _fet_t_max) {
+        _thermal_trip = true;
+    } else if (temp_c < _fet_t_max - 10.0f) {
+        _thermal_trip = false;
+    }
+}
+
+float MotorControl::peak_phase_current() const
+{
+    const float a = fabsf(_t_ia), b = fabsf(_t_ib), c = fabsf(_t_ic);
+    const float ab = a > b ? a : b;
+    return ab > c ? ab : c;
+}
+
+// A switch between the two active setpoint controllers (CURRENT/SPEED) is only
+// safe near zero torque — otherwise the incoming loop can step-demand a large
+// (possibly braking) current against a spinning rotor, which is exactly the
+// event that destroyed a leg. Arming from STOP and same-mode setpoint updates
+// are always allowed; BRAKE is not routed through here (it is regen-limited).
+bool MotorControl::mode_change_allowed(Mode target) const
+{
+    if (_mode == target || _mode == Mode::STOP) {
+        return true;
+    }
+    return peak_phase_current() < _mode_switch_i;
 }
 
 void MotorControl::set_current(float amps)
@@ -230,6 +294,11 @@ void MotorControl::set_current(float amps)
         // From idle/fault, stay idle so a zero command can't spin the motor up.
         _cmd_current = 0.0f;
         _mode = (_state == State::CLOSED || _state == State::OPENLOOP) ? Mode::CURRENT : Mode::STOP;
+        return;
+    }
+    // Refuse a hot swap from another active controller under load; the host
+    // must coast (command 0) first so current decays before re-arming.
+    if (!mode_change_allowed(Mode::CURRENT)) {
         return;
     }
     _cmd_current = clampf(amps, -_current_max, _current_max);
@@ -251,7 +320,7 @@ void MotorControl::set_brake_current(float amps)
         set_current(0.0f);
         return;
     }
-    _cmd_current = (mag > _current_max) ? _current_max : mag;  // magnitude only
+    _cmd_current = (mag > _regen_max) ? _regen_max : mag;  // magnitude, capped to regen limit
     _mode = Mode::BRAKE;
 }
 
@@ -260,6 +329,10 @@ void MotorControl::set_rpm(float erpm)
     _last_cmd_ms = AP_HAL::millis();
     if (fabsf(erpm) < 1.0f) {    // zero command = explicit stop (also clears a latched fault)
         stop();
+        return;
+    }
+    // Refuse a hot swap from another active controller under load (see set_current).
+    if (!mode_change_allowed(Mode::SPEED)) {
         return;
     }
     _cmd_erpm = erpm;
@@ -304,51 +377,101 @@ void MotorControl::set_debug_voltage(float duty)
 
 // ── ISR path ────────────────────────────────────────────────────────────────
 
-void MotorControl::adc_sample_callback(void *ctx, uint16_t sample_u, uint16_t sample_v)
+void MotorControl::adc_sample_callback(void *ctx, uint16_t sample_u, uint16_t sample_v, uint16_t sample_w)
 {
-    static_cast<MotorControl *>(ctx)->adc_sample_isr(sample_u, sample_v);
+    static_cast<MotorControl *>(ctx)->adc_sample_isr(sample_u, sample_v, sample_w);
 }
 
 // Full FOC cycle, once per PWM period (ADC injected-EOC ISR).
-void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v)
+void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t sample_w)
 {
     // ── Zero-current calibration (outputs gated, no current flowing) ────────
     if (!_current_zero_valid) {
         // Don't latch a baseline until the sense front-end (INA181 ref) is
         // powered; restart accumulation if the rail dips mid-calibration.
+        // Only U/V gate the loop (control depends on them); W is baselined in
+        // parallel but a missing W amp must not stall start-up.
         if (sample_u < SENSE_ALIVE_COUNTS || sample_v < SENSE_ALIVE_COUNTS) {
-            _zero_accum[0] = _zero_accum[1] = 0;
+            _zero_accum[0] = _zero_accum[1] = _zero_accum[2] = 0;
             _zero_count = 0;
             return;
         }
         _zero_accum[0] += sample_u;
         _zero_accum[1] += sample_v;
+        _zero_accum[2] += sample_w;
         if (++_zero_count == ZERO_SAMPLES) {
             _current_zero_raw[0] = uint16_t(_zero_accum[0] / ZERO_SAMPLES);
             _current_zero_raw[1] = uint16_t(_zero_accum[1] / ZERO_SAMPLES);
+            _current_zero_raw[2] = uint16_t(_zero_accum[2] / ZERO_SAMPLES);
+            // W is only trusted if its baseline sits in the INA-ref band; a
+            // floating/unpopulated input (rails near 0 or full-scale) → fall
+            // back to the derived -(ia+ib) and report a zero residual.
+            _w_sense_valid = (_current_zero_raw[2] > SENSE_ALIVE_COUNTS &&
+                              _current_zero_raw[2] < SENSE_REF_MAX);
             _current_zero_valid  = true;
         }
         return;
     }
     _adc_sample_cb_count++;
 
+    // ── Bus voltage tracking ────────────────────────────────────────────────
+    // Filter the measured vbus (τ ≈ 5 ms at 20 kHz) and recompute the
+    // vbus-dependent constants each cycle, so the volts→duty conversion and the
+    // observer's assumed applied voltage stay correct whatever the actual
+    // supply is. Below the plausible-supply floor keep the last good value.
+    {
+        const float vraw = stm32_foc_vbus_read_volts();
+        if (vraw > 6.0f) {
+            _vbus_flt += (vraw - _vbus_flt) * 0.01f;
+        }
+        const float inv_vbus = 1.0f / _vbus_flt;
+        _inv_vbus_half = 2.0f * inv_vbus;
+        _v_max         = _mod_to_vmax * _vbus_flt;
+        _dt_comp_duty  = _dt_comp_volts * inv_vbus;
+        _vbus          = _vbus_flt;
+    }
+    // Bus-OV regen foldback: scales any decelerating (bus-charging) current
+    // from full at (vbus_max - band) to zero at vbus_max.
+    const float ov_scale = clampf((_vbus_max - _vbus_flt) * _vbus_fold_inv, 0.0f, 1.0f);
+    // Thermal derate of the iq limit (thread-computed from the board NTC).
+    const float i_max = _current_max * _i_derate;
+
     // ── Phase currents ──────────────────────────────────────────────────────
     // Low-side shunt polarity: positive phase current pulls the amplified ADC
     // reading BELOW the zero reference, so current = (zero - sample).
     const float ia = float(int32_t(_current_zero_raw[0]) - int32_t(sample_u)) * ADC_LSB_VOLTS * _current_scale;
     const float ib = float(int32_t(_current_zero_raw[1]) - int32_t(sample_v)) * ADC_LSB_VOLTS * _current_scale;
-    const float ic = -(ia + ib);
+    // Prefer the directly-measured W current; the sum ia+ib+ic then becomes an
+    // independent health check. Without a live W amp, reconstruct as before.
+    float ic;
+    if (_w_sense_valid) {
+        const float ic_meas = float(int32_t(_current_zero_raw[2]) - int32_t(sample_w)) * ADC_LSB_VOLTS * _current_scale;
+        _t_i_resid = ia + ib + ic_meas;
+        ic = ic_meas;
+    } else {
+        _t_i_resid = 0.0f;
+        ic = -(ia + ib);
+    }
     _t_ia = ia;
     _t_ib = ib;
+    _t_ic = ic;
 
-    // ── Hard overcurrent trip (blanked on arm, debounced) ───────────────────
-    // A single noisy sample must not latch a fault. Skip the first few samples
-    // after the bridge arms (switching-transient inrush on the sense line), then
-    // require OC_DEBOUNCE consecutive over-limit samples before tripping.
-    if (_oc_blank > 0) {
+    // ── Hard overcurrent trip ───────────────────────────────────────────────
+    // Two tiers. The instant tier (_oc_trip_hard) has no debounce and is NOT
+    // blanked — arming straight into a short must be caught within one sample,
+    // not after the 800 µs blank window. The debounced tier (_oc_trip) rejects
+    // single noisy samples: it skips the first few samples after the bridge
+    // arms (switching-transient inrush on the sense line), then requires
+    // OC_DEBOUNCE consecutive over-limit samples before tripping.
+    const float ia_abs = fabsf(ia), ib_abs = fabsf(ib), ic_abs = fabsf(ic);
+    const float i_pk   = ia_abs > ib_abs ? (ia_abs > ic_abs ? ia_abs : ic_abs)
+                                         : (ib_abs > ic_abs ? ib_abs : ic_abs);
+    if (i_pk > _oc_trip_hard) {
+        trip_fault(FAULT_ABS_OVERCURRENT);
+    } else if (_oc_blank > 0) {
         _oc_blank--;
         _oc_over_count = 0;
-    } else if (fabsf(ia) > _oc_trip || fabsf(ib) > _oc_trip || fabsf(ic) > _oc_trip) {
+    } else if (i_pk > _oc_trip) {
         if (++_oc_over_count >= OC_DEBOUNCE) {
             trip_fault(FAULT_ABS_OVERCURRENT);
         }
@@ -363,7 +486,17 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v)
     observer_update(_v_alpha_prev, _v_beta_prev, i_alpha, i_beta);
 
     const Mode mode = _mode;
+    // Detect a fresh entry into SPEED (e.g. CURRENT→SPEED while spinning) so the
+    // setpoint can be seeded to the actual speed below. Without this the speed
+    // error starts from a stale setpoint and the loop step-demands a hard brake.
+    const bool speed_entry = (mode == Mode::SPEED && _prev_mode != Mode::SPEED);
+    _prev_mode = mode;
 
+    // ── Over-temp: re-trips every cycle while hot, so a streaming host that
+    //    clears the fault code with each command can't keep the bridge armed.
+    if (_thermal_trip && _fault_code == FAULT_NONE) {
+        trip_fault(FAULT_OVER_TEMP_FET);
+    }
     // ── Latched fault → bridge stays off until cleared by a new command ─────
     if (_fault_code != FAULT_NONE) {
         hold_off(State::FAULT);
@@ -445,6 +578,12 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v)
     // ── Outer command: torque current (speed PI for RPM mode, direct otherwise)
     float iq_cmd;
     if (mode == Mode::SPEED) {
+        // On a fresh SPEED entry, seed the ramped setpoint to the current speed
+        // (and clear the integrator) so the takeover error ≈ 0 — no step brake.
+        if (speed_entry) {
+            _spd_set_erpm = _obs_omega * _w_to_erpm;
+            _integ_spd    = 0.0f;
+        }
         // VESC-style ramped setpoint (foc_run_pid_control_speed): slew toward the
         // command at an accel limit, and while still in open loop clamp it to the
         // handover speed. So at handover the setpoint ≈ actual speed (no error step
@@ -456,14 +595,29 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v)
             set_erpm = clampf(set_erpm, -_open_handover_erpm, _open_handover_erpm);
         }
         const float erpm_err = set_erpm - _obs_omega * _w_to_erpm;
-        _integ_spd = clampf(_integ_spd + erpm_err * _spd_ki_dt, -_current_max, _current_max);
-        iq_cmd = clampf(erpm_err * _spd_kp + _integ_spd, -_current_max, _current_max);
+        _integ_spd = clampf(_integ_spd + erpm_err * _spd_ki_dt, -i_max, i_max);
+        iq_cmd = clampf(erpm_err * _spd_kp + _integ_spd, -i_max, i_max);
+        // Regen limit: when iq opposes rotation (decelerating) the braking energy
+        // returns to the bus, which a bench PSU can't sink — cap the braking
+        // current hard, folded toward zero as vbus approaches vbus_max.
+        if (iq_cmd * _obs_omega < 0.0f) {
+            const float rl = _regen_max * ov_scale;
+            iq_cmd = clampf(iq_cmd, -rl, rl);
+        }
     } else if (mode == Mode::BRAKE) {
-        // _cmd_current holds the brake magnitude; sign opposes rotation.
-        iq_cmd = clampf((_obs_omega >= 0.0f ? -1.0f : 1.0f) * _cmd_current,
-                        -_current_max, _current_max);
+        // _cmd_current holds the brake magnitude (already capped to _regen_max);
+        // sign opposes rotation. Clamp again here as the single enforcement
+        // point, folded by the bus-OV scale.
+        const float rl = _regen_max * ov_scale;
+        iq_cmd = clampf((_obs_omega >= 0.0f ? -1.0f : 1.0f) * _cmd_current, -rl, rl);
     } else {
-        iq_cmd = clampf(_cmd_current, -_current_max, _current_max);
+        iq_cmd = clampf(_cmd_current, -i_max, i_max);
+        // CURRENT mode has no steady regen cap by design, but a decelerating
+        // command must still fold back rather than pump the bus past vbus_max.
+        if (iq_cmd * _obs_omega < 0.0f) {
+            const float rl = i_max * ov_scale;
+            iq_cmd = clampf(iq_cmd, -rl, rl);
+        }
     }
 
     // ── VESC-style sensorless open-loop override (mcpwm_foc control_current) ──
@@ -542,6 +696,22 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v)
     const float cos_t = cosf(theta);
     float id, iq;
     FOC::park(i_alpha, i_beta, sin_t, cos_t, id, iq);
+
+    // ── Stall protection ────────────────────────────────────────────────────
+    // CLOSED only: during the open-loop override the observer is seeded to the
+    // forced angle, so its speed doesn't reflect the rotor (an OL stall shows
+    // up as the hysteresis retrigger loop instead). A locked rotor in closed
+    // loop = no back-EMF, ω→0, torque current held → heat with no cooling.
+    if (_state == State::CLOSED &&
+        fabsf(_obs_omega) < _stall_w && fabsf(iq) > _stall_i) {
+        _stall_timer += _dt;
+        if (_stall_timer > _stall_t) {
+            trip_fault(FAULT_STALL);
+            return;   // MOE already cut; don't write another PWM cycle
+        }
+    } else {
+        _stall_timer = 0.0f;
+    }
 
     const float err_d = id_set - id;
     const float err_q = iq_set - iq;

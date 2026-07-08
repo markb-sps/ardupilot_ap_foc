@@ -144,7 +144,22 @@ void AP_Periph_FW::init()
         // Conservative limits for first bring-up — raise once verified.
         motor_cfg.current_max      = 15.0f;
         motor_cfg.overcurrent_trip = 30.0f;
+        // Instant trip (no debounce, not blanked on arm) — catches arming into
+        // a short within one sample. Keep well above overcurrent_trip, below
+        // the EPC23102 65 A pulse rating.
+        motor_cfg.overcurrent_trip_hard = 45.0f;
+        // Bus-OV regen foldback: braking current scales to zero as vbus rises
+        // from (vbus_max - band) to vbus_max.
+        motor_cfg.vbus_max       = 40.0f;
+        motor_cfg.vbus_fold_band = 3.0f;
         motor_cfg.openloop_current = 8.0f;
+        // Max braking/regen motor current [A]. Deliberately low: braking energy
+        // returns to the bus, a bench PSU can't sink it, and there is no bus-OV
+        // clamp yet. Raise once OV handling / a brake resistor exists.
+        motor_cfg.regen_current_max = 5.0f;
+        // Refuse a CURRENT↔SPEED hot-swap while peak phase current ≥ this [A];
+        // the host must coast (command 0) between active modes.
+        motor_cfg.mode_switch_current = 1.0f;
         // Startup spin-up: the 6374 rotor can't follow a 0.1 s ramp on only 3 A,
         // so it slips and the observer never sees coherent back-EMF. Give it real
         // torque and a gentle, long ramp/hold so we can confirm it actually spins
@@ -493,6 +508,7 @@ void AP_Periph_FW::update_motor_test(uint32_t now_ms)
         return;
     }
     motor_control.check_command_timeout(now_ms);  // coast if host stopped commanding
+    motor_control.update_thermal(now_ms);         // FET NTC → iq derate / over-temp trip
 }
 #endif
 

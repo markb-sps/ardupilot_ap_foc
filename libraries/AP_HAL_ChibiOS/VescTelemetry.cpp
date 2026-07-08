@@ -255,9 +255,11 @@ void VescTelemetry::handle_get_values()
     const float duty    = _mc.get_duty();
     const float erpm    = _mc.get_erpm();          // electrical RPM (VESC convention)
 
+    const float temp_fet = _mc.get_fet_temp();     // board NTC by the bridge [°C]
+
     put_u8 (p, COMM_GET_VALUES);
-    put_f16(p, 25.0f,    10.0f);   // temp_mos   (no sensor yet — placeholder)
-    put_f16(p, 25.0f,    10.0f);   // temp_motor (no sensor yet — placeholder)
+    put_f16(p, temp_fet, 10.0f);   // temp_mos
+    put_f16(p, 25.0f,    10.0f);   // temp_motor (no sensor — placeholder)
     put_f32(p, i_motor,  100.0f);  // current_motor [A * 100]
     put_f32(p, 0.0f,     100.0f);  // current_in (not measured)
     put_f32(p, id,       100.0f);  // id
@@ -287,6 +289,8 @@ void VescTelemetry::handle_get_values()
     put_f32(p, free_theta, 10000.0f); // unseeded shadow observer     (offset 82)
     put_f32(p, ia,           100.0f); // raw phase-U current [A]      (offset 86)
     put_f32(p, ib,           100.0f); // raw phase-V current [A]      (offset 90)
+    put_f32(p, ic,           100.0f); // measured phase-W current [A] (offset 94)
+    put_f32(p, _mc.get_phase_residual(), 100.0f); // ia+ib+ic [A]     (offset 98)
 
     send_packet(buf, uint16_t(p - buf));
 }

@@ -13,7 +13,7 @@ struct Stm32FocMotorControlSetup {
     bool     break_input_enabled = false;
 };
 
-using Stm32FocMotorControlPhaseCurrentCallback = void (*)(void *ctx, uint16_t sample_u, uint16_t sample_v);
+using Stm32FocMotorControlPhaseCurrentCallback = void (*)(void *ctx, uint16_t sample_u, uint16_t sample_v, uint16_t sample_w);
 
 struct Stm32FocMotorControlCallbacks {
     void *ctx = nullptr;
@@ -43,5 +43,10 @@ void stm32_foc_motor_control_write_pwm(uint16_t phase_u, uint16_t phase_v, uint1
 // channel, which has priority and will preempt the regular conversion.
 // Call from thread context at low rate.
 float stm32_foc_vbus_read_volts();
+
+// Board-temp (NTC divider on PB12 = ADC1_IN11) as a fraction of Vref [0..1].
+// Cached load like the VBUS read; the conversion alternates with VBUS on the
+// ADC1 regular channel, so each updates at ~10 kHz.
+float stm32_foc_temp_read_ratio();
 
 } // namespace ChibiOS

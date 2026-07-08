@@ -85,10 +85,22 @@ extern "C"
 {
 #define bkpt() __asm volatile("BKPT #0\n")
 
+/*
+  Cut any active motor bridge (clear TIM1 MOE → all six FETs off / coast) as the
+  very first action of a CPU exception. If the core faults or is halted, TIM1
+  keeps applying the last PWM duty; on a motor drive that means a frozen voltage
+  vector into a spinning motor, whose current is then bounded only by the winding
+  resistance (destructive). This weak no-op is overridden by the FOC motor driver,
+  which runtime-gates it on the bridge actually being initialised so non-motor
+  builds that share TIM1 are unaffected.
+ */
+__attribute__((weak)) void motor_control_fault_stop(void) {}
+
 #if !AP_CRASHDUMP_ENABLED
 // do legacy hardfault handling
 void HardFault_Handler(void);
 void HardFault_Handler(void) {
+    motor_control_fault_stop();   // cut the motor bridge before anything else
     //Copy to local variables (not pointers) to allow GDB "i loc" to directly show the info
     //Get thread context. Contains main registers including PC and LR
     struct port_extctx ctx;
@@ -160,6 +172,7 @@ void BusFault_Handler(void) __attribute__((alias("HardFault_Handler")));
 
 void UsageFault_Handler(void);
 void UsageFault_Handler(void) {
+    motor_control_fault_stop();   // cut the motor bridge before anything else
     //Copy to local variables (not pointers) to allow GDB "i loc" to directly show the info
     //Get thread context. Contains main registers including PC and LR
     struct port_extctx ctx;
@@ -197,6 +210,7 @@ void UsageFault_Handler(void) {
 
 void MemManage_Handler(void);
 void MemManage_Handler(void) {
+    motor_control_fault_stop();   // cut the motor bridge before anything else
     //Copy to local variables (not pointers) to allow GDB "i loc" to directly show the info
     //Get thread context. Contains main registers including PC and LR
     struct port_extctx ctx;
@@ -286,7 +300,7 @@ void __cxa_pure_virtual(void);
 void __cxa_pure_virtual() { while (1); } //TODO: Handle properly, maybe generate a traceback
 
 void NMI_Handler(void);
-void NMI_Handler(void) { while (1); }
+void NMI_Handler(void) { motor_control_fault_stop(); while (1); }
 
 #if defined(HAL_BOOTLOADER_BUILD) && HAL_ENABLE_DFU_BOOT
 void __entry_hook(void);

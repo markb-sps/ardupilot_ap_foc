@@ -113,7 +113,7 @@ define STM32_ADC_ADC2_IRQ_HOOK do { extern void motor_control_adc2_irq_hook(uint
 # 1 mR low-side shunts, REF = 1.8 V. No STM32 internal OpAmps.
 #   PHASE_I1 -> PA1 (ADC1_IN2)
 #   PHASE_I2 -> PA7 (ADC2_IN4)
-#   PHASE_I3 -> PB0 (ADC1_IN15) - available, currently unused (W derived from U+V)
+#   PHASE_I3 -> PB0 (ADC1_IN15) - phase W, sampled as ADC1 injected rank 2
 # VBUS -> PA0 (ADC1_IN1). These pins are configured by MotorControl at runtime.
 
 # ESC interrupt
