@@ -152,7 +152,9 @@ void AP_Periph_FW::init()
         // from (vbus_max - band) to vbus_max.
         motor_cfg.vbus_max       = 40.0f;
         motor_cfg.vbus_fold_band = 3.0f;
-        motor_cfg.openloop_current = 8.0f;
+        // Startup torque: the OL cap was leaving a third of the current budget
+        // unused (easily hand-stalled) — let open loop use the full iq limit.
+        motor_cfg.openloop_current = 12.0f;
         // Max braking/regen motor current [A]. Deliberately low: braking energy
         // returns to the bus, a bench PSU can't sink it, and there is no bus-OV
         // clamp yet. Raise once OV handling / a brake resistor exists.
@@ -164,9 +166,14 @@ void AP_Periph_FW::init()
         // so it slips and the observer never sees coherent back-EMF. Give it real
         // torque and a gentle, long ramp/hold so we can confirm it actually spins
         // (watch `ferr`→small as back-EMF appears) before worrying about handover.
-        motor_cfg.openloop_max_q  = 10.0f;  // was 3 A — too weak to accelerate the rotor
+        motor_cfg.openloop_max_q  = 15.0f;  // = current_max: full budget for startup torque
+        // Capture phase: hold the vector static (current ramped in over the
+        // first ~75 ms) until the rotor's settle oscillation dies, THEN
+        // accelerate — otherwise capture happens mid-ramp and a bad draw
+        // slips poles backward before catching (backward-run-then-jerk start).
+        motor_cfg.openloop_lock_s = 0.2f;
         motor_cfg.openloop_ramp_s = 0.5f;   // was 0.1 s — gentler so the rotor can keep up
-        motor_cfg.openloop_const_s = 1.0f;  // hold forced rotation long enough to observe
+        motor_cfg.openloop_const_s = 0.2f;  // hold forced rotation long enough to observe
         // Hand over to the observer at HIGHER speed so back-EMF is large enough for
         // a clean lock (the −400 eRPM dip at handover is the observer converging for
         // real for the first time; more back-EMF makes that converge faster, less

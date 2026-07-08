@@ -93,6 +93,13 @@ public:
         float    openloop_lock_s       = 0.0f;    // hold-angle lock time at sequence start [s] (VESC t_lock)
         float    openloop_ramp_s       = 0.1f;    // forced-speed ramp-up time [s] (VESC t_ramp)
         float    openloop_const_s      = 0.05f;   // forced-speed hold time after ramp [s] (VESC t_const)
+        float    openloop_release_s    = 0.3f;    // boost fade-out after handover [s] (0 = step, old behaviour)
+        // Fresh-start TRACK phase: hold iq=0 closed-loop for this long before
+        // driving. Applied volts ≈ back-EMF, so the observer re-converges on a
+        // still-freewheeling rotor (restart after stop) → seamless catch; from
+        // standstill the open-loop hysteresis fires as usual ~openloop_hyst_s in.
+        // Clamped in init to at least openloop_hyst_s + 20 ms.
+        float    resync_time_s         = 0.15f;
         float    openloop_max_q        = 3.0f;    // open-loop iq cap [A] (VESC foc_sl_openloop_max_q) — limits startup heat
 
         // ── Observer / speed loop ──────────────────────────────────────────
@@ -263,6 +270,8 @@ private:
     float _ol_t_lock         = 0.0f; // lock phase duration [s]
     float _ol_t_ramp         = 0.1f; // forced-speed ramp duration [s]
     float _ol_t_total        = 0.15f;// lock + ramp + const [s]
+    float _ol_t_release      = 0.3f; // post-handover boost fade-out [s]
+    float _resync_t          = 0.15f;// fresh-start TRACK phase duration [s]
     float _obs_lambda        = 0.0f; // PM flux linkage λ [Wb] (observer seed)
     float _obs_L           = 0.0f;   // 1.5·Ls
     float _obs_R           = 0.0f;   // 1.5·Rs
@@ -302,6 +311,12 @@ private:
     float    _override_ang = 0.0f;   // forced open-loop angle [rad]
     float    _hyst_timer   = 0.0f;   // time spent below open-loop speed [s]
     float    _ol_timer     = 0.0f;   // remaining open-loop override time [s]
+    float    _ol_release   = 0.0f;   // remaining post-handover boost fade [s]
+    float    _track_timer  = 0.0f;   // remaining fresh-start TRACK time [s]
+    uint16_t _lock_count   = 0;      // consecutive in-band flux samples during TRACK
+    uint16_t _lock_need    = 1500;   // samples required to call the observer locked
+    uint16_t _ol_lock_count = 0;     // shadow-observer lock samples during OPENLOOP
+    float    _ol_run_time  = 0.0f;   // cumulative time in this OL sequence [s]
     float    _debug_theta  = 0.0f;
     float    _v_alpha_prev = 0.0f;   // applied αβ volts, fed to observer next cycle
     float    _v_beta_prev  = 0.0f;

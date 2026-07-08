@@ -31,6 +31,8 @@ constexpr uint16_t SENSE_REF_MAX      = 3200;
 constexpr float TWO_PI          = 6.28318530718f;
 constexpr float PI_F            = 3.14159265359f;
 constexpr float DT_COMP_I_BAND  = 1.0f;     // [A] current band over which dead-time sign() is softened
+constexpr float OL_MAX_RUN_S    = 3.0f;     // give up (FAULT_STALL) if open loop can't confirm a lock
+constexpr float OL_IQ_RAMP_S    = 0.075f;   // capture soft-start: OL current ramp-in time
 
 inline float wrap_pi(float a)
 {
@@ -143,6 +145,15 @@ bool MotorControl::init(const Config &cfg)
     _ol_t_lock          = cfg.openloop_lock_s;
     _ol_t_ramp          = cfg.openloop_ramp_s;
     _ol_t_total         = cfg.openloop_lock_s + cfg.openloop_ramp_s + cfg.openloop_const_s;
+    _ol_t_release       = cfg.openloop_release_s;
+    // TRACK must outlast the OL hysteresis: if it expired first, a standstill
+    // start would drive full iq on a garbage angle until the hysteresis fires.
+    _resync_t           = (cfg.resync_time_s > cfg.openloop_hyst_s + 0.02f)
+                              ? cfg.resync_time_s : cfg.openloop_hyst_s + 0.02f;
+    // Lock dwell = half the TRACK window: long enough that an unconverged
+    // observer's offset circle (sweeps out of the flux band each electrical
+    // cycle down to ~500 eRPM) can't stay in band that long by accident.
+    _lock_need          = uint16_t(0.5f * _resync_t / _dt);
 
     _obs_L          = 1.5f * cfg.motor_Ls;
     _obs_R          = 1.5f * cfg.motor_Rs;
@@ -182,6 +193,11 @@ void MotorControl::reset_control()
     _override_ang = 0.0f;
     _hyst_timer = 0.0f;
     _ol_timer = 0.0f;
+    _ol_release = 0.0f;
+    _track_timer = 0.0f;
+    _lock_count = 0;
+    _ol_lock_count = 0;
+    _ol_run_time = 0.0f;
     _v_alpha_prev = _v_beta_prev = 0.0f;
     _obs_x1 = _obs_x2 = _obs_theta = _obs_omega = 0.0f;
     _free_x1 = _free_x2 = 0.0f;
@@ -335,6 +351,11 @@ void MotorControl::set_rpm(float erpm)
     if (!mode_change_allowed(Mode::SPEED)) {
         return;
     }
+    // Clear a latched trip like set_current does — without this a stall fault
+    // is unrecoverable for an RPM-streaming host: each packet would arm the
+    // bridge for one cycle before the fault path cuts it (a short-brake blip at
+    // the command rate), and the fault never clears.
+    _fault_code = FAULT_NONE;
     _cmd_erpm = erpm;
     _mode = Mode::SPEED;
     _oc_over_count = 0; _oc_blank = OC_BLANK_SAMPLES;
@@ -556,19 +577,27 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
             return;
         }
         _ol_timer = 0.0f;
+        _ol_release = 0.0f;
         _hyst_timer = 0.0f;
     }
 
-    // First running cycle after STOP / fault / debug → arm the open-loop
-    // sequence immediately so a standstill start runs the forced lock→ramp.
+    // First running cycle after STOP / fault / debug → enter the TRACK phase
+    // (State::ALIGN): closed loop at iq=0. The rotor state is unknown here — a
+    // stop is a high-Z coast and hold_off() kept the observer zeroed, so the
+    // rotor may still be freewheeling fast. Forcing open loop against it (the
+    // old behaviour) kicked and tripped overcurrent. With iq nulled the applied
+    // volts ≈ back-EMF and the observer converges to the true angle/speed:
+    // spinning → ω rises above the OL threshold and closed loop catches
+    // seamlessly; standstill → the hysteresis fires the OL sequence as before.
     bool started_now = false;
-    if (_state != State::OPENLOOP && _state != State::CLOSED && !coasting) {
+    if (_state != State::OPENLOOP && _state != State::CLOSED &&
+        _state != State::ALIGN && !coasting) {
         _override_ang = _obs_theta;
         _integ_spd    = 0.0f;
         _hyst_timer   = 0.0f;
-        _ol_timer     = _ol_t_total;
+        _track_timer  = _resync_t;
+        _lock_count   = 0;
         _spd_set_erpm = _obs_omega * _w_to_erpm;  // VESC: init setpoint to current speed
-        started_now   = true;
     }
 
     const float dir = (mode == Mode::SPEED)
@@ -651,6 +680,10 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
     float iq_set = iq_cmd;
 
     if (_ol_timer > 0.0f) {
+        if (_state != State::OPENLOOP) {   // sequence (re)start
+            _ol_lock_count = 0;
+            _ol_run_time   = 0.0f;
+        }
         // Forced rotation: 0 during lock, ramped 0→max during ramp, then full.
         const float time_fwd = _ol_t_total - _ol_timer;
         float rpm = ol_rpm_max;
@@ -669,26 +702,148 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
         // heating during forced commutation, and clamp the speed-PI integrator to
         // the same so it can't wind up (→ over-current / overshoot) while forced.
         iq_set = clampf(iq_cmd + dir * _ol_boost_q, -_ol_max_q, _ol_max_q);
+        // Capture soft-start: the rotor sits at an unknown angle, and a stepped
+        // full current maximally excites its (lightly damped) swing into the
+        // I/f well — the backward-run-then-jerk start. Ramp the current in over
+        // the beginning of the (static) lock phase so the vector pulls the
+        // rotor over instead of slingshotting it; accelerate only after capture.
+        if (time_fwd < OL_IQ_RAMP_S) {
+            iq_set *= time_fwd / OL_IQ_RAMP_S;
+        }
         _integ_spd = clampf(_integ_spd, -_ol_max_q, _ol_max_q);
 
-        // Seed observer flux to where the rotor d-axis actually sits in I/f:
-        // current is applied on the forced q-axis, so under sufficient torque the
-        // rotor d-axis (PM flux) aligns with the current vector at forced_angle +
-        // dir·π/2 — and the observer state x = λ·(cos,sin)(rotor_angle). Matches
-        // VESC m_observer_x1/x2_override (offset -π/2 in VESC's opposite sign
-        // convention). VESC clobbers this every override cycle, then hard-switches
-        // to the observer angle; the post-handover convergence is kept gentle by
-        // the speed-scaled observer gain (see observer_update), not by a blend.
-        _obs_x1 = cosf(_override_ang + dir * 1.57079633f) * _obs_lambda;
-        _obs_x2 = sinf(_override_ang + dir * 1.57079633f) * _obs_lambda;
+        // Seed observer flux toward where the rotor d-axis sits in I/f. The
+        // true offset from the forced angle depends on load (0° at pull-out,
+        // 90° unloaded); VESC seeds the compromise +45° (mcpwm_foc.c:
+        // m_phase_now_observer_override + SIGN(duty)·π/4) — match it. Seed
+        // EVERY override cycle, const phase included (letting the observer run
+        // free during const was tried and made handover depend on unassisted
+        // convergence from small back-EMF — intermittent bad-angle handovers);
+        // post-handover convergence is kept gentle by the speed-scaled
+        // observer gain (see observer_update), not by a blend.
+        _obs_x1 = cosf(_override_ang + dir * 0.78539816f) * _obs_lambda;
+        _obs_x2 = sinf(_override_ang + dir * 0.78539816f) * _obs_lambda;
 
-        _ol_timer  -= _dt;
+        // ── Gated, adoptive handover ────────────────────────────────────────
+        // The seeded angle above is a GUESS (true flux offset is load-
+        // dependent: ~90° unloaded, →0° at pull-out), so handing over on the
+        // sequence timer put full current onto that guess — the CURRENT-mode
+        // handover jerk/overcurrent. Instead, hand over only when the UNSEEDED
+        // shadow observer demonstrably tracks the rotor: flux magnitude in
+        // band AND its angle leading the forced angle in the rotation
+        // direction (also rejects the 180°-flipped solution), held
+        // continuously for _lock_need samples. On handover, ADOPT its state
+        // so closed loop starts from the true rotor angle.
+        const float fe1  = _free_x1 - _obs_L * i_alpha;
+        const float fe2  = _free_x2 - _obs_L * i_beta;
+        const float ffl2 = fe1 * fe1 + fe2 * fe2;
+        const float fang = atan2f(fe2, fe1);
+        const float lead = dir * wrap_pi(fang - _override_ang);
+        if (ffl2 > 0.25f * _obs_lambda2 && ffl2 < 2.25f * _obs_lambda2 &&
+            lead > 0.0f && lead < PI_F) {
+            if (_ol_lock_count < 0xFFFFU) {
+                _ol_lock_count++;
+            }
+        } else {
+            _ol_lock_count = 0;
+        }
+
+        _ol_timer   -= _dt;
+        _ol_run_time += _dt;
+        const bool at_speed = time_fwd >= _ol_t_lock + _ol_t_ramp;
+        if (at_speed && _ol_lock_count >= _lock_need) {
+            // Tracking confirmed → seamless handover on the TRUE angle.
+            _obs_x1    = _free_x1;
+            _obs_x2    = _free_x2;
+            _pll_theta = fang;
+            _obs_omega = dir * rpm * _erpm_to_w;   // forced speed = ground truth here
+            _ol_timer  = 0.0f;
+        } else if (_ol_timer <= 0.0f) {
+            // Sequence timed out without a confirmed lock: do NOT hand over
+            // blind. Keep rotating at the forced speed (re-dwell the const
+            // phase — no re-ramp, so the rotation stays smooth) and keep
+            // waiting; give up honestly after OL_MAX_RUN_S.
+            if (_ol_run_time > OL_MAX_RUN_S) {
+                trip_fault(FAULT_STALL);
+                return;
+            }
+            const float redwell = _ol_t_total - _ol_t_lock - _ol_t_ramp;
+            _ol_timer = (redwell > 0.05f) ? redwell : 0.05f;
+        }
+        _ol_release = _ol_t_release;   // armed for the post-handover boost fade
+        _track_timer = 0.0f;           // OL running → TRACK is over
         _hyst_timer = 0.0f;
         _state = State::OPENLOOP;
+    } else if (_track_timer > 0.0f) {
+        // TRACK: commutate on the observer angle but hold iq=0 while the
+        // observer re-converges (see the fresh-start comment above).
+        _track_timer -= _dt;
+        _override_ang = _obs_theta;
+        theta  = _obs_theta;
+        iq_set = 0.0f;
+        _state = State::ALIGN;
+        // Observer lock detector. Genuinely tracking ⇔ |flux| stays in a band
+        // around λ. ω alone can't decide this (at standstill the angle is
+        // atan2 of noise and the PLL random-walks ω high), and a single sample
+        // of |flux| can't either: an unconverged observer carries a DC offset
+        // that sweeps |flux| through 0..2λ every electrical cycle and can pass
+        // at the sampled instant — CLOSED then slams full commanded iq onto a
+        // wobbling angle (the intermittent CURRENT-mode start overcurrent).
+        // Require the band to hold CONTINUOUSLY for _lock_need samples.
+        const float te1 = _obs_x1 - _obs_L * i_alpha;
+        const float te2 = _obs_x2 - _obs_L * i_beta;
+        const float fl2 = te1 * te1 + te2 * te2;
+        if (fl2 > 0.25f * _obs_lambda2 && fl2 < 2.25f * _obs_lambda2) {
+            if (_lock_count < 0xFFFFU) {
+                _lock_count++;
+            }
+        } else {
+            _lock_count = 0;
+        }
+        if (_track_timer <= 0.0f) {
+            const bool locked = _lock_count >= _lock_need;
+            if (locked) {
+                if (mode == Mode::SPEED) {
+                    // Seed the speed loop to the speed the observer found
+                    // (same reset as the OL handover).
+                    _spd_set_erpm = _obs_omega * _w_to_erpm;
+                    _integ_spd    = 0.0f;
+                }
+            } else {
+                // No lock → standstill (or too slow to matter): forced start.
+                _ol_timer     = _ol_t_total;
+                _override_ang = wrap_pi(_obs_theta + dir * 1.04719755f); // anti-stuck kick
+                _hyst_timer   = 0.0f;
+                _obs_omega    = 0.0f;   // discard the random-walk estimate
+                _pll_theta    = _obs_theta;
+            }
+        }
     } else {
+        const bool handover = (_state == State::OPENLOOP);
         _override_ang = _obs_theta;
         theta  = _obs_theta;   // pure sensorless
         _state = State::CLOSED;
+        if (mode == Mode::SPEED) {
+            // Handover into the speed loop: the integrator wound up against the
+            // clamped setpoint during the forced ramp, and the open-loop current
+            // was mostly non-torque-producing (absorbed by the load angle) — so
+            // carrying either into closed loop just over-torques and overshoots.
+            // Reset the loop and re-seed the setpoint to the measured speed; the
+            // subsequent acceleration is governed by the setpoint slew
+            // (speed_ramp_erpm_s), which the observer/PLL can track.
+            if (handover) {
+                _spd_set_erpm = _obs_omega * _w_to_erpm;
+                _integ_spd    = 0.0f;
+                iq_set        = 0.0f;
+            }
+            _ol_release = 0.0f;
+        } else if (_ol_release > 0.0f && _ol_t_release > 1e-3f) {
+            // CURRENT mode: no outer loop to hand over to, so just fade the
+            // boost out instead of stepping ~12 A → iq_cmd in one cycle.
+            iq_set = clampf(iq_cmd + dir * _ol_boost_q * (_ol_release / _ol_t_release),
+                            -i_max, i_max);
+            _ol_release -= _dt;
+        }
     }
 
     // ── dq current PI (Kp = L·ωbw, Ki = R·ωbw) with anti-windup ─────────────
