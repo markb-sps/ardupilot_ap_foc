@@ -304,7 +304,10 @@ void VescTelemetry::handle_set_current()
                        (int32_t(_payload[2]) << 16) |
                        (int32_t(_payload[3]) <<  8) |
                         int32_t(_payload[4]);
-    _mc.set_current(float(ma) / 1000.0f);
+    // Route through the throttle arbiter (as the USB source) rather than driving
+    // MotorControl directly, so CAN can take priority. Applied in update_motor_test().
+    _usb_current_a  = float(ma) / 1000.0f;
+    _usb_current_ms = AP_HAL::millis();
 }
 
 // COMM_SET_CURRENT_BRAKE: payload = [cmd, int32 brake_mA] — regen brake
@@ -317,6 +320,7 @@ void VescTelemetry::handle_set_current_brake()
                        (int32_t(_payload[3]) <<  8) |
                         int32_t(_payload[4]);
     _mc.set_brake_current(float(ma) / 1000.0f);
+    _override_ms = AP_HAL::millis();   // bench override: arbiter stands off
 }
 
 // COMM_SET_DUTY: payload = [cmd, int32 duty·1e5]. Repurposed as the open-loop
@@ -331,6 +335,7 @@ void VescTelemetry::handle_set_duty()
                       (int32_t(_payload[3]) <<  8) |
                        int32_t(_payload[4]);
     _mc.set_debug_voltage(float(d) / 100000.0f);
+    _override_ms = AP_HAL::millis();   // bench override: arbiter stands off
 }
 
 // COMM_SET_RPM: payload = [cmd, int32 erpm] (big-endian, electrical RPM).
@@ -342,6 +347,7 @@ void VescTelemetry::handle_set_rpm()
                          (int32_t(_payload[3]) <<  8) |
                           int32_t(_payload[4]);
     _mc.set_rpm(float(erpm));
+    _override_ms = AP_HAL::millis();   // bench override: arbiter stands off
 }
 
 } // namespace ChibiOS

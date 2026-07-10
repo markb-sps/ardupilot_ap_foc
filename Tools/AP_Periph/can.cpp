@@ -700,6 +700,26 @@ void AP_Periph_FW::handle_act_command(CanardInstance* canard_instance, CanardRxT
 }
 #endif // AP_PERIPH_RC_OUT_ENABLED
 
+#if CONFIG_HAL_BOARD == HAL_BOARD_CHIBIOS && !AP_PERIPH_RC_OUT_ENABLED
+// Lean DroneCAN ESC RawCommand → torque throttle (CAN source of the arbiter).
+// RC_OUT/SRV_Channels is disabled on the FOC board, so decode directly rather
+// than routing through rcout. This node drives one motor on ESC index 0; a
+// positive raw command maps 0..8191 → 0..current_max [A] (no reverse).
+void AP_Periph_FW::handle_esc_rawcommand_foc(CanardInstance* canard_instance, CanardRxTransfer* transfer)
+{
+    uavcan_equipment_esc_RawCommand cmd;
+    if (uavcan_equipment_esc_RawCommand_decode(transfer, &cmd)) {
+        return;
+    }
+    if (cmd.cmd.len < 1) {
+        return;
+    }
+    const float frac = constrain_float(float(cmd.cmd.data[0]) / 8191.0f, 0.0f, 1.0f);
+    throttle_can_amps = frac * motor_control.current_limit();
+    throttle_can_ms   = AP_HAL::millis();
+}
+#endif // CHIBIOS && !AP_PERIPH_RC_OUT_ENABLED
+
 #if AP_PERIPH_NOTIFY_ENABLED
 void AP_Periph_FW::handle_notify_state(CanardInstance* canard_instance, CanardRxTransfer* transfer)
 {
@@ -894,6 +914,12 @@ void AP_Periph_FW::onTransferReceived(CanardInstance* canard_instance,
         break;
 #endif
 
+#if !AP_PERIPH_RC_OUT_ENABLED && CONFIG_HAL_BOARD == HAL_BOARD_CHIBIOS
+    case UAVCAN_EQUIPMENT_ESC_RAWCOMMAND_ID:
+        handle_esc_rawcommand_foc(canard_instance, transfer);
+        break;
+#endif
+
 #if AP_PERIPH_RC_OUT_ENABLED
     case UAVCAN_EQUIPMENT_ESC_RAWCOMMAND_ID:
         handle_esc_rawcommand(canard_instance, transfer);
@@ -1020,11 +1046,17 @@ bool AP_Periph_FW::shouldAcceptTransfer(const CanardInstance* canard_instance,
         return true;
 #endif
 
+#if !AP_PERIPH_RC_OUT_ENABLED && CONFIG_HAL_BOARD == HAL_BOARD_CHIBIOS
+    case UAVCAN_EQUIPMENT_ESC_RAWCOMMAND_ID:
+        *out_data_type_signature = UAVCAN_EQUIPMENT_ESC_RAWCOMMAND_SIGNATURE;
+        return true;
+#endif
+
 #if AP_PERIPH_RC_OUT_ENABLED
     case UAVCAN_EQUIPMENT_ESC_RAWCOMMAND_ID:
         *out_data_type_signature = UAVCAN_EQUIPMENT_ESC_RAWCOMMAND_SIGNATURE;
         return true;
-    
+
     case UAVCAN_EQUIPMENT_ACTUATOR_ARRAYCOMMAND_ID:
         *out_data_type_signature = UAVCAN_EQUIPMENT_ACTUATOR_ARRAYCOMMAND_SIGNATURE;
         return true;

@@ -109,6 +109,7 @@ bool MotorControl::init(const Config &cfg)
     _cur_kp    = cfg.current_bw_rad * cfg.motor_Ls;
     _cur_ki_dt = cfg.current_bw_rad * cfg.motor_Rs * _dt;
     _current_max   = cfg.current_max;
+    _i_slew_per_tick = cfg.current_slew_a_s * _dt;   // 0 → instant (slew disabled)
     _oc_trip       = cfg.overcurrent_trip;
     _oc_trip_hard  = cfg.overcurrent_trip_hard;
     _regen_max     = cfg.regen_current_max;
@@ -305,8 +306,13 @@ void MotorControl::set_current(float amps)
         // Zero command: while running keep the loop alive at iq=0 (current loop
         // drives vd/vq to hold zero current → smooth coast, no bridge cliff-cut).
         // From idle/fault, stay idle so a zero command can't spin the motor up.
-        _cmd_current = 0.0f;
+        // Leave _cmd_current to slew down to 0 for a controlled release; only
+        // force it to 0 when fully stopping so a later re-arm starts from zero.
+        _cmd_current_target = 0.0f;
         _mode = (_state == State::CLOSED || _state == State::OPENLOOP) ? Mode::CURRENT : Mode::STOP;
+        if (_mode == Mode::STOP) {
+            _cmd_current = 0.0f;
+        }
         return;
     }
     // Refuse a hot swap from another active controller under load; the host
@@ -314,7 +320,10 @@ void MotorControl::set_current(float amps)
     if (!mode_change_allowed(Mode::CURRENT)) {
         return;
     }
-    _cmd_current = clampf(amps, -_current_max, _current_max);
+    if (_mode != Mode::CURRENT) {
+        _cmd_current = 0.0f;                     // (re)entry: slew up from zero, not from a stale value
+    }
+    _cmd_current_target = clampf(amps, -_current_max, _current_max);
     _mode = Mode::CURRENT;                      // set mode first so a racing ISR sees CURRENT not STOP
     _oc_over_count = 0; _oc_blank = OC_BLANK_SAMPLES;
     stm32_foc_motor_control_enable_outputs();   // re-arm bridge if previously released
@@ -559,6 +568,18 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
         _t_erpm  = _obs_omega * _w_to_erpm;
         _t_theta = _debug_theta;
         return;
+    }
+
+    // Slew the CURRENT-mode torque setpoint toward its target (VESC l_current_ramp
+    // equivalent) so a step throttle command can't apply an instant iq reference
+    // jump. Done before the coast test below, which reads _cmd_current: a
+    // commanded 0 ramps down to true zero, then coasts/releases. BRAKE writes
+    // _cmd_current directly as a magnitude and SPEED ignores it, so slew CURRENT
+    // only. i_max clamp at the iq_cmd site still bounds the derated ceiling.
+    if (mode == Mode::CURRENT) {
+        _cmd_current = (_i_slew_per_tick > 0.0f)
+                           ? step_towards(_cmd_current, _cmd_current_target, _i_slew_per_tick)
+                           : _cmd_current_target;
     }
 
     // ── Coast (CURRENT @ iq=0) / Brake: hold the loop alive, never let OL

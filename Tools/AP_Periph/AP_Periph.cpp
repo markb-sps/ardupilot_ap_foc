@@ -197,9 +197,15 @@ void AP_Periph_FW::init()
         // the observer has real back-EMF to lock onto (Step 2 sign/tracking check).
         // Set back to 0 for a static d-axis sign/scale test.
         motor_cfg.debug_openloop_hz = 1.0f;   // ≈60 eRPM forced rotation (slow enough to pull in from rest)
+        // Torque-command slew: full-scale (current_max) reached in ~100 ms so a
+        // PWM RC throttle step can't apply an instant iq jump. See MotorControl.
+        motor_cfg.current_slew_a_s = 150.0f;   // [A/s]
         motor_control.init(motor_cfg);
 
         vesc_telem.init(hal.serial(0));
+
+        // J305 PWM RC throttle input (TIM3_CH1 / PC6) — polled in update_motor_test().
+        ChibiOS::stm32_pwm_input_init();
     }
 #endif
 
@@ -507,17 +513,86 @@ void AP_Periph_FW::show_stack_free()
 #endif
 
 #if CONFIG_HAL_BOARD == HAL_BOARD_CHIBIOS
-// Set-points (current / RPM) come from VESC Tool through VescTelemetry; the FOC
-// cycle runs in the ADC ISR. MotorControl manages MOE internally — spin-up
-// commands enable it, hold_off()/trip_fault() disable it — so the thread side
-// only has to enforce the host-comms failsafe here.
+// J305 RC PWM throttle calibration (single-channel servo pulse, high-time coded).
+static constexpr uint16_t THR_PWM_MIN_US      = 1000;  // 0% throttle pulse
+static constexpr uint16_t THR_PWM_MAX_US      = 2000;  // 100% throttle pulse
+static constexpr uint16_t THR_PWM_DEADZONE_US = 30;    // ignore this much above min (0% band)
+static constexpr uint16_t THR_PWM_RANGE_TOL_US = 100;  // accept 900..2100; beyond → signal invalid
+// Arming gate: the throttle must be seen at/below this (i.e. fully closed) before
+// it may command torque. A power-up or reconnect with the stick raised will not
+// spin the motor until it has passed through the low end at least once.
+static constexpr uint16_t THR_PWM_ARM_MAX_US = 1000;
+// A source is "fresh" for this long after its last valid command. Covers a
+// couple of dropped 50 Hz RC frames / DroneCAN commands before it ages out.
+static constexpr uint32_t THR_SOURCE_TIMEOUT_MS = 200;
+
+// Poll the TIM3 capture and, on a valid in-range frame, refresh the PWM source.
+// Enforces a boot-low arming gate: the throttle must be seen at/below the 0%
+// band once before it may command torque, so a power-up (or reconnect) at high
+// stick can't spin the motor. An out-of-range pulse re-arms the gate.
+void AP_Periph_FW::read_pwm_throttle(uint32_t now_ms)
+{
+    uint16_t pulse_us, period_us;
+    if (!ChibiOS::stm32_pwm_input_read(&pulse_us, &period_us)) {
+        return;   // no fresh frame — leave throttle_pwm_ms to age out into coast
+    }
+    // Plausibility: pulse in the RC band and a sane ~50–500 Hz frame period.
+    if (pulse_us < THR_PWM_MIN_US - THR_PWM_RANGE_TOL_US ||
+        pulse_us > THR_PWM_MAX_US + THR_PWM_RANGE_TOL_US ||
+        period_us < 2000 || period_us > 25000) {
+        throttle_pwm_armed = false;   // bad signal → require a fresh low before driving
+        throttle_pwm_amps = 0.0f;
+        return;                       // and let the source go stale → coast
+    }
+    // Frame is valid → the PWM source is present (prevents coast even at 0%).
+    throttle_pwm_ms = now_ms;
+    const uint16_t low = THR_PWM_MIN_US + THR_PWM_DEADZONE_US;
+    if (!throttle_pwm_armed) {
+        // Must pass through the fully-closed end (≤1000 µs) before it can drive:
+        // a boot/reconnect at raised throttle stays coasted until stick is low.
+        if (pulse_us <= THR_PWM_ARM_MAX_US) {
+            throttle_pwm_armed = true;
+        }
+        throttle_pwm_amps = 0.0f;     // hold coast until armed through low
+        return;
+    }
+    const float pct = constrain_float(float(pulse_us - low) /
+                                      float(THR_PWM_MAX_US - low), 0.0f, 1.0f);
+    throttle_pwm_amps = pct * motor_control.current_limit();
+}
+
+// Torque set-points come from three sources: DroneCAN ESC RawCommand (CAN), a
+// VESC Tool COMM_SET_CURRENT over USB serial (USB), and the J305 PWM RC input
+// (PWM). Priority CAN > USB > PWM; as long as one source is fresh the motor is
+// driven, and it coasts only when all are stale. A VESC Tool bench override
+// (rpm / brake / duty-debug) drives MotorControl directly and, while active,
+// takes exclusive control — the arbiter stands off so it isn't stomped.
 void AP_Periph_FW::update_motor_test(uint32_t now_ms)
 {
     if (!motor_control.is_initialized()) {
         return;
     }
-    motor_control.check_command_timeout(now_ms);  // coast if host stopped commanding
+    read_pwm_throttle(now_ms);
     motor_control.update_thermal(now_ms);         // FET NTC → iq derate / over-temp trip
+
+    if (vesc_telem.override_active(now_ms, THR_SOURCE_TIMEOUT_MS)) {
+        return;                                   // VESC bench override owns the motor
+    }
+
+    const bool can_fresh = throttle_can_ms != 0 && (now_ms - throttle_can_ms) < THR_SOURCE_TIMEOUT_MS;
+    const bool pwm_fresh = throttle_pwm_ms != 0 && (now_ms - throttle_pwm_ms) < THR_SOURCE_TIMEOUT_MS;
+    float usb_amps;
+    const bool usb_fresh = vesc_telem.usb_current(now_ms, THR_SOURCE_TIMEOUT_MS, usb_amps);
+
+    if (can_fresh) {
+        motor_control.set_current(throttle_can_amps);
+    } else if (usb_fresh) {
+        motor_control.set_current(usb_amps);
+    } else if (pwm_fresh) {
+        motor_control.set_current(throttle_pwm_amps);
+    } else {
+        motor_control.set_current(0.0f);          // all sources stale → coast
+    }
 }
 #endif
 

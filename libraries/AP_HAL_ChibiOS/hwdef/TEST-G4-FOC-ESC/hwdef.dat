@@ -116,7 +116,10 @@ define STM32_ADC_ADC2_IRQ_HOOK do { extern void motor_control_adc2_irq_hook(uint
 #   PHASE_I3 -> PB0 (ADC1_IN15) - phase W, sampled as ADC1 injected rank 2
 # VBUS -> PA0 (ADC1_IN1). These pins are configured by MotorControl at runtime.
 
-# ESC interrupt
+# J305 PWM RC throttle input. PC6 = TIM3_CH1 (AF2). Left unassigned here and
+# claimed at runtime by the stm32_pwm_input driver (register-level TIM3 PWM-input
+# capture), the same way MotorControl claims the ADC pins. TIM3 is otherwise
+# unused (bridge = TIM1, systick = TIM2).
 #PC6 ESC_INT INPUT
 
 define SERIAL_BUFFERS_SIZE 256

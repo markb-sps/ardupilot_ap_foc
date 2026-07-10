@@ -18,6 +18,24 @@ public:
     void init(AP_HAL::UARTDriver *uart);
     void update();
 
+    // ── Throttle-arbiter interface (see AP_Periph_FW::update_motor_test) ─────
+    // USB torque source: true (and amps set) if a COMM_SET_CURRENT arrived within
+    // timeout_ms. A current command drives the motor through the arbiter (subject
+    // to CAN priority), not directly, so CAN can cleanly override it.
+    bool usb_current(uint32_t now_ms, uint16_t timeout_ms, float &amps) const {
+        if (_usb_current_ms != 0 && (now_ms - _usb_current_ms) < timeout_ms) {
+            amps = _usb_current_a;
+            return true;
+        }
+        return false;
+    }
+    // True while a VESC Tool bench override (rpm / brake / duty-debug) is active.
+    // These modes drive MotorControl directly, so the arbiter stands off rather
+    // than stomping them with a current command.
+    bool override_active(uint32_t now_ms, uint16_t timeout_ms) const {
+        return _override_ms != 0 && (now_ms - _override_ms) < timeout_ms;
+    }
+
 private:
     enum class RxState : uint8_t {
         WAIT_START,
@@ -54,6 +72,11 @@ private:
     uint8_t  _payload[80];
 
     uint8_t  _tx_buf[128];
+
+    // Throttle-arbiter state (thread context).
+    float    _usb_current_a  = 0.0f;  // last COMM_SET_CURRENT value [A]
+    uint32_t _usb_current_ms = 0;     // millis() of that command (0 = none yet)
+    uint32_t _override_ms    = 0;     // millis() of last rpm/brake/duty override (0 = none)
 };
 
 } // namespace ChibiOS

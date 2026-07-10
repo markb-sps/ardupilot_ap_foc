@@ -84,6 +84,11 @@ public:
         // the 2-point static debug method (slope fit gives V_dt). ~0.10V here.
         float    deadtime_comp_volts = 0.10f;
         uint16_t command_timeout_ms = 1000;   // coast if no host packet within this (comms failsafe)
+        // Torque-command slew limit [A/s]: the CURRENT-mode setpoint is ramped
+        // toward each new command at this rate so a step throttle input (e.g. a
+        // PWM RC channel snapped to full) can't apply an instant iq reference
+        // jump. 0 disables (instant). VESC l_current_ramp equivalent.
+        float    current_slew_a_s   = 0.0f;
 
         // ── Sensorless open-loop override (models VESC mcpwm_foc control_current)
         float    openloop_current      = 5.0f;    // boost current added during the override [A] (VESC boost_q)
@@ -193,6 +198,7 @@ public:
     float get_fet_temp()      const { return _t_fet_temp; }  // board NTC [°C]
     uint8_t get_fault()       const { return _fault_code; }
     uint8_t get_state()       const { return uint8_t(_state); }
+    float   current_limit()   const { return _current_max; }   // iq command ceiling [A]
 
     volatile uint32_t _adc_sample_cb_count{0};
 
@@ -230,7 +236,8 @@ private:
 
     // ── Commands (written from thread, read in ISR) ────────────────────────
     volatile Mode  _mode        = Mode::STOP;
-    volatile float _cmd_current = 0.0f;   // [A]
+    volatile float _cmd_current = 0.0f;   // [A] applied (slew-limited) CURRENT setpoint / BRAKE magnitude
+    volatile float _cmd_current_target = 0.0f; // [A] raw CURRENT command; _cmd_current slews toward this
     volatile float _cmd_erpm    = 0.0f;   // [electrical RPM]
     volatile uint32_t _last_cmd_ms = 0;   // millis() of last set-point (host failsafe)
     uint16_t       _cmd_timeout_ms = 500;
@@ -242,6 +249,7 @@ private:
     float _cur_kp          = 0.0f;   // L·ωbw
     float _cur_ki_dt       = 0.0f;   // R·ωbw·dt
     float _current_max     = 15.0f;
+    float _i_slew_per_tick = 0.0f;   // CURRENT-setpoint slew per ISR tick [A] (0 = instant)
     float _oc_trip         = 30.0f;
     float _oc_trip_hard    = 60.0f;  // instant trip, active during blanking too [A]
     float _regen_max       = 5.0f;   // max braking/regen motor current [A]
