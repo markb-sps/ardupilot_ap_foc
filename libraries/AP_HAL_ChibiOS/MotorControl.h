@@ -314,9 +314,7 @@ private:
     float    _ol_release   = 0.0f;   // remaining post-handover boost fade [s]
     float    _track_timer  = 0.0f;   // remaining fresh-start TRACK time [s]
     uint16_t _lock_count   = 0;      // consecutive in-band flux samples during TRACK
-    uint16_t _lock_need    = 1500;   // samples required to call the observer locked
-    uint16_t _ol_lock_count = 0;     // shadow-observer lock samples during OPENLOOP
-    float    _ol_run_time  = 0.0f;   // cumulative time in this OL sequence [s]
+    uint16_t _lock_need    = 1500;   // samples required to call the observer locked (TRACK/restart)
     float    _debug_theta  = 0.0f;
     float    _v_alpha_prev = 0.0f;   // applied αβ volts, fed to observer next cycle
     float    _v_beta_prev  = 0.0f;

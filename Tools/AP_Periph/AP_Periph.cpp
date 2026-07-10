@@ -154,7 +154,7 @@ void AP_Periph_FW::init()
         motor_cfg.vbus_fold_band = 3.0f;
         // Startup torque: the OL cap was leaving a third of the current budget
         // unused (easily hand-stalled) — let open loop use the full iq limit.
-        motor_cfg.openloop_current = 12.0f;
+        motor_cfg.openloop_current = 10.0f;
         // Max braking/regen motor current [A]. Deliberately low: braking energy
         // returns to the bus, a bench PSU can't sink it, and there is no bus-OV
         // clamp yet. Raise once OV handling / a brake resistor exists.
@@ -171,7 +171,7 @@ void AP_Periph_FW::init()
         // first ~75 ms) until the rotor's settle oscillation dies, THEN
         // accelerate — otherwise capture happens mid-ramp and a bad draw
         // slips poles backward before catching (backward-run-then-jerk start).
-        motor_cfg.openloop_lock_s = 0.2f;
+        motor_cfg.openloop_lock_s = 0.4f;
         motor_cfg.openloop_ramp_s = 0.5f;   // was 0.1 s — gentler so the rotor can keep up
         motor_cfg.openloop_const_s = 0.2f;  // hold forced rotation long enough to observe
         // Hand over to the observer at HIGHER speed so back-EMF is large enough for
@@ -180,9 +180,11 @@ void AP_Periph_FW::init()
         // backward). Note this is NOT the actual handover eRPM: like VESC
         // (mcpwm_foc utils_map on iq vs current_max), the effective threshold is
         //   map(|iq|+boost, 0, current_max, rpm_low_frac*openloop_erpm, openloop_erpm)
-        // so at our ~9.5 A of 15 A operating point handover lands at ≈0.63·this.
-        // 1500 → ≈950 eRPM handover (was 600 → ≈380, where the dip happened).
-        motor_cfg.openloop_erpm = 1500.0f;
+        // At our boost_q=12 A of 15 A, a zero-throttle start hands over near
+        // 0.8·this; full throttle at this ceiling. 2000 → ≈1600 eRPM zero-throttle
+        // handover, 2000 at full — well above the observer's ~900 eRPM floor, so
+        // the freed observer has strong back-EMF (≈0.96 V) to lock onto.
+        motor_cfg.openloop_erpm = 2000.0f;
         // Outer speed PI — strong enough to reject load (tune: ↑ if sluggish, ↓ if hunting).
         motor_cfg.speed_kp = 0.005f;   // [A per eRPM]
         motor_cfg.speed_ki = 0.05f;    // [A per eRPM·s]
