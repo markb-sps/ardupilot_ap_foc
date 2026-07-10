@@ -139,6 +139,8 @@ bool MotorControl::init(const Config &cfg)
 
     _ol_boost_q         = cfg.openloop_current;
     _ol_max_q           = cfg.openloop_max_q;
+    _ol_max_attempts    = cfg.openloop_max_attempts;
+    _ol_cooldown_t      = cfg.openloop_cooldown_s;
     _open_handover_erpm = cfg.openloop_erpm;
     _ol_rpm_low         = cfg.openloop_rpm_low_frac;
     _ol_hyst            = cfg.openloop_hyst_s;
@@ -198,7 +200,6 @@ void MotorControl::reset_control()
     _lock_count = 0;
     _v_alpha_prev = _v_beta_prev = 0.0f;
     _obs_x1 = _obs_x2 = _obs_theta = _obs_omega = 0.0f;
-    _free_x1 = _free_x2 = 0.0f;
     _pll_theta = 0.0f;
     _stall_timer = 0.0f;
 }
@@ -300,9 +301,19 @@ bool MotorControl::mode_change_allowed(Mode target) const
 
 void MotorControl::set_current(float amps)
 {
+    // Sensorless-start lockout: after too many failed forced starts the bridge is
+    // latched off (thermal cap). A nonzero command must NOT clear it — otherwise
+    // the arbiter re-commanding every loop would retry forever. Only a zero/stop
+    // command (below) releases it.
+    if (_ol_locked_out && fabsf(amps) >= 0.01f) {
+        _last_cmd_ms = AP_HAL::millis();  // still a live host, just held off
+        return;
+    }
     _last_cmd_ms = AP_HAL::millis();
     _fault_code  = FAULT_NONE;        // any host current command clears a latched trip
     if (fabsf(amps) < 0.01f) {
+        _ol_locked_out = false;       // throttle released → clear the start lockout
+        _ol_attempts   = 0;
         // Zero command: while running keep the loop alive at iq=0 (current loop
         // drives vd/vq to hold zero current → smooth coast, no bridge cliff-cut).
         // From idle/fault, stay idle so a zero command can't spin the motor up.
@@ -384,6 +395,9 @@ void MotorControl::stop()
 {
     _mode = Mode::STOP;
     _fault_code = FAULT_NONE;   // clear latched fault on explicit stop
+    _ol_attempts = 0;           // fresh sensorless-start retry budget
+    _ol_cooldown = 0.0f;
+    _ol_locked_out = false;
 }
 
 void MotorControl::set_debug_voltage(float duty)
@@ -589,6 +603,8 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
     const bool coasting = (mode == Mode::BRAKE) ||
                           (mode == Mode::CURRENT && _cmd_current == 0.0f);
     if (coasting) {
+        _ol_cooldown = 0.0f;                             // command released → drop
+        _ol_attempts = 0;                                // any pending retry/cooldown
         constexpr float RELEASE_OMEGA = 10.47f;          // ~100 eRPM (rad/s)
         if (fabsf(_obs_omega) < RELEASE_OMEGA) {
             hold_off(State::IDLE);                       // safe to high-Z now
@@ -597,6 +613,20 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
         _ol_timer = 0.0f;
         _ol_release = 0.0f;
         _hyst_timer = 0.0f;
+    }
+
+    // Inter-attempt cooldown after an abandoned sensorless start: hold the bridge
+    // high-Z for openloop_cooldown_s so the windings shed heat before another
+    // forced try (no motor-temp sensor). The retry counters survive reset_control()
+    // so the budget carries across; when the timer expires we fall through and the
+    // TRACK/hysteresis path below re-arms the next forced attempt.
+    if (_ol_cooldown > 0.0f) {
+        _ol_cooldown -= _dt;
+        stm32_foc_motor_control_disable_outputs_isr();
+        stm32_foc_motor_control_write_pwm(0, 0, 0);
+        _state = State::IDLE;
+        _t_id = _t_iq = _t_vd = _t_vq = _t_duty = 0.0f;
+        return;
     }
 
     // First running cycle after STOP / fault / debug → enter the TRACK phase
@@ -668,10 +698,12 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
     }
 
     // ── VESC-style sensorless open-loop override (mcpwm_foc control_current) ──
-    // The observer ALWAYS commutates. While too slow, we instead force the angle
-    // through a timed lock→ramp→const sequence AND overwrite the observer flux
-    // to match it, so the observer is already tracking when the override
-    // releases — seamless, no blend / agreement gate / fallback bounce.
+    // While too slow to sense, we force the angle through a timed lock→ramp→const
+    // sequence and commutate on that FORCED angle. The Ortega observer free-runs
+    // the whole time on the real applied v/i (never seeded or clobbered — same as
+    // VESC's single observer) and its output is IGNORED here; it is used only at
+    // the transfer, and only if it has converged by then (see the handover gate
+    // in the else-branch below). If it hasn't, the start is abandoned and retried.
     //
     // Open-loop speed threshold scales with commanded current (more torque →
     // wider open-loop band), like VESC's openloop_rpm_max map.
@@ -690,6 +722,7 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
     // and never while coasting/braking — must not auto-re-spin the motor).
     if (_hyst_timer >= _ol_hyst && _ol_timer <= 1e-4f && !coasting) {
         _ol_timer   = _ol_t_total;
+        _lock_count = 0;          // fresh convergence watch for this attempt
         started_now = true;
     }
 
@@ -726,26 +759,26 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
         }
         _integ_spd = clampf(_integ_spd, -_ol_max_q, _ol_max_q);
 
-        // Seed observer flux toward where the rotor d-axis sits in I/f, forced
-        // angle + dir·45°. The true offset is load-dependent (0° at pull-out, 90°
-        // unloaded); VESC seeds the +45° compromise (mcpwm_foc.c: m_observer_x1/2
-        // _override = flux·sincos(override + SIGN(duty)·π/4)). Seed EVERY override
-        // cycle so that when the timer releases the observer is already at ~the
-        // rotor angle and turning at the forced speed — it then converges the last
-        // ~45° gently under the speed-scaled observer gain (see observer_update).
-        _obs_x1 = cosf(_override_ang + dir * 0.78539816f) * _obs_lambda;
-        _obs_x2 = sinf(_override_ang + dir * 0.78539816f) * _obs_lambda;
+        // Convergence watch (decides the transfer only — NOT commutation, which
+        // stays forced above). The free-running observer is "converged" once its
+        // flux magnitude |x − L·i| holds in the [0.5λ, 1.5λ] band CONTINUOUSLY for
+        // _lock_need samples. This naturally only accumulates once there is enough
+        // back-EMF (the const phase at ol_rpm_max); at standstill the magnitude
+        // wanders and the count keeps resetting. Same detector the TRACK phase uses.
+        const float te1 = _obs_x1 - _obs_L * i_alpha;
+        const float te2 = _obs_x2 - _obs_L * i_beta;
+        const float fl2 = te1 * te1 + te2 * te2;
+        if (fl2 > 0.25f * _obs_lambda2 && fl2 < 2.25f * _obs_lambda2) {
+            if (_lock_count < 0xFFFFU) {
+                _lock_count++;
+            }
+        } else {
+            _lock_count = 0;
+        }
 
-        // ── Unconditional, timer-based handover (VESC mcpwm_foc) ─────────────
-        // The override runs for exactly _ol_t_total, then simply releases. Because
-        // the observer is pinned to the forced angle every cycle above, when
-        // _ol_timer reaches 0 it is already seeded at (near) the rotor angle and
-        // turning at the forced speed, so the CLOSED branch below just keeps
-        // commutating on it — no lock gate, no blend, no shadow-observer vote.
-        // If the freed observer then can't hold ≥ ol_rpm_max, the hysteresis at
-        // the top re-arms a fresh sequence: the start self-heals and can never
-        // latch a stall it can't recover from (the old gated path could
-        // FAULT_STALL here, or re-dwell forever on a wobbly lock).
+        // Timer-based end of the forced sequence. When _ol_timer reaches 0 the
+        // else-branch below runs the transfer gate: hand over to the observer angle
+        // iff converged, otherwise abandon → coast → retry (bounded).
         _ol_timer -= _dt;
         _ol_release = _ol_t_release;   // armed for the post-handover boost fade
         _track_timer = 0.0f;           // OL running → TRACK is over
@@ -789,6 +822,7 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
             } else {
                 // No lock → standstill (or too slow to matter): forced start.
                 _ol_timer     = _ol_t_total;
+                _lock_count   = 0;      // fresh convergence watch for this attempt
                 _override_ang = wrap_pi(_obs_theta + dir * 1.04719755f); // anti-stuck kick
                 _hyst_timer   = 0.0f;
                 _obs_omega    = 0.0f;   // discard the random-walk estimate
@@ -797,6 +831,27 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
         }
     } else {
         const bool handover = (_state == State::OPENLOOP);
+        // ── Transfer gate ────────────────────────────────────────────────────
+        // First cycle after the forced sequence: only hand the commutation angle
+        // to the observer if it actually converged (the watch above). If it did
+        // not, the forced start failed — abandon it, coast for a cooldown, then
+        // retry. Bounded: after _ol_max_attempts, latch FAULT_STALL so a motor
+        // that never locks can't be force-driven (heated) indefinitely.
+        if (handover && _lock_count < _lock_need) {
+            _ol_attempts++;
+            if (_ol_attempts >= _ol_max_attempts) {
+                _ol_locked_out = true;         // stop retrying until throttle released
+                _fault_code    = FAULT_STALL;
+                hold_off(State::FAULT);        // (counters/lockout survive reset_control)
+                return;
+            }
+            _ol_cooldown = _ol_cooldown_t; // high-Z coast, then a fresh attempt
+            hold_off(State::IDLE);         // (survives reset_control: see header)
+            return;
+        }
+        if (handover) {
+            _ol_attempts = 0;              // converged → restore the retry budget
+        }
         _override_ang = _obs_theta;
         theta  = _obs_theta;   // pure sensorless
         _state = State::CLOSED;
@@ -950,21 +1005,6 @@ void MotorControl::observer_update(float v_alpha, float v_beta, float i_alpha, f
 
     _obs_theta   = theta;   // commutation still uses the raw observer angle, not the PLL angle
     _t_obs_theta = theta;
-
-    // ── Shadow observer (diagnostic) ────────────────────────────────────────
-    // Identical Ortega dynamics, but its state is NEVER seeded/clobbered by the
-    // open-loop override. So during forced startup this angle is the estimate
-    // the sensorless observer reaches on its own — comparing it to the forced
-    // angle shows whether the rotor is actually being tracked before handover.
-    const float fL_ia = _obs_L * i_alpha;
-    const float fL_ib = _obs_L * i_beta;
-    const float fe1   = _free_x1 - fL_ia;
-    const float fe2   = _free_x2 - fL_ib;
-    float ferr        = _obs_lambda2 - (fe1 * fe1 + fe2 * fe2);
-    if (ferr > 0.0f) ferr = 0.0f;
-    _free_x1 += (v_alpha - _obs_R * i_alpha + gamma_half * fe1 * ferr) * _dt;
-    _free_x2 += (v_beta  - _obs_R * i_beta  + gamma_half * fe2 * ferr) * _dt;
-    _t_free_theta = atan2f(_free_x2 - fL_ib, _free_x1 - fL_ia);
 }
 
 } // namespace ChibiOS

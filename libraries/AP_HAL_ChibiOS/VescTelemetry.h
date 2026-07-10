@@ -19,11 +19,16 @@ public:
     void update();
 
     // ── Throttle-arbiter interface (see AP_Periph_FW::update_motor_test) ─────
-    // USB torque source: true (and amps set) if a COMM_SET_CURRENT arrived within
-    // timeout_ms. A current command drives the motor through the arbiter (subject
-    // to CAN priority), not directly, so CAN can cleanly override it.
+    // USB torque source: holds the last COMM_SET_CURRENT value for as long as the
+    // host LINK is alive (any valid packet within timeout_ms), matching VESC's
+    // setpoint-hold model — VESC Tool sends SET_CURRENT sparsely and keeps the
+    // link alive with GET_VALUES/COMM_ALIVE polling, relying on the firmware to
+    // hold the setpoint between sends (expiring on the SET_CURRENT age instead
+    // aborts a start mid-forced-spin: "kicks but never spins"). Requires at least
+    // one real SET_CURRENT (_usb_current_ms != 0) so a purely passive poller (RT
+    // monitoring, no command) never owns the motor. Lower priority than CAN.
     bool usb_current(uint32_t now_ms, uint16_t timeout_ms, float &amps) const {
-        if (_usb_current_ms != 0 && (now_ms - _usb_current_ms) < timeout_ms) {
+        if (_usb_current_ms != 0 && (now_ms - _host_alive_ms) < timeout_ms) {
             amps = _usb_current_a;
             return true;
         }
@@ -75,7 +80,8 @@ private:
 
     // Throttle-arbiter state (thread context).
     float    _usb_current_a  = 0.0f;  // last COMM_SET_CURRENT value [A]
-    uint32_t _usb_current_ms = 0;     // millis() of that command (0 = none yet)
+    uint32_t _usb_current_ms = 0;     // millis() of that command (0 = none ever sent)
+    uint32_t _host_alive_ms  = 0;     // millis() of the last valid packet (link keepalive)
     uint32_t _override_ms    = 0;     // millis() of last rpm/brake/duty override (0 = none)
 };
 

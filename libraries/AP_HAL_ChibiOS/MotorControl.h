@@ -106,6 +106,16 @@ public:
         // Clamped in init to at least openloop_hyst_s + 20 ms.
         float    resync_time_s         = 0.15f;
         float    openloop_max_q        = 3.0f;    // open-loop iq cap [A] (VESC foc_sl_openloop_max_q) — limits startup heat
+        // Sensorless-start supervision. The observer free-runs (never seeded) during
+        // the forced lock→ramp→const sequence and its angle is USED only at the
+        // transfer: handover happens iff the observer has converged (|flux| held in
+        // band for _lock_need samples) by the transfer speed. If it hasn't, the
+        // start is abandoned, the bridge coasts for openloop_cooldown_s, then it
+        // retries. Retries are capped because there is no motor-temp sensor and a
+        // motor that never locks would otherwise be force-driven (and heated)
+        // indefinitely — after openloop_max_attempts it latches FAULT_STALL.
+        uint8_t  openloop_max_attempts = 3;       // forced-start tries before FAULT
+        float    openloop_cooldown_s   = 0.5f;    // high-Z coast between tries [s]
 
         // ── Observer / speed loop ──────────────────────────────────────────
         float    observer_gain = 2.5e7f;   // Ortega γ (bw ≈ γ·λ²); VESC-equivalent (9e7·(λ_vesc/λ)²)
@@ -191,7 +201,6 @@ public:
     float get_erpm()          const { return _t_erpm; }    // electrical RPM
     float get_estimated_angle() const { return _t_theta; }     // control angle [rad]
     float get_observer_angle()  const { return _t_obs_theta; } // observer angle [rad]
-    float get_free_observer_angle() const { return _t_free_theta; } // unseeded shadow observer [rad]
     float get_vbus()          const { return _vbus; }
     // Filtered bus volts, maintained by the control ISR from the PA0 divider.
     float read_vbus() { return _vbus; }
@@ -279,6 +288,18 @@ private:
     float _ol_t_ramp         = 0.1f; // forced-speed ramp duration [s]
     float _ol_t_total        = 0.15f;// lock + ramp + const [s]
     float _ol_t_release      = 0.3f; // post-handover boost fade-out [s]
+    // Sensorless-start supervision (see Config). _ol_attempts / _ol_cooldown are
+    // deliberately NOT touched by reset_control() so the retry budget survives the
+    // inter-attempt coast; they are cleared on stop() and on a successful handover.
+    uint8_t _ol_max_attempts = 3;    // forced-start tries before FAULT
+    float   _ol_cooldown_t   = 0.5f; // coast between tries [s]
+    uint8_t _ol_attempts     = 0;    // failed tries this spin-up
+    float   _ol_cooldown     = 0.0f; // remaining inter-try coast [s]
+    // Latched once _ol_attempts hits the cap: the bridge stays off (FAULT_STALL)
+    // and — unlike other trips — a nonzero current command does NOT clear it, so
+    // the arbiter re-commanding every loop can't defeat the thermal cap. Cleared
+    // only by a zero/stop command (throttle released). NOT reset by reset_control.
+    volatile bool _ol_locked_out = false;
     float _resync_t          = 0.15f;// fresh-start TRACK phase duration [s]
     float _obs_lambda        = 0.0f; // PM flux linkage λ [Wb] (observer seed)
     float _obs_L           = 0.0f;   // 1.5·Ls
@@ -333,8 +354,6 @@ private:
     float _obs_theta  = 0.0f;
     float _obs_omega  = 0.0f;   // electrical speed [rad/s] — PLL output
     float _pll_theta  = 0.0f;   // PLL tracked angle (follows _obs_theta)
-    float _free_x1    = 0.0f;   // shadow observer — never seeded/clobbered (diagnostic)
-    float _free_x2    = 0.0f;
 
     // ── Telemetry snapshots (ISR → thread) ─────────────────────────────────
     volatile State   _state      = State::IDLE;
@@ -351,7 +370,6 @@ private:
     volatile float   _t_erpm  = 0.0f;
     volatile float   _t_theta = 0.0f;
     volatile float   _t_obs_theta = 0.0f;
-    volatile float   _t_free_theta = 0.0f;
     volatile float   _t_fet_temp = 0.0f;   // board NTC [°C] (thread-written)
 };
 

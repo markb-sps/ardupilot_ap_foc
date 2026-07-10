@@ -156,8 +156,10 @@ void VescTelemetry::dispatch()
 {
     if (_payload_len < 1) return;
     // Any CRC-valid packet (set-point, GET_VALUES poll, COMM_ALIVE) means the
-    // host is alive — pet the comms failsafe so it only coasts on real loss.
+    // host is alive — pet the comms failsafe so it only coasts on real loss, and
+    // keep the held USB current setpoint alive (VESC setpoint-hold; see usb_current).
     _mc.notify_host_alive();
+    _host_alive_ms = AP_HAL::millis();
     switch (_payload[0]) {
     case COMM_FW_VERSION:
         handle_fw_version();
@@ -248,7 +250,6 @@ void VescTelemetry::handle_get_values()
     _mc.get_vdq(vd, vq);
     const float theta     = _mc.get_estimated_angle();      // control angle [rad]
     const float obs_theta = _mc.get_observer_angle();       // observer angle [rad]
-    const float free_theta = _mc.get_free_observer_angle(); // unseeded shadow observer [rad]
 
     const float i_motor = _mc.get_motor_current(); // q-axis (torque) current [A]
     const float v_in    = _mc.read_vbus();   // fresh ADC sample (PA0 divider)
@@ -286,7 +287,7 @@ void VescTelemetry::handle_get_values()
     // trailing bytes; our bench scripts read them). Both angles in rad·10000.
     put_f32(p, theta,      10000.0f); // control/commanded angle      (offset 74)
     put_f32(p, obs_theta,  10000.0f); // observer-estimated angle     (offset 78)
-    put_f32(p, free_theta, 10000.0f); // unseeded shadow observer     (offset 82)
+    put_f32(p, 0.0f,       10000.0f); // reserved (was shadow observer) (offset 82)
     put_f32(p, ia,           100.0f); // raw phase-U current [A]      (offset 86)
     put_f32(p, ib,           100.0f); // raw phase-V current [A]      (offset 90)
     put_f32(p, ic,           100.0f); // measured phase-W current [A] (offset 94)
