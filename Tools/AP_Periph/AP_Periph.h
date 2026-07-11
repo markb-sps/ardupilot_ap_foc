@@ -50,11 +50,7 @@
 #endif
 #include <AP_AHRS/AP_AHRS.h>
 #include <AP_DAC/AP_DAC.h>
-#if CONFIG_HAL_BOARD == HAL_BOARD_CHIBIOS
-#include <AP_HAL_ChibiOS/MotorControl.h>
-#include <AP_HAL_ChibiOS/VescTelemetry.h>
-#include <AP_HAL_ChibiOS/stm32_pwm_input.h>
-#endif
+#include "foc_esc.h"
 
 #if AP_PERIPH_RELAY_ENABLED
 #if AP_PERIPH_PWM_HARDPOINT_ENABLED
@@ -466,23 +462,10 @@ public:
     Networking_Periph networking_periph;
 #endif
 
-#if CONFIG_HAL_BOARD == HAL_BOARD_CHIBIOS
-    ChibiOS::MotorControl motor_control;
-    ChibiOS::VescTelemetry vesc_telem{motor_control, 7};
-    uint32_t motor_test_last_cycle_ms;
-    uint32_t motor_test_start_ms;
-
-    // ── Throttle command arbitration (priority: CAN > USB/VESC > PWM RC) ─────
-    // Each source stamps its latest torque command + time; update_motor_test()
-    // forwards the highest-priority source that is still fresh and in-range, and
-    // coasts only when all sources are stale. USB/VESC activity is inferred from
-    // motor_control.host_alive_ms() and drives the motor via its own direct path.
-    void  read_pwm_throttle(uint32_t now_ms);   // poll J305 capture → PWM source
-    float throttle_can_amps;                    // last DroneCAN ESC RawCommand torque [A]
-    uint32_t throttle_can_ms;                   // millis() of that command (0 = none yet)
-    float throttle_pwm_amps;                    // last valid PWM-derived torque [A]
-    uint32_t throttle_pwm_ms;                   // millis() of last valid PWM frame (0 = none)
-    bool  throttle_pwm_armed;                   // boot-low safety gate for the PWM source
+#ifdef HAL_PERIPH_ENABLE_FOC_ESC
+    // Field-Oriented-Control ESC: motor controller + VESC link + PWM RC input +
+    // CAN/USB/PWM torque arbiter, all self-contained (see foc_esc.h).
+    FOC_ESC foc;
 #endif
 
 #if AP_PERIPH_RTC_ENABLED
@@ -547,7 +530,6 @@ public:
 
     // show stack as DEBUG msgs
     void show_stack_free();
-    void update_motor_test(uint32_t now_ms);
 
     static bool no_iface_finished_dna;
     static constexpr auto can_printf = ::can_printf;
@@ -610,9 +592,9 @@ public:
     void handle_RTCMStream(CanardInstance* canard_instance, CanardRxTransfer* transfer);
     void handle_MovingBaselineData(CanardInstance* canard_instance, CanardRxTransfer* transfer);
     void handle_esc_rawcommand(CanardInstance* canard_instance, CanardRxTransfer* transfer);
-#if CONFIG_HAL_BOARD == HAL_BOARD_CHIBIOS && !AP_PERIPH_RC_OUT_ENABLED
-    // Lean ESC RawCommand handler for the FOC board (RC_OUT/SRV disabled): feeds
-    // the CAN source of the throttle arbiter instead of routing through rcout.
+#ifdef HAL_PERIPH_ENABLE_FOC_ESC
+    // Lean ESC RawCommand handler for the FOC board (RC_OUT/SRV disabled): decodes
+    // the raw command and feeds the CAN source of the FOC throttle arbiter (foc).
     void handle_esc_rawcommand_foc(CanardInstance* canard_instance, CanardRxTransfer* transfer);
 #endif
     void handle_act_command(CanardInstance* canard_instance, CanardRxTransfer* transfer);

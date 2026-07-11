@@ -166,6 +166,10 @@ PB15 TIM1_CH3N TIM1 PWM(3) GPIO(55)
 
 #define AP_PERIPH_RC_OUT_ENABLED 1
 
+# Field-Oriented-Control ESC: sensorless FOC motor + VESC link + PWM RC input +
+# CAN/USB/PWM throttle arbiter (Tools/AP_Periph/foc_esc.{h,cpp}).
+define HAL_PERIPH_ENABLE_FOC_ESC 1
+
 #define HAL_UART_MIN_TX_SIZE 256
 #define HAL_UART_MIN_RX_SIZE 128
 
