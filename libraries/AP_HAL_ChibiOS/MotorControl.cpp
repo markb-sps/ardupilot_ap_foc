@@ -416,6 +416,26 @@ void MotorControl::set_debug_voltage(float duty)
     stm32_foc_motor_control_enable_outputs();
 }
 
+// Play a tone through the motor (see header). A fixed-axis (α) voltage vector
+// modulated at freq_hz vibrates the windings without net rotation. Amplitude is
+// capped and the frequency floored so a mistaken low/DC tone can't dump current
+// through the ~55 mΩ winding resistance (the hard OC trip still backstops it).
+void MotorControl::play_tone(float freq_hz, float amplitude, uint16_t duration_ms)
+{
+    if (!_initialized || duration_ms == 0) {
+        return;
+    }
+    if (freq_hz < 200.0f) freq_hz = 200.0f;   // keep inductive reactance meaningful
+    _beep_phase      = 0.0f;
+    _beep_phase_step = TWO_PI * freq_hz * _dt;
+    _beep_amp        = clampf(amplitude, 0.0f, _debug_max_mod);
+    _beep_ticks_left = uint32_t(duration_ms) * (_pwm_update_rate_hz / 1000U);
+    _fault_code      = FAULT_NONE;
+    _mode            = Mode::BEEP;
+    _oc_over_count = 0; _oc_blank = OC_BLANK_SAMPLES;
+    stm32_foc_motor_control_enable_outputs();
+}
+
 // ── ISR path ────────────────────────────────────────────────────────────────
 
 void MotorControl::adc_sample_callback(void *ctx, uint16_t sample_u, uint16_t sample_v, uint16_t sample_w)
@@ -546,6 +566,36 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
     // ── Stopped / coasting ──────────────────────────────────────────────────
     if (mode == Mode::STOP) {
         hold_off(State::IDLE);
+        return;
+    }
+
+    // ── Audio beep: fixed-axis (α) voltage modulated at the tone frequency ────
+    // The windings vibrate as a speaker; a symmetric AC on one axis makes no net
+    // torque so the rotor doesn't spin. No current loop / observer involvement.
+    if (mode == Mode::BEEP) {
+        if (_beep_ticks_left == 0) {
+            _mode = Mode::STOP;        // tone done → coast (silent) next cycle
+            hold_off(State::IDLE);
+            return;
+        }
+        _beep_ticks_left--;
+        _beep_phase = wrap_pi(_beep_phase + _beep_phase_step);
+        const float m_alpha = _beep_amp * sinf(_beep_phase);
+        const float m_beta  = 0.0f;
+
+        float va, vb, vc;
+        FOC::inv_clarke(m_alpha, m_beta, va, vb, vc);
+        float da, db, dc;
+        FOC::svpwm(va, vb, vc, da, db, dc);
+        const float pf = float(_period_ticks);
+        stm32_foc_motor_control_write_pwm(uint16_t(da * pf), uint16_t(db * pf), uint16_t(dc * pf));
+
+        const float vbus_half = _vbus * 0.5f;
+        _v_alpha_prev = m_alpha * vbus_half;   // applied volts → observer next cycle
+        _v_beta_prev  = m_beta  * vbus_half;
+        _state  = State::BEEP;
+        _t_duty = _beep_amp;
+        _t_erpm = 0.0f;
         return;
     }
 

@@ -29,6 +29,13 @@ constexpr uint16_t THR_PWM_ARM_MAX_US   = 1000;
 // A source is "fresh" for this long after its last valid command — covers a
 // couple of dropped 50 Hz RC frames / DroneCAN commands before it ages to coast.
 constexpr uint32_t THR_SOURCE_TIMEOUT_MS = 200;
+
+// ── Power-on chime (played through the motor windings) ──────────────────────
+struct ChimeNote { uint16_t freq_hz; uint16_t ms; };
+constexpr ChimeNote CHIME[] = { {1047, 120}, {1319, 120}, {1568, 200} };  // C6–E6–G6
+constexpr uint8_t   CHIME_LEN       = sizeof(CHIME) / sizeof(CHIME[0]);
+constexpr float     CHIME_AMPLITUDE = 0.08f;  // modulation fraction (capped in play_tone)
+constexpr uint16_t  CHIME_GAP_MS    = 40;     // silence between notes
 }
 
 void FOC_ESC::init(AP_HAL::UARTDriver *vesc_uart)
@@ -152,29 +159,69 @@ void FOC_ESC::set_can_throttle(float frac)
 // driven, and it coasts only when all are stale. A VESC-Tool bench override
 // (rpm / brake / duty-debug) drives MotorControl directly and, while active,
 // takes exclusive control — the arbiter stands off so it isn't stomped.
+// Power-on chime: play the note table through the motor windings once the
+// controller has finished zero-current calibration. Returns true while the chime
+// owns the motor (so the arbiter stands off); aborts immediately if a real
+// command arrives or a fault trips, so it can never sound over a live throttle.
+bool FOC_ESC::update_startup_chime(uint32_t now_ms, bool any_command)
+{
+    if (_chime_state == ChimeState::DONE) {
+        return false;
+    }
+    if (any_command || motor_control.get_fault() != 0) {
+        if (motor_control.is_beeping()) {
+            motor_control.stop();
+        }
+        _chime_state = ChimeState::DONE;
+        return false;
+    }
+    if (_chime_state == ChimeState::WAIT) {
+        if (!motor_control.zero_valid()) {
+            return true;   // calibrating — hold the arbiter off, stay silent
+        }
+        _chime_idx = 0;
+        motor_control.play_tone(CHIME[0].freq_hz, CHIME_AMPLITUDE, CHIME[0].ms);
+        _chime_step_ms = now_ms + CHIME[0].ms + CHIME_GAP_MS;
+        _chime_state   = ChimeState::PLAY;
+        return true;
+    }
+    // PLAY: let the current note + trailing gap elapse, then start the next.
+    if (int32_t(now_ms - _chime_step_ms) < 0) {
+        return true;
+    }
+    if (++_chime_idx >= CHIME_LEN) {
+        _chime_state = ChimeState::DONE;   // finished → hand control to the arbiter
+        return false;
+    }
+    motor_control.play_tone(CHIME[_chime_idx].freq_hz, CHIME_AMPLITUDE, CHIME[_chime_idx].ms);
+    _chime_step_ms = now_ms + CHIME[_chime_idx].ms + CHIME_GAP_MS;
+    return true;
+}
+
 void FOC_ESC::update(uint32_t now_ms)
 {
     if (motor_control.is_initialized()) {
         read_pwm_throttle(now_ms);
         motor_control.update_thermal(now_ms);     // FET NTC → iq derate / over-temp trip
 
-        if (vesc_telem.override_active(now_ms, THR_SOURCE_TIMEOUT_MS)) {
-            // VESC bench override owns the motor — leave it be.
-        } else {
-            const bool can_fresh = _can_ms != 0 && (now_ms - _can_ms) < THR_SOURCE_TIMEOUT_MS;
-            const bool pwm_fresh = _pwm_ms != 0 && (now_ms - _pwm_ms) < THR_SOURCE_TIMEOUT_MS;
-            float usb_amps;
-            const bool usb_fresh = vesc_telem.usb_current(now_ms, THR_SOURCE_TIMEOUT_MS, usb_amps);
+        const bool can_fresh = _can_ms != 0 && (now_ms - _can_ms) < THR_SOURCE_TIMEOUT_MS;
+        const bool pwm_fresh = _pwm_ms != 0 && (now_ms - _pwm_ms) < THR_SOURCE_TIMEOUT_MS;
+        float usb_amps;
+        const bool usb_fresh = vesc_telem.usb_current(now_ms, THR_SOURCE_TIMEOUT_MS, usb_amps);
+        const bool override  = vesc_telem.override_active(now_ms, THR_SOURCE_TIMEOUT_MS);
 
-            if (can_fresh) {
-                motor_control.set_current(_can_amps);
-            } else if (usb_fresh) {
-                motor_control.set_current(usb_amps);
-            } else if (pwm_fresh) {
-                motor_control.set_current(_pwm_amps);
-            } else {
-                motor_control.set_current(0.0f);      // all sources stale → coast
-            }
+        if (update_startup_chime(now_ms, can_fresh || usb_fresh || pwm_fresh || override)) {
+            // Power-on chime owns the motor until it finishes or is pre-empted.
+        } else if (override) {
+            // VESC bench override owns the motor — leave it be.
+        } else if (can_fresh) {
+            motor_control.set_current(_can_amps);
+        } else if (usb_fresh) {
+            motor_control.set_current(usb_amps);
+        } else if (pwm_fresh) {
+            motor_control.set_current(_pwm_amps);
+        } else {
+            motor_control.set_current(0.0f);          // all sources stale → coast
         }
     }
 

@@ -16,7 +16,7 @@ namespace ChibiOS {
 // period. Thread-side code only issues set-points and toggles the output stage.
 class MotorControl {
 public:
-    enum class State : uint8_t { IDLE, ALIGN, OPENLOOP, BLEND, CLOSED, FAULT, DEBUG };
+    enum class State : uint8_t { IDLE, ALIGN, OPENLOOP, BLEND, CLOSED, FAULT, DEBUG, BEEP };
 
     // VESC fault codes (subset) reported through telemetry.
     // FAULT_STALL is not a VESC code — 30 is outside the VESC enum range.
@@ -185,6 +185,17 @@ public:
     // observer tracking before closing the loop. duty≈0 stops.
     void set_debug_voltage(float duty);
 
+    // Play an audible tone THROUGH the motor: a fixed-axis voltage vector whose
+    // magnitude is modulated at freq_hz, so the windings vibrate as a speaker
+    // without net rotation (a symmetric AC on one axis makes no net torque).
+    // amplitude is a modulation fraction (0..1 of the SVPWM range), internally
+    // capped; keep freq_hz audible (≥~500 Hz) so winding inductance limits the
+    // current. Auto-releases the bridge (coast) when the tone finishes. Use it
+    // for a power-on chime; do not call while driving. is_beeping() is true until
+    // the tone (and its release) completes.
+    void play_tone(float freq_hz, float amplitude, uint16_t duration_ms);
+    bool is_beeping() const { return _mode == Mode::BEEP; }
+
     // ── Telemetry getters (lock-free snapshots) ────────────────────────────
     void  get_idq(float &id, float &iq) const { id = _t_id; iq = _t_iq; }
     void  get_vdq(float &vd, float &vq) const { vd = _t_vd; vq = _t_vq; }
@@ -212,7 +223,7 @@ public:
     volatile uint32_t _adc_sample_cb_count{0};
 
 private:
-    enum class Mode : uint8_t { STOP, CURRENT, SPEED, BRAKE, DEBUG_VOLTAGE };
+    enum class Mode : uint8_t { STOP, CURRENT, SPEED, BRAKE, DEBUG_VOLTAGE, BEEP };
 
     static void adc_sample_callback(void *ctx, uint16_t sample_u, uint16_t sample_v, uint16_t sample_w);
     void        adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t sample_w);
@@ -318,6 +329,12 @@ private:
     float _w_to_erpm       = 0.0f;   // 60/2π
     float _debug_phase_step = 0.0f;  // |Δθ| per cycle in debug mode
     float _debug_max_mod    = 0.10f; // debug modulation clamp
+
+    // ── Audio beep (Mode::BEEP): fixed-axis amplitude-modulated tone ──────────
+    volatile uint32_t _beep_ticks_left = 0;    // ISR ticks remaining in the tone
+    float _beep_phase      = 0.0f;   // tone phase [rad] (ISR)
+    float _beep_phase_step = 0.0f;   // 2π·freq·dt per tick (thread → ISR)
+    float _beep_amp        = 0.0f;   // modulation amplitude [0..1] (thread → ISR)
 
     // ── Thermal protection (thread computes, ISR applies) ─────────────────
     float _fet_t_start     = 80.0f;

@@ -41,6 +41,16 @@ private:
     // boot-low arming gate + out-of-range coast).
     void read_pwm_throttle(uint32_t now_ms);
 
+    // Play a short power-on chime through the motor once the controller is ready.
+    // Returns true while the chime owns the motor (the arbiter stands off).
+    // Aborts (and is done) if any real throttle command arrives or a fault trips.
+    bool update_startup_chime(uint32_t now_ms, bool any_command);
+
+    enum class ChimeState : uint8_t { WAIT, PLAY, DONE };
+    ChimeState _chime_state = ChimeState::WAIT;
+    uint8_t    _chime_idx     = 0;   // index into the note table
+    uint32_t   _chime_step_ms = 0;   // millis() when the current note+gap ends
+
     ChibiOS::MotorControl  motor_control;
     ChibiOS::VescTelemetry vesc_telem{motor_control, 7};
 
