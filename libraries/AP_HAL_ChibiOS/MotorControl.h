@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <math.h>
 
 namespace ChibiOS {
 
@@ -16,18 +17,55 @@ namespace ChibiOS {
 // period. Thread-side code only issues set-points and toggles the output stage.
 class MotorControl {
 public:
-    enum class State : uint8_t { IDLE, ALIGN, OPENLOOP, BLEND, CLOSED, FAULT, DEBUG, BEEP };
+    enum class State : uint8_t { IDLE, ALIGN, OPENLOOP, BLEND, CLOSED, FAULT, DEBUG, BEEP,
+                                 HALL, HALL_DETECT };
 
     // VESC fault codes (subset) reported through telemetry.
-    // FAULT_STALL is not a VESC code — 30 is outside the VESC enum range.
+    // FAULT_STALL / FAULT_HALL_SENSOR are not VESC codes — 30+ is outside the
+    // VESC enum range, so they can't be confused with a real VESC fault.
     enum Fault : uint8_t {
         FAULT_NONE            = 0,
         FAULT_ABS_OVERCURRENT = 4,
         FAULT_OVER_TEMP_FET   = 5,
         FAULT_STALL           = 30,
+        FAULT_HALL_SENSOR     = 31,
     };
 
+    // Rotor-angle source. SENSORLESS = Ortega observer + I/f startup (original).
+    // HALL = digital hall sensors (J304), commutates from standstill, blends to
+    // the observer angle at high speed.
+    enum class SensorMode : uint8_t { SENSORLESS, HALL };
+
     struct Config {
+        // ── Rotor-angle sensing ────────────────────────────────────────────
+        // Default HALL for hardware bring-up of a sensored motor; switch to
+        // SENSORLESS (or set param) to run the observer-only path.
+        SensorMode sensor_mode = SensorMode::HALL;
+        // Electrical angle [deg] per 3-bit hall state (bit0 = A/PB11, bit1 = B/PB7,
+        // bit2 = C/PB10). NaN = unmapped. Motor/wiring specific AND convention
+        // specific (a 60° motor uses states {0,1,2,5,6,7}, a 120° motor {1..6}) —
+        // there is no safe universal guess, so the default is ALL-INVALID. HALL
+        // mode refuses to drive until a real table is loaded (from params) or
+        // produced by a HALL_DETECT spin. See MotorControl::hall_table_valid().
+        float hall_table_deg[8] = { NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN };
+        // Hall→observer angle blend band [eRPM] (VESC foc_sl_erpm). Below _lo the
+        // commutation angle is pure hall; above _hi it is pure observer; linear in
+        // between. Keep _hi below the sensorless floor is unnecessary — the
+        // observer is reliable well above _lo here.
+        float hall_blend_erpm_lo = 3000.0f;
+        float hall_blend_erpm_hi = 6000.0f;
+        // Break-away current cap [A] applied in HALL mode until the rotor has
+        // demonstrably moved (>= HALL_BREAKAWAY_N hall transitions). Bounds the
+        // current dumped into a stationary rotor if the table is wrong/mis-
+        // calibrated, so a bad angle can't hold near-DC current in one leg long
+        // enough to cook a FET before the HALL stall trip fires. See run loop.
+        float hall_breakaway_a   = 4.0f;
+        // Hall-table detection spin current [A], d-axis, current-regulated (VESC
+        // mcpwm_foc_hall_detect uses current control, not fixed voltage, so an
+        // unloaded low-R motor can't draw a large spin current). Clamped to
+        // current_max in init.
+        float hall_detect_a      = 5.0f;
+
         // ── PWM / current sense ────────────────────────────────────────────
         uint32_t pwm_clock_hz               = 20000000;
         uint32_t pwm_frequency_hz           = 20000;
@@ -45,8 +83,11 @@ public:
 
         // ── Current loop / limits ──────────────────────────────────────────
         float    current_bw_rad    = 1000.0f; // current-loop bandwidth [rad/s]
-        // EPC23102 GaN HB: 100 V / 65 A pulsed, ~35 A continuous (cooling-bound).
-        // Iq cap is approx peak phase current; keep below continuous with margin.
+        // Power stage (v2 PCB): EPC2305 eGaN FETs — 150 V, 80 A pulsed, 3.2 mΩ,
+        // MP1918 gate driver, 1 mΩ shunt + INA181A1. eGaN has NO avalanche rating
+        // and a fragile gate (V_GS abs-max ~+6/-4 V): it fails from fast transients
+        // (gate ring / dv/dt shoot-through), not slow heat — keep current + di/dt
+        // conservative. Iq cap is approx peak phase current; margin below pulsed.
         float    current_max       = 30.0f;   // iq command limit [A]
         float    overcurrent_trip  = 50.0f;   // per-phase hard trip [A] (debounced)
         // Instant trip [A]: no debounce and active even inside the post-arm
@@ -196,6 +237,31 @@ public:
     void play_tone(float freq_hz, float amplitude, uint16_t duration_ms);
     bool is_beeping() const { return _mode == Mode::BEEP; }
 
+    // ── Hall sensors ────────────────────────────────────────────────────────
+    // Start a hall-table detection spin: forces a slow open-loop electrical
+    // rotation and records the forced angle seen in each hall state, then stores
+    // the result into the live hall table and coasts. Call only at standstill.
+    void start_hall_detect();
+    // True once a detection spin has completed; fills out[8] with the detected
+    // sector-centre angles [deg] (NaN for unseen/invalid states).
+    bool hall_detect_result(float out_deg[8]) const;
+    // Like hall_detect_result() but consumes the "fresh" flag: returns true only
+    // once per completed detection (for a one-shot save to storage).
+    bool take_hall_detect_result(float out_deg[8]);
+    // Latest decoded hall state (1..6; 0 = invalid/not yet read).
+    uint8_t get_hall_state() const { return _t_hall_state; }
+    // True once the hall table maps all six real states (i.e. a valid detected
+    // table is loaded). HALL mode refuses to drive while this is false.
+    bool hall_table_valid() const { return _hall_table_valid; }
+    // Copy the live hall table out as electrical degrees [0..360), NaN = unmapped.
+    void get_hall_table_deg(float out_deg[8]) const {
+        for (uint8_t k = 0; k < 8; k++) {
+            float d = _hall_table[k] * 57.2957795f;   // rad → deg
+            if (!isnan(d) && d < 0.0f) d += 360.0f;
+            out_deg[k] = d;
+        }
+    }
+
     // ── Telemetry getters (lock-free snapshots) ────────────────────────────
     void  get_idq(float &id, float &iq) const { id = _t_id; iq = _t_iq; }
     void  get_vdq(float &vd, float &vq) const { vd = _t_vd; vq = _t_vq; }
@@ -220,14 +286,39 @@ public:
     uint8_t get_state()       const { return uint8_t(_state); }
     float   current_limit()   const { return _current_max; }   // iq command ceiling [A]
 
+    // ── Config read-back (for the VESC-Tool COMM_GET_MCCONF responder) ──────
+    SensorMode get_sensor_mode() const { return _sensor_mode; }
+    void  get_hall_blend_erpm(float &lo, float &hi) const { lo = _hall_blend_lo; hi = _hall_blend_hi; }
+    float get_current_kp() const { return _cur_kp; }
+    // Per-phase motor params (unscaled — the observer holds L,R pre-scaled ×1.5).
+    void  get_motor_lrflux(float &L, float &R, float &flux) const {
+        L    = (_obs_L > 0.0f) ? _obs_L * (1.0f / 1.5f) : 0.0f;
+        R    = _obs_R * (1.0f / 1.5f);
+        flux = _obs_lambda;
+    }
+
     volatile uint32_t _adc_sample_cb_count{0};
 
 private:
-    enum class Mode : uint8_t { STOP, CURRENT, SPEED, BRAKE, DEBUG_VOLTAGE, BEEP };
+    enum class Mode : uint8_t { STOP, CURRENT, SPEED, BRAKE, DEBUG_VOLTAGE, BEEP, HALL_DETECT };
 
     static void adc_sample_callback(void *ctx, uint16_t sample_u, uint16_t sample_v, uint16_t sample_w);
     void        adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t sample_w);
     void        observer_update(float v_alpha, float v_beta, float i_alpha, float i_beta);
+    // Sensorless (observer + I/f) angle/torque state machine. Sets theta/id_set/
+    // iq_set for the shared current loop; returns false if it aborted the cycle
+    // (bridge already gated off — the caller must return without writing PWM).
+    bool        run_sensorless(Mode mode, float dir, float iq_cmd,
+                               float i_alpha, float i_beta, float i_max, bool coasting,
+                               float &theta, float &id_set, float &iq_set);
+    // Recompute _hall_table_valid (true iff all six real hall states are mapped).
+    void        update_hall_table_valid();
+    // Read the three hall GPIOs → raw 3-bit state (0..7).
+    uint8_t     read_hall_state() const;
+    // Decode/debounce halls, update _hall_theta (interpolated commutation angle)
+    // and _hall_omega (speed from transition timing). Returns false on an invalid
+    // (0/7) or unmapped state.
+    bool        update_hall();
     // Largest |phase current| across U/V/W [A] (lock-free telemetry snapshot).
     float       peak_phase_current() const;
     // False if `target` would hot-swap between active drive modes (CURRENT/
@@ -343,6 +434,36 @@ private:
     volatile float _i_derate     = 1.0f;   // thermal iq-limit scale [0..1]
     volatile bool  _thermal_trip = false;  // latched-by-temp over-temp trip
 
+    // ── Hall sensors ──────────────────────────────────────────────────────
+    SensorMode _sensor_mode = SensorMode::HALL;
+    float _hall_table[8]   = {0};   // sector-centre electrical angle [rad]; NaN if invalid
+    volatile bool _hall_table_valid = false; // all six real states mapped → HALL may drive
+    float _hall_blend_lo   = 3000.0f; // pure-hall below this [eRPM]
+    float _hall_blend_hi   = 6000.0f; // pure-observer above this [eRPM]
+    float _hall_breakaway_a = 4.0f;   // iq cap until motion confirmed [A]
+    uint8_t _hall_move_count = 0;     // committed transitions since drive re-arm (saturating)
+    // Runtime decode state (ISR-only except _t_hall_state snapshot).
+    uint8_t  _hall_state    = 0xFF; // committed state (0..7); 0xFF = none yet (0 is a valid state)
+    uint8_t  _hall_raw_prev = 0;    // last raw read (debounce)
+    uint8_t  _hall_deb      = 0;    // consecutive identical raw reads
+    float    _hall_dir      = 1.0f; // rotation sign from the last transition
+    float    _hall_base     = 0.0f; // interpolation origin (sector entry edge) [rad]
+    float    _hall_theta    = 0.0f; // interpolated commutation angle [rad]
+    float    _hall_omega    = 0.0f; // electrical speed from hall timing [rad/s]
+    uint32_t _hall_ticks    = 0;    // ISR ticks since the last committed transition
+    uint16_t _hall_fault    = 0;    // consecutive invalid-read samples
+    // Hall-table detection accumulators (circular mean of the forced angle seen
+    // in each state). _hd_* are only touched during a HALL_DETECT spin.
+    float    _hd_sin[8]     = {0};
+    float    _hd_cos[8]     = {0};
+    uint32_t _hd_n[8]       = {0};
+    float    _hd_angle      = 0.0f; // forced electrical angle [rad]
+    uint32_t _hd_ticks      = 0;    // spin duration counter
+    float    _hd_current    = 5.0f; // detection d-axis current target [A]
+    bool     _hall_detect_done = false;
+    volatile bool _hall_detect_fresh = false; // set on completion, cleared by take_hall_detect_result()
+    float    _hall_detect_deg[8] = {0}; // last detection result [deg]
+
     // ── Stall protection (ISR-only) ────────────────────────────────────────
     float _stall_w         = 0.0f;   // |ω| threshold [rad/s]
     float _stall_i         = 2.0f;   // |iq| threshold [A]
@@ -388,6 +509,7 @@ private:
     volatile float   _t_theta = 0.0f;
     volatile float   _t_obs_theta = 0.0f;
     volatile float   _t_fet_temp = 0.0f;   // board NTC [°C] (thread-written)
+    volatile uint8_t _t_hall_state = 0;    // decoded hall state (1..6)
 };
 
 } // namespace ChibiOS

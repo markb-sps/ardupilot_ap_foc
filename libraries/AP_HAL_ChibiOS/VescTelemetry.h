@@ -63,6 +63,16 @@ private:
     void handle_set_current();
     void handle_set_current_brake();
     void handle_set_duty();
+    void handle_detect_hall();
+    // COMM_GET_MCCONF / _DEFAULT: serialize the full mc_configuration blob (VESC
+    // FW 6.00 layout) so VESC Tool's "Read Motor Configuration" succeeds and its
+    // FOC → Hall Sensors tab shows the stored table. reply_id echoes the request.
+    void handle_get_mcconf(uint8_t reply_id);
+    // VESC-Tool terminal (COMM_TERMINAL_CMD): a tiny command set to read/trigger
+    // the hall table (works even if a VESC Tool version can't read MCCONF).
+    void handle_terminal();
+    void print_hall_table();
+    void send_print(const char *s);   // emit one COMM_PRINT line
 
     static uint16_t crc16(const uint8_t *data, uint16_t len);
 
@@ -76,13 +86,16 @@ private:
     uint16_t _rx_crc = 0;
     uint8_t  _payload[80];
 
-    uint8_t  _tx_buf[128];
+    // Sized for the largest reply — the ~482-byte COMM_GET_MCCONF blob plus
+    // long-frame header (3) + CRC (2) + stop (1).
+    uint8_t  _tx_buf[512];
 
     // Throttle-arbiter state (thread context).
     float    _usb_current_a  = 0.0f;  // last COMM_SET_CURRENT value [A]
     uint32_t _usb_current_ms = 0;     // millis() of that command (0 = none ever sent)
     uint32_t _host_alive_ms  = 0;     // millis() of the last valid packet (link keepalive)
     uint32_t _override_ms    = 0;     // millis() of last rpm/brake/duty override (0 = none)
+    bool     _hall_detect_pending = false; // a hall-detect spin is running; emit table when done
 };
 
 } // namespace ChibiOS

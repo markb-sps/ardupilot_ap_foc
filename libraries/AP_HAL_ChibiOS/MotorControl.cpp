@@ -33,6 +33,20 @@ constexpr float PI_F            = 3.14159265359f;
 constexpr float DT_COMP_I_BAND  = 1.0f;     // [A] current band over which dead-time sign() is softened
 constexpr float OL_IQ_RAMP_S    = 0.2f;   // capture soft-start: OL current ramp-in time
 
+// ── Hall sensors ────────────────────────────────────────────────────────────
+constexpr uint8_t  HALL_NONE          = 0xFF; // "no committed state yet" sentinel (0 is a valid state)
+constexpr uint8_t  HALL_DEBOUNCE      = 2;    // identical raw reads before a state commit
+constexpr uint16_t HALL_FAULT_SAMPLES = 200;  // consecutive invalid reads → FAULT (~10 ms @20 kHz)
+constexpr float    HALL_STOP_S        = 0.05f;// no transition for this long → treat speed as 0
+constexpr float    HALL_SECTOR        = 1.04719755f;   // 60° electrical [rad]
+constexpr float    HALL_HALF_SECTOR   = 0.52359878f;   // 30° electrical [rad]
+constexpr uint8_t  HALL_BREAKAWAY_N   = 2;    // hall transitions confirming motion → release full current
+// Hall-table detection spin: slow current-controlled forced rotation, forward
+// then reverse (averaging both directions cancels the hall hysteresis bias).
+constexpr float    HD_HZ              = 3.0f;  // forced electrical rotation [Hz]
+constexpr float    HD_RAMP_S          = 0.2f;  // detect-current ramp-in / initial align [s]
+constexpr float    HD_REVS            = 3.0f;  // electrical revolutions per direction to average over
+
 inline float wrap_pi(float a)
 {
     while (a >  PI_F) a -= TWO_PI;
@@ -176,6 +190,19 @@ bool MotorControl::init(const Config &cfg)
     _debug_phase_step = TWO_PI * cfg.debug_openloop_hz * _dt;
     _debug_max_mod    = cfg.debug_max_modulation;
 
+    // ── Hall sensor config ─────────────────────────────────────────────────
+    _sensor_mode   = cfg.sensor_mode;
+    _hall_blend_lo = cfg.hall_blend_erpm_lo;
+    _hall_blend_hi = (cfg.hall_blend_erpm_hi > cfg.hall_blend_erpm_lo + 1.0f)
+                         ? cfg.hall_blend_erpm_hi : cfg.hall_blend_erpm_lo + 1.0f;
+    for (uint8_t s = 0; s < 8; s++) {
+        _hall_table[s] = isnan(cfg.hall_table_deg[s])
+                             ? NAN : wrap_pi(cfg.hall_table_deg[s] * (PI_F / 180.0f));
+    }
+    _hall_breakaway_a = cfg.hall_breakaway_a;
+    _hd_current       = (cfg.hall_detect_a < cfg.current_max) ? cfg.hall_detect_a : cfg.current_max;
+    update_hall_table_valid();
+
     reset_control();
     _mode       = Mode::STOP;
     _fault_code = FAULT_NONE;
@@ -202,6 +229,16 @@ void MotorControl::reset_control()
     _obs_x1 = _obs_x2 = _obs_theta = _obs_omega = 0.0f;
     _pll_theta = 0.0f;
     _stall_timer = 0.0f;
+    // Hall decode re-fixes from scratch on the next valid read.
+    _hall_state = HALL_NONE;
+    _hall_raw_prev = _hall_deb = 0;
+    _hall_omega = 0.0f;
+    _hall_ticks = 0;
+    _hall_fault = 0;
+    // Motion must be re-confirmed after any stop/hold-off before full current is
+    // released again (break-away clamp re-arms). reset_control() runs from
+    // hold_off(), so every coast/idle/fault re-arms it.
+    _hall_move_count = 0;
 }
 
 void MotorControl::trip_fault(uint8_t code)
@@ -446,6 +483,11 @@ void MotorControl::adc_sample_callback(void *ctx, uint16_t sample_u, uint16_t sa
 // Full FOC cycle, once per PWM period (ADC injected-EOC ISR).
 void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t sample_w)
 {
+    // Live raw hall state for diagnostics — updated every cycle regardless of
+    // drive state, so the state can be watched while turning the rotor by hand
+    // (motor stopped). HALL-run mode overwrites this with the debounced state.
+    _t_hall_state = read_hall_state();
+
     // ── Zero-current calibration (outputs gated, no current flowing) ────────
     if (!_current_zero_valid) {
         // Don't latch a baseline until the sense front-end (INA181 ref) is
@@ -634,6 +676,89 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
         return;
     }
 
+    // ── Hall-table detection (VESC mcpwm_foc_hall_detect style) ─────────────
+    //    Current-controlled forced rotation: hold a d-axis current at a forced
+    //    electrical angle and sweep the angle slowly — forward for the first
+    //    half, reverse for the second. The rotor's PM follows the field like a
+    //    stepper; averaging both directions cancels the hall switching-hysteresis
+    //    bias so each recorded sector centre is the true mid-point. Current is
+    //    regulated (not fixed voltage) so an unloaded low-R motor can't draw a
+    //    large spin current. Fills the live hall table and coasts when finished.
+    if (mode == Mode::HALL_DETECT) {
+        const uint32_t half       = uint32_t(HD_REVS / (HD_HZ * _dt));
+        const uint32_t ramp_ticks = uint32_t(HD_RAMP_S / _dt);
+        // Ramp the detect current in over the first ramp_ticks (with the angle
+        // held) so the rotor first aligns to angle 0 without a torque step.
+        const float ramp      = clampf(float(_hd_ticks) / float(ramp_ticks), 0.0f, 1.0f);
+        const float id_target = _hd_current * ramp;
+        if (_hd_ticks >= ramp_ticks) {
+            const float dir_hd = (_hd_ticks < ramp_ticks + half) ? 1.0f : -1.0f;
+            _hd_angle = wrap_pi(_hd_angle + dir_hd * TWO_PI * HD_HZ * _dt);
+        }
+        const float st = sinf(_hd_angle);
+        const float ct = cosf(_hd_angle);
+
+        // d-axis current PI on the forced angle (iq target 0), same gains and
+        // anti-windup / vector clamp as the main current loop below.
+        float id_m, iq_m;
+        FOC::park(i_alpha, i_beta, st, ct, id_m, iq_m);
+        _integ_d = clampf(_integ_d + (id_target - id_m) * _cur_ki_dt, -_v_max, _v_max);
+        _integ_q = clampf(_integ_q + (0.0f      - iq_m) * _cur_ki_dt, -_v_max, _v_max);
+        float vd = clampf((id_target - id_m) * _cur_kp + _integ_d,
+                          -_v_max * 0.7071068f, _v_max * 0.7071068f);
+        float vq = (0.0f - iq_m) * _cur_kp + _integ_q;
+        const float vqr = sqrtf(_v_max * _v_max - vd * vd);
+        vq = clampf(vq, -vqr, vqr);
+
+        float v_alpha, v_beta;
+        FOC::inv_park(vd, vq, st, ct, v_alpha, v_beta);
+        const float m_alpha = v_alpha * _inv_vbus_half;
+        const float m_beta  = v_beta  * _inv_vbus_half;
+
+        float va, vb, vc, da, db, dc;
+        FOC::inv_clarke(m_alpha, m_beta, va, vb, vc);
+        FOC::svpwm(va, vb, vc, da, db, dc);
+        const float pf = float(_period_ticks);
+        stm32_foc_motor_control_write_pwm(uint16_t(da * pf), uint16_t(db * pf), uint16_t(dc * pf));
+        _v_alpha_prev = v_alpha;   // keep the observer input sane during the spin
+        _v_beta_prev  = v_beta;
+
+        // Record ALL states 0..7 (the valid six are motor-specific — this motor
+        // uses {0,1,2,5,6,7}, others {1..6} — we don't presume which), but only
+        // after the current has ramped in, to skip the initial alignment step.
+        if (ramp >= 1.0f) {
+            const uint8_t s = read_hall_state();
+            _hd_sin[s] += st;
+            _hd_cos[s] += ct;
+            _hd_n[s]++;
+        }
+        _state = State::HALL_DETECT;
+
+        if (++_hd_ticks >= ramp_ticks + 2 * half) {
+            // A real state is dwelt in for a full 60° sector each rev; a glitch
+            // state gets only a handful of samples. Keep states with a meaningful
+            // share of the busiest state's count (threshold = max/4).
+            uint32_t nmax = 0;
+            for (uint8_t k = 0; k < 8; k++) {
+                if (_hd_n[k] > nmax) nmax = _hd_n[k];
+            }
+            const uint32_t nmin = nmax / 4;
+            // Circular mean of the forced angle per state = sector centre.
+            for (uint8_t k = 0; k < 8; k++) {
+                const bool valid = (_hd_n[k] > nmin);
+                const float ang  = valid ? atan2f(_hd_sin[k], _hd_cos[k]) : NAN;
+                _hall_table[k]        = ang;
+                _hall_detect_deg[k]   = valid ? (ang * (180.0f / PI_F)) : NAN;
+            }
+            update_hall_table_valid();   // newly detected table may now be drivable
+            _hall_detect_done  = true;
+            _hall_detect_fresh = true;   // one-shot: consumed by take_hall_detect_result()
+            _mode = Mode::STOP;
+            hold_off(State::IDLE);
+        }
+        return;
+    }
+
     // Slew the CURRENT-mode torque setpoint toward its target (VESC l_current_ramp
     // equivalent) so a step throttle command can't apply an instant iq reference
     // jump. Done before the coast test below, which reads _cmd_current: a
@@ -646,6 +771,32 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
                            : _cmd_current_target;
     }
 
+    // ── Hall sensors (sensored mode): decode + speed every cycle ────────────
+    // The observer still free-runs above (for the high-speed blend), but the
+    // control speed comes from hall transition timing, which is valid from the
+    // first revolution — no sensorless floor.
+    if (_sensor_mode == SensorMode::HALL) {
+        // Fail-safe arming: never commutate on an unvalidated table. Without all
+        // six real states mapped (fresh board, or params never populated), the
+        // angle would be wrong → jerky drive + hard fault-cuts that stress the
+        // GaN stage. Refuse to drive (high-Z idle) until a HALL_DETECT run (or
+        // loaded params) supplies a real table. Reached only for drive modes;
+        // HALL_DETECT itself returns earlier, so detection is unaffected.
+        if (!_hall_table_valid) {
+            hold_off(State::IDLE);
+            return;
+        }
+        if (update_hall()) {
+            _hall_fault = 0;
+        } else if (++_hall_fault > HALL_FAULT_SAMPLES) {
+            trip_fault(FAULT_HALL_SENSOR);
+            return;
+        }
+    }
+    // Unified control-speed estimate: hall timing when sensored, observer PLL
+    // otherwise. Used by the shared coast/regen/speed-loop logic below.
+    const float omega_ctrl = (_sensor_mode == SensorMode::HALL) ? _hall_omega : _obs_omega;
+
     // ── Coast (CURRENT @ iq=0) / Brake: hold the loop alive, never let OL
     //    re-arm and re-spin the motor, auto-release once safely slow. Without
     //    this, a coasting motor that drops below the OL hysteresis threshold
@@ -656,7 +807,7 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
         _ol_cooldown = 0.0f;                             // command released → drop
         _ol_attempts = 0;                                // any pending retry/cooldown
         constexpr float RELEASE_OMEGA = 10.47f;          // ~100 eRPM (rad/s)
-        if (fabsf(_obs_omega) < RELEASE_OMEGA) {
+        if (fabsf(omega_ctrl) < RELEASE_OMEGA) {
             hold_off(State::IDLE);                       // safe to high-Z now
             return;
         }
@@ -687,8 +838,10 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
     // volts ≈ back-EMF and the observer converges to the true angle/speed:
     // spinning → ω rises above the OL threshold and closed loop catches
     // seamlessly; standstill → the hysteresis fires the OL sequence as before.
-    bool started_now = false;
-    if (_state != State::OPENLOOP && _state != State::CLOSED &&
+    // (Sensorless startup bookkeeping — hall mode commutates from standstill and
+    // skips the whole I/f sequence, so this only arms in SENSORLESS mode.)
+    if (_sensor_mode == SensorMode::SENSORLESS &&
+        _state != State::OPENLOOP && _state != State::CLOSED &&
         _state != State::ALIGN && !coasting) {
         _override_ang = _obs_theta;
         _integ_spd    = 0.0f;
@@ -708,7 +861,7 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
         // On a fresh SPEED entry, seed the ramped setpoint to the current speed
         // (and clear the integrator) so the takeover error ≈ 0 — no step brake.
         if (speed_entry) {
-            _spd_set_erpm = _obs_omega * _w_to_erpm;
+            _spd_set_erpm = omega_ctrl * _w_to_erpm;
             _integ_spd    = 0.0f;
         }
         // VESC-style ramped setpoint (foc_run_pid_control_speed): slew toward the
@@ -721,13 +874,13 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
         if (_ol_timer > 0.0f) {
             set_erpm = clampf(set_erpm, -_open_handover_erpm, _open_handover_erpm);
         }
-        const float erpm_err = set_erpm - _obs_omega * _w_to_erpm;
+        const float erpm_err = set_erpm - omega_ctrl * _w_to_erpm;
         _integ_spd = clampf(_integ_spd + erpm_err * _spd_ki_dt, -i_max, i_max);
         iq_cmd = clampf(erpm_err * _spd_kp + _integ_spd, -i_max, i_max);
         // Regen limit: when iq opposes rotation (decelerating) the braking energy
         // returns to the bus, which a bench PSU can't sink — cap the braking
         // current hard, folded toward zero as vbus approaches vbus_max.
-        if (iq_cmd * _obs_omega < 0.0f) {
+        if (iq_cmd * omega_ctrl < 0.0f) {
             const float rl = _regen_max * ov_scale;
             iq_cmd = clampf(iq_cmd, -rl, rl);
         }
@@ -736,16 +889,202 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
         // sign opposes rotation. Clamp again here as the single enforcement
         // point, folded by the bus-OV scale.
         const float rl = _regen_max * ov_scale;
-        iq_cmd = clampf((_obs_omega >= 0.0f ? -1.0f : 1.0f) * _cmd_current, -rl, rl);
+        iq_cmd = clampf((omega_ctrl >= 0.0f ? -1.0f : 1.0f) * _cmd_current, -rl, rl);
     } else {
         iq_cmd = clampf(_cmd_current, -i_max, i_max);
         // CURRENT mode has no steady regen cap by design, but a decelerating
         // command must still fold back rather than pump the bus past vbus_max.
-        if (iq_cmd * _obs_omega < 0.0f) {
+        if (iq_cmd * omega_ctrl < 0.0f) {
             const float rl = i_max * ov_scale;
             iq_cmd = clampf(iq_cmd, -rl, rl);
         }
     }
+
+    // ── Angle + torque source ───────────────────────────────────────────────
+    // HALL commutates from the hall angle (interpolated), blending to the
+    // observer at speed. SENSORLESS runs the I/f-start state machine, which may
+    // gate the bridge off (failed start) — then it returns false and we abort.
+    float theta;
+    float id_set = 0.0f;
+    float iq_set = iq_cmd;
+
+    if (_sensor_mode == SensorMode::HALL) {
+        // Blend hall → observer angle across [_hall_blend_lo, _hall_blend_hi]
+        // eRPM (VESC foc_sl_erpm): pure hall from standstill, pure observer at
+        // speed, short-way interpolation of the wrapped angle difference between.
+        const float erpm_abs = fabsf(_hall_omega) * _w_to_erpm;
+        const float k = mapf(erpm_abs, _hall_blend_lo, _hall_blend_hi, 0.0f, 1.0f);
+        theta = (k <= 0.0f)
+                    ? _hall_theta
+                    : wrap_pi(_hall_theta + k * wrap_pi(_obs_theta - _hall_theta));
+        iq_set = iq_cmd;   // torque straight through; no open-loop boost needed
+        // Break-away clamp: until the rotor has demonstrably moved (>= a couple
+        // of hall transitions) cap torque current to a low value. A wrong/mis-
+        // calibrated table or a jam then can't dump full current into a stationary
+        // rotor — the current that can be held at a bad angle is bounded, and the
+        // HALL stall trip below cuts it entirely within _stall_t if it never moves.
+        if (_hall_move_count < HALL_BREAKAWAY_N) {
+            iq_set = clampf(iq_set, -_hall_breakaway_a, _hall_breakaway_a);
+        }
+        _state = State::HALL;
+    } else if (!run_sensorless(mode, dir, iq_cmd, i_alpha, i_beta, i_max, coasting,
+                               theta, id_set, iq_set)) {
+        return;   // sensorless start abandoned this cycle — bridge already gated off
+    }
+
+    // ── dq current PI (Kp = L·ωbw, Ki = R·ωbw) with anti-windup ─────────────
+    const float sin_t = sinf(theta);
+    const float cos_t = cosf(theta);
+    float id, iq;
+    FOC::park(i_alpha, i_beta, sin_t, cos_t, id, iq);
+
+    // ── Stall protection ────────────────────────────────────────────────────
+    // SENSORLESS/CLOSED: during the open-loop override the observer is seeded to
+    // the forced angle, so its speed doesn't reflect the rotor (an OL stall shows
+    // up as the hysteresis retrigger loop instead). A locked rotor in closed loop
+    // = no back-EMF, ω→0, torque current held → heat with no cooling.
+    //
+    // HALL: a locked or wrong-angle rotor never transitions the halls, so
+    // _hall_omega collapses to 0 while torque current is still commanded — the
+    // exact case that holds near-DC current in one leg and cooks a low-side FET
+    // (this is what killed a FET on a mis-set 120°-vs-60° table). Unlike VESC,
+    // which has no stall trip and holds torque at standstill by design, the eGaN
+    // stage can't sit at DC current, so we trip. The break-away clamp above bounds
+    // the current during the _stall_t dwell before the trip fires.
+    bool stalled;
+    if (_sensor_mode == SensorMode::HALL) {
+        stalled = (_state == State::HALL) && (fabsf(_hall_omega) < 1.0f) && (fabsf(iq_set) > _stall_i);
+    } else {
+        stalled = (_state == State::CLOSED) && (fabsf(_obs_omega) < _stall_w) && (fabsf(iq) > _stall_i);
+    }
+    if (stalled) {
+        _stall_timer += _dt;
+        if (_stall_timer > _stall_t) {
+            trip_fault(FAULT_STALL);
+            return;   // MOE already cut; don't write another PWM cycle
+        }
+    } else {
+        _stall_timer = 0.0f;
+    }
+
+    const float err_d = id_set - id;
+    const float err_q = iq_set - iq;
+    _integ_d = clampf(_integ_d + err_d * _cur_ki_dt, -_v_max, _v_max);
+    _integ_q = clampf(_integ_q + err_q * _cur_ki_dt, -_v_max, _v_max);
+    float vd = err_d * _cur_kp + _integ_d;
+    float vq = err_q * _cur_kp + _integ_q;
+
+    // Clamp the voltage vector to the SVPWM limit, prioritising vq (torque).
+    const float vd_lim = _v_max * 0.7071068f;
+    vd = clampf(vd, -vd_lim, vd_lim);
+    const float vq_room = sqrtf(_v_max * _v_max - vd * vd);
+    vq = clampf(vq, -vq_room, vq_room);
+
+    // ── αβ voltages → SVPWM duties ──────────────────────────────────────────
+    float v_alpha, v_beta;
+    FOC::inv_park(vd, vq, sin_t, cos_t, v_alpha, v_beta);
+
+    const float m_alpha = v_alpha * _inv_vbus_half;
+    const float m_beta  = v_beta  * _inv_vbus_half;
+
+    float va, vb, vc;
+    FOC::inv_clarke(m_alpha, m_beta, va, vb, vc);
+
+    float da, db, dc;
+    FOC::svpwm(va, vb, vc, da, db, dc);
+
+    // ── Dead-time compensation ──────────────────────────────────────────────
+    // During the bridge's dead-time (both FETs briefly off at each switch-over)
+    // the phase current — not the PWM — sets the output: a phase sourcing
+    // current (i>0) gets pulled low, so it delivers LESS voltage than commanded;
+    // a phase sinking current (i<0) gets pulled high and delivers MORE. The
+    // error is a roughly fixed magnitude (_dt_comp_duty, = V_dt/vbus) whose sign
+    // follows the phase current. We cancel it by nudging each phase's duty in
+    // the SAME direction as its current: add duty where i>0, subtract where i<0.
+    //
+    // sign(i) is softened to a linear ramp across ±DT_COMP_I_BAND amps so the
+    // correction doesn't chatter at the current zero-crossing, where both the
+    // current sign and the dead-time effect itself are ill-defined.
+    //
+    // This makes the *delivered* voltage match the desired v_alpha/v_beta, which
+    // is exactly what the observer assumes — so the observer's angle estimate
+    // stays accurate even at low speed, where the lost ~0.1V was otherwise a
+    // large fraction of the back-EMF and pushed the sensorless floor up.
+    if (_dt_comp_duty > 0.0f) {
+        constexpr float inv_band = 1.0f / DT_COMP_I_BAND;
+        da = clampf(da + clampf(ia * inv_band, -1.0f, 1.0f) * _dt_comp_duty, 0.0f, 1.0f);
+        db = clampf(db + clampf(ib * inv_band, -1.0f, 1.0f) * _dt_comp_duty, 0.0f, 1.0f);
+        dc = clampf(dc + clampf(ic * inv_band, -1.0f, 1.0f) * _dt_comp_duty, 0.0f, 1.0f);
+    }
+
+    const float pf = float(_period_ticks);
+    stm32_foc_motor_control_write_pwm(uint16_t(da * pf), uint16_t(db * pf), uint16_t(dc * pf));
+
+    // Applied voltage for the next observer iteration. With dead-time comp on,
+    // the delivered voltage ≈ this desired value, so no separate correction is
+    // needed on the observer input.
+    _v_alpha_prev = v_alpha;
+    _v_beta_prev  = v_beta;
+
+    // ── Telemetry snapshots ─────────────────────────────────────────────────
+    _t_id    = id;
+    _t_iq    = iq;
+    _t_vd    = vd;
+    _t_vq    = vq;
+    _t_duty  = sqrtf(m_alpha * m_alpha + m_beta * m_beta); // modulation depth (1.0 ≈ full)
+    _t_erpm  = omega_ctrl * _w_to_erpm;
+    _t_theta = theta;
+}
+
+// Ortega flux-linkage observer (vedderb/bldc foc_observer_update).
+//   x_dot = v − R·i + (γ/2)·(x − L·i)·(λ² − |x − L·i|²)
+//   θ     = atan2(x2 − L·iβ, x1 − L·iα)
+// L and R are the per-phase values pre-scaled by 3/2 in init.
+void MotorControl::observer_update(float v_alpha, float v_beta, float i_alpha, float i_beta)
+{
+    // VESC-style speed/duty-scaled observer gain (m_gamma_now duty map): gain is
+    // cut at low modulation (low speed) so the angle converges GENTLY after the
+    // open-loop hard switch, ramping to full as back-EMF grows. This is what
+    // keeps the OL→CLOSED handover from blipping, without any angle blend.
+    const float mod    = sqrtf(v_alpha * v_alpha + v_beta * v_beta) * _inv_vbus_half;
+    const float gscale = clampf(mod * _obs_gain_mod_inv, _obs_gain_slow_frac, 1.0f);
+    const float gamma_half = _obs_gamma_half * gscale;
+
+    const float L_ia = _obs_L * i_alpha;
+    const float L_ib = _obs_L * i_beta;
+    const float e1   = _obs_x1 - L_ia;
+    const float e2   = _obs_x2 - L_ib;
+    float err        = _obs_lambda2 - (e1 * e1 + e2 * e2);
+    if (err > 0.0f) err = 0.0f;   // VESC: forcing err ≤ 0 aids observer convergence
+
+    _obs_x1 += (v_alpha - _obs_R * i_alpha + gamma_half * e1 * err) * _dt;
+    _obs_x2 += (v_beta  - _obs_R * i_beta  + gamma_half * e2 * err) * _dt;
+
+    const float theta = atan2f(_obs_x2 - L_ib, _obs_x1 - L_ia);
+
+    // Speed via a VESC-style PLL (foc_pll_run): a tracking loop locks _pll_theta
+    // onto the observer angle, and its integrator IS the speed estimate. Unlike
+    // differentiating the angle, this stays clean at low speed (small back-EMF),
+    // which is what lets the lock survive far below the old ~900 erpm floor.
+    const float delta = wrap_pi(theta - _pll_theta);
+    _pll_theta  = wrap_pi(_pll_theta + (_obs_omega + _pll_kp * delta) * _dt);
+    _obs_omega += _pll_ki * delta * _dt;
+
+    _obs_theta   = theta;   // commutation still uses the raw observer angle, not the PLL angle
+    _t_obs_theta = theta;
+}
+
+// ── Sensorless angle/torque state machine (I/f startup → observer) ───────────
+// Extracted from the ISR for readability; behaviour is unchanged. Sets theta and
+// iq_set (id_set stays 0). Returns false if it gated the bridge off this cycle
+// (abandoned/failed start) — the caller must then return without writing PWM.
+bool MotorControl::run_sensorless(Mode mode, float dir, float iq_cmd,
+                                  float i_alpha, float i_beta, float i_max, bool coasting,
+                                  float &theta, float &id_set, float &iq_set)
+{
+    id_set = 0.0f;
+    iq_set = iq_cmd;
+    bool started_now = false;
 
     // ── VESC-style sensorless open-loop override (mcpwm_foc control_current) ──
     // While too slow to sense, we force the angle through a timed lock→ramp→const
@@ -775,10 +1114,6 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
         _lock_count = 0;          // fresh convergence watch for this attempt
         started_now = true;
     }
-
-    float theta;
-    float id_set = 0.0f;
-    float iq_set = iq_cmd;
 
     if (_ol_timer > 0.0f) {
         // Forced rotation: 0 during lock, ramped 0→max during ramp, then full.
@@ -893,11 +1228,11 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
                 _ol_locked_out = true;         // stop retrying until throttle released
                 _fault_code    = FAULT_STALL;
                 hold_off(State::FAULT);        // (counters/lockout survive reset_control)
-                return;
+                return false;
             }
             _ol_cooldown = _ol_cooldown_t; // high-Z coast, then a fresh attempt
             hold_off(State::IDLE);         // (survives reset_control: see header)
-            return;
+            return false;
         }
         if (handover) {
             _ol_attempts = 0;              // converged → restore the retry budget
@@ -927,134 +1262,164 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
             _ol_release -= _dt;
         }
     }
-
-    // ── dq current PI (Kp = L·ωbw, Ki = R·ωbw) with anti-windup ─────────────
-    const float sin_t = sinf(theta);
-    const float cos_t = cosf(theta);
-    float id, iq;
-    FOC::park(i_alpha, i_beta, sin_t, cos_t, id, iq);
-
-    // ── Stall protection ────────────────────────────────────────────────────
-    // CLOSED only: during the open-loop override the observer is seeded to the
-    // forced angle, so its speed doesn't reflect the rotor (an OL stall shows
-    // up as the hysteresis retrigger loop instead). A locked rotor in closed
-    // loop = no back-EMF, ω→0, torque current held → heat with no cooling.
-    if (_state == State::CLOSED &&
-        fabsf(_obs_omega) < _stall_w && fabsf(iq) > _stall_i) {
-        _stall_timer += _dt;
-        if (_stall_timer > _stall_t) {
-            trip_fault(FAULT_STALL);
-            return;   // MOE already cut; don't write another PWM cycle
-        }
-    } else {
-        _stall_timer = 0.0f;
-    }
-
-    const float err_d = id_set - id;
-    const float err_q = iq_set - iq;
-    _integ_d = clampf(_integ_d + err_d * _cur_ki_dt, -_v_max, _v_max);
-    _integ_q = clampf(_integ_q + err_q * _cur_ki_dt, -_v_max, _v_max);
-    float vd = err_d * _cur_kp + _integ_d;
-    float vq = err_q * _cur_kp + _integ_q;
-
-    // Clamp the voltage vector to the SVPWM limit, prioritising vq (torque).
-    const float vd_lim = _v_max * 0.7071068f;
-    vd = clampf(vd, -vd_lim, vd_lim);
-    const float vq_room = sqrtf(_v_max * _v_max - vd * vd);
-    vq = clampf(vq, -vq_room, vq_room);
-
-    // ── αβ voltages → SVPWM duties ──────────────────────────────────────────
-    float v_alpha, v_beta;
-    FOC::inv_park(vd, vq, sin_t, cos_t, v_alpha, v_beta);
-
-    const float m_alpha = v_alpha * _inv_vbus_half;
-    const float m_beta  = v_beta  * _inv_vbus_half;
-
-    float va, vb, vc;
-    FOC::inv_clarke(m_alpha, m_beta, va, vb, vc);
-
-    float da, db, dc;
-    FOC::svpwm(va, vb, vc, da, db, dc);
-
-    // ── Dead-time compensation ──────────────────────────────────────────────
-    // During the bridge's dead-time (both FETs briefly off at each switch-over)
-    // the phase current — not the PWM — sets the output: a phase sourcing
-    // current (i>0) gets pulled low, so it delivers LESS voltage than commanded;
-    // a phase sinking current (i<0) gets pulled high and delivers MORE. The
-    // error is a roughly fixed magnitude (_dt_comp_duty, = V_dt/vbus) whose sign
-    // follows the phase current. We cancel it by nudging each phase's duty in
-    // the SAME direction as its current: add duty where i>0, subtract where i<0.
-    //
-    // sign(i) is softened to a linear ramp across ±DT_COMP_I_BAND amps so the
-    // correction doesn't chatter at the current zero-crossing, where both the
-    // current sign and the dead-time effect itself are ill-defined.
-    //
-    // This makes the *delivered* voltage match the desired v_alpha/v_beta, which
-    // is exactly what the observer assumes — so the observer's angle estimate
-    // stays accurate even at low speed, where the lost ~0.1V was otherwise a
-    // large fraction of the back-EMF and pushed the sensorless floor up.
-    if (_dt_comp_duty > 0.0f) {
-        constexpr float inv_band = 1.0f / DT_COMP_I_BAND;
-        da = clampf(da + clampf(ia * inv_band, -1.0f, 1.0f) * _dt_comp_duty, 0.0f, 1.0f);
-        db = clampf(db + clampf(ib * inv_band, -1.0f, 1.0f) * _dt_comp_duty, 0.0f, 1.0f);
-        dc = clampf(dc + clampf(ic * inv_band, -1.0f, 1.0f) * _dt_comp_duty, 0.0f, 1.0f);
-    }
-
-    const float pf = float(_period_ticks);
-    stm32_foc_motor_control_write_pwm(uint16_t(da * pf), uint16_t(db * pf), uint16_t(dc * pf));
-
-    // Applied voltage for the next observer iteration. With dead-time comp on,
-    // the delivered voltage ≈ this desired value, so no separate correction is
-    // needed on the observer input.
-    _v_alpha_prev = v_alpha;
-    _v_beta_prev  = v_beta;
-
-    // ── Telemetry snapshots ─────────────────────────────────────────────────
-    _t_id    = id;
-    _t_iq    = iq;
-    _t_vd    = vd;
-    _t_vq    = vq;
-    _t_duty  = sqrtf(m_alpha * m_alpha + m_beta * m_beta); // modulation depth (1.0 ≈ full)
-    _t_erpm  = _obs_omega * _w_to_erpm;
-    _t_theta = theta;
+    return true;
 }
 
-// Ortega flux-linkage observer (vedderb/bldc foc_observer_update).
-//   x_dot = v − R·i + (γ/2)·(x − L·i)·(λ² − |x − L·i|²)
-//   θ     = atan2(x2 − L·iβ, x1 − L·iα)
-// L and R are the per-phase values pre-scaled by 3/2 in init.
-void MotorControl::observer_update(float v_alpha, float v_beta, float i_alpha, float i_beta)
+// ── Hall sensors ────────────────────────────────────────────────────────────
+// Raw 3-bit hall state from the J304 GPIOs: A=PB11, B=PB7, C=PB10 (all GPIOB).
+uint8_t MotorControl::read_hall_state() const
 {
-    // VESC-style speed/duty-scaled observer gain (m_gamma_now duty map): gain is
-    // cut at low modulation (low speed) so the angle converges GENTLY after the
-    // open-loop hard switch, ramping to full as back-EMF grows. This is what
-    // keeps the OL→CLOSED handover from blipping, without any angle blend.
-    const float mod    = sqrtf(v_alpha * v_alpha + v_beta * v_beta) * _inv_vbus_half;
-    const float gscale = clampf(mod * _obs_gain_mod_inv, _obs_gain_slow_frac, 1.0f);
-    const float gamma_half = _obs_gamma_half * gscale;
+    const uint32_t idr = palReadPort(GPIOB);
+    uint8_t s = 0;
+    if (idr & (1u << 11)) s |= 0x1;   // Hall A
+    if (idr & (1u << 7))  s |= 0x2;   // Hall B
+    if (idr & (1u << 10)) s |= 0x4;   // Hall C
+    return s;
+}
 
-    const float L_ia = _obs_L * i_alpha;
-    const float L_ib = _obs_L * i_beta;
-    const float e1   = _obs_x1 - L_ia;
-    const float e2   = _obs_x2 - L_ib;
-    float err        = _obs_lambda2 - (e1 * e1 + e2 * e2);
-    if (err > 0.0f) err = 0.0f;   // VESC: forcing err ≤ 0 aids observer convergence
+// A 3-hall motor has exactly six valid states (the two it never enters stay
+// NaN), and the six sector centres must be spaced ~60° apart around the circle.
+// Require BOTH before HALL mode may drive — matching VESC's "exactly 2 invalid"
+// rule and additionally rejecting a malformed table (garbage params, detection
+// under load, two states at the same angle) whose bad angles would drive at the
+// wrong commutation position — the exact class of fault that killed a low-side
+// FET. A partial (<6) or geometrically inconsistent table is refused.
+void MotorControl::update_hall_table_valid()
+{
+    float a[6];
+    uint8_t n = 0;
+    for (uint8_t k = 0; k < 8; k++) {
+        if (!isnan(_hall_table[k])) {
+            if (n < 6) a[n] = _hall_table[k];
+            n++;
+        }
+    }
+    if (n != 6) { _hall_table_valid = false; return; }
 
-    _obs_x1 += (v_alpha - _obs_R * i_alpha + gamma_half * e1 * err) * _dt;
-    _obs_x2 += (v_beta  - _obs_R * i_beta  + gamma_half * e2 * err) * _dt;
+    // Sort the six wrapped angles ascending (insertion sort — tiny, ISR-safe).
+    for (uint8_t i = 1; i < 6; i++) {
+        const float v = a[i];
+        int8_t j = int8_t(i) - 1;
+        while (j >= 0 && a[j] > v) { a[j + 1] = a[j]; j--; }
+        a[j + 1] = v;
+    }
+    // Each adjacent gap (and the wrap-around gap) must be one sector ±30°. Six
+    // ~60° gaps sum to 360°, so a transposed/garbage entry breaks the spacing.
+    bool ok = true;
+    for (uint8_t i = 0; i < 6 && ok; i++) {
+        const float gap = (i < 5) ? (a[i + 1] - a[i]) : (a[0] + TWO_PI - a[5]);
+        if (gap < HALL_HALF_SECTOR || gap > HALL_SECTOR + HALL_HALF_SECTOR) {
+            ok = false;
+        }
+    }
+    _hall_table_valid = ok;
+}
 
-    const float theta = atan2f(_obs_x2 - L_ib, _obs_x1 - L_ia);
+// Decode + debounce the halls, and produce an interpolated commutation angle
+// (_hall_theta) plus a speed estimate from transition timing (_hall_omega).
+// Validity is table-driven: any of the 8 states can be legal (some motors use
+// 0/7 and skip 3/4). Returns false only on a state the table doesn't map (NaN)
+// — i.e. one that never appeared during detection, or a genuine glitch.
+bool MotorControl::update_hall()
+{
+    const uint8_t raw = read_hall_state();   // 0..7, all potentially valid
 
-    // Speed via a VESC-style PLL (foc_pll_run): a tracking loop locks _pll_theta
-    // onto the observer angle, and its integrator IS the speed estimate. Unlike
-    // differentiating the angle, this stays clean at low speed (small back-EMF),
-    // which is what lets the lock survive far below the old ~900 erpm floor.
-    const float delta = wrap_pi(theta - _pll_theta);
-    _pll_theta  = wrap_pi(_pll_theta + (_obs_omega + _pll_kp * delta) * _dt);
-    _obs_omega += _pll_ki * delta * _dt;
+    // Debounce: commit a new state only after HALL_DEBOUNCE identical raw reads.
+    if (raw == _hall_raw_prev) {
+        if (_hall_deb < HALL_DEBOUNCE) _hall_deb++;
+    } else {
+        _hall_raw_prev = raw;
+        _hall_deb = 0;
+    }
 
-    _obs_theta   = theta;   // commutation still uses the raw observer angle, not the PLL angle
-    _t_obs_theta = theta;
+    _hall_ticks++;
+
+    if (_hall_deb >= HALL_DEBOUNCE && raw != _hall_state) {
+        const float ang = _hall_table[raw];
+        if (isnan(ang)) {
+            return false;   // table has no angle for this state → not calibrated
+        }
+        if (_hall_state == HALL_NONE) {
+            // First fix: no previous edge, so no speed yet — sit at the centre.
+            _hall_base  = ang;
+            _hall_dir   = 1.0f;
+            _hall_omega = 0.0f;
+        } else {
+            // Direction + speed from the 60° step between sector centres.
+            const float d   = wrap_pi(ang - _hall_table[_hall_state]);
+            _hall_dir       = (d >= 0.0f) ? 1.0f : -1.0f;
+            const float dts = float(_hall_ticks) * _dt;
+            _hall_omega     = (dts > 1e-6f) ? (_hall_dir * HALL_SECTOR / dts) : 0.0f;
+            // The rotor just crossed into this sector, so it is one half-sector
+            // before the centre (in the direction of travel).
+            _hall_base      = wrap_pi(ang - _hall_dir * HALL_HALF_SECTOR);
+            // A genuine sector transition = confirmed rotor motion; count it so
+            // the break-away current clamp releases once the rotor is turning.
+            if (_hall_move_count < 255) _hall_move_count++;
+        }
+        _hall_state = raw;
+        _hall_ticks = 0;
+    }
+
+    // Interpolate within the sector, capped at ±60° so a missed edge can't let
+    // the angle run away past the next sector.
+    float adv = _hall_omega * (float(_hall_ticks) * _dt);
+    adv = clampf(adv, -HALL_SECTOR, HALL_SECTOR);
+    _hall_theta = wrap_pi(_hall_base + adv);
+
+    // No transition for a while → the rotor has stopped; drop the speed estimate.
+    if (float(_hall_ticks) * _dt > HALL_STOP_S) {
+        _hall_omega = 0.0f;
+    }
+
+    _t_hall_state = _hall_state;
+    return true;
+}
+
+// Kick off a hall-table detection spin (thread context; call at standstill).
+// Self-terminating after HD_REVS; the caller should not run the comms failsafe
+// while it is in progress (it would coast the spin early).
+void MotorControl::start_hall_detect()
+{
+    if (!_initialized) {
+        return;
+    }
+    for (uint8_t k = 0; k < 8; k++) {
+        _hd_sin[k] = _hd_cos[k] = 0.0f;
+        _hd_n[k] = 0;
+    }
+    _hd_angle = 0.0f;
+    _hd_ticks = 0;
+    _hall_detect_done = false;
+    _integ_d = _integ_q = 0.0f;   // detection runs the current PI — start clean
+    _last_cmd_ms = AP_HAL::millis();
+    _fault_code  = FAULT_NONE;
+    _mode        = Mode::HALL_DETECT;
+    _oc_over_count = 0; _oc_blank = OC_BLANK_SAMPLES;
+    stm32_foc_motor_control_enable_outputs();
+}
+
+bool MotorControl::hall_detect_result(float out_deg[8]) const
+{
+    if (!_hall_detect_done) {
+        return false;
+    }
+    for (uint8_t k = 0; k < 8; k++) {
+        out_deg[k] = _hall_detect_deg[k];
+    }
+    return true;
+}
+
+bool MotorControl::take_hall_detect_result(float out_deg[8])
+{
+    if (!_hall_detect_fresh) {
+        return false;
+    }
+    for (uint8_t k = 0; k < 8; k++) {
+        out_deg[k] = _hall_detect_deg[k];
+    }
+    _hall_detect_fresh = false;
+    return true;
 }
 
 } // namespace ChibiOS

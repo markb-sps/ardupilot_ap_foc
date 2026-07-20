@@ -38,6 +38,46 @@ constexpr float     CHIME_AMPLITUDE = 0.08f;  // modulation fraction (capped in 
 constexpr uint16_t  CHIME_GAP_MS    = 40;     // silence between notes
 }
 
+const AP_Param::GroupInfo FOC_ESC::var_info[] = {
+    // @Param: SENSOR
+    // @DisplayName: FOC rotor-angle sensor mode
+    // @Description: Rotor angle source for the FOC ESC.
+    // @Values: 0:Sensorless,1:Hall
+    // @User: Standard
+    AP_GROUPINFO("SENSOR", 1, FOC_ESC, _p_sensor_mode, 1),
+
+    // @Param: HALL0
+    // @DisplayName: Hall table angle for state 0
+    // @Description: Electrical angle for hall state 0, or -1 if this state is unused. Set by hall detection.
+    // @Units: deg
+    // @Range: -1 359
+    // @User: Advanced
+    AP_GROUPINFO("HALL0", 2, FOC_ESC, _p_hall[0], -1),
+    // @Param: HALL1
+    // @Description: Hall table angle for state 1 (deg, -1 = unused).
+    AP_GROUPINFO("HALL1", 3, FOC_ESC, _p_hall[1], -1),
+    // @Param: HALL2
+    // @Description: Hall table angle for state 2 (deg, -1 = unused).
+    AP_GROUPINFO("HALL2", 4, FOC_ESC, _p_hall[2], -1),
+    // @Param: HALL3
+    // @Description: Hall table angle for state 3 (deg, -1 = unused).
+    AP_GROUPINFO("HALL3", 5, FOC_ESC, _p_hall[3], -1),
+    // @Param: HALL4
+    // @Description: Hall table angle for state 4 (deg, -1 = unused).
+    AP_GROUPINFO("HALL4", 6, FOC_ESC, _p_hall[4], -1),
+    // @Param: HALL5
+    // @Description: Hall table angle for state 5 (deg, -1 = unused).
+    AP_GROUPINFO("HALL5", 7, FOC_ESC, _p_hall[5], -1),
+    // @Param: HALL6
+    // @Description: Hall table angle for state 6 (deg, -1 = unused).
+    AP_GROUPINFO("HALL6", 8, FOC_ESC, _p_hall[6], -1),
+    // @Param: HALL7
+    // @Description: Hall table angle for state 7 (deg, -1 = unused).
+    AP_GROUPINFO("HALL7", 9, FOC_ESC, _p_hall[7], -1),
+
+    AP_GROUPEND
+};
+
 void FOC_ESC::init(AP_HAL::UARTDriver *vesc_uart)
 {
     ChibiOS::MotorControl::Config motor_cfg;
@@ -57,7 +97,7 @@ void FOC_ESC::init(AP_HAL::UARTDriver *vesc_uart)
     motor_cfg.overcurrent_trip = 30.0f;
     // Instant trip (no debounce, not blanked on arm) — catches arming into
     // a short within one sample. Keep well above overcurrent_trip, below
-    // the EPC23102 65 A pulse rating.
+    // the EPC2305 80 A pulse rating.
     motor_cfg.overcurrent_trip_hard = 45.0f;
     // Bus-OV regen foldback: braking current scales to zero as vbus rises
     // from (vbus_max - band) to vbus_max.
@@ -104,6 +144,24 @@ void FOC_ESC::init(AP_HAL::UARTDriver *vesc_uart)
     // Torque-command slew: full-scale (current_max) reached in ~100 ms so a
     // PWM RC throttle step can't apply an instant iq jump. See MotorControl.
     motor_cfg.current_slew_a_s = 150.0f;   // [A/s]
+
+    // ── Apply persisted config (AP_Periph storage) over the defaults ────────
+    motor_cfg.sensor_mode = (_p_sensor_mode.get() == 0)
+                                ? ChibiOS::MotorControl::SensorMode::SENSORLESS
+                                : ChibiOS::MotorControl::SensorMode::HALL;
+    // Use the stored hall table only once it has been populated by a detection
+    // run (any entry >= 0); a virgin board keeps the compile-time default guess.
+    bool have_hall_table = false;
+    for (uint8_t k = 0; k < 8; k++) {
+        if (_p_hall[k].get() >= 0) { have_hall_table = true; break; }
+    }
+    if (have_hall_table) {
+        for (uint8_t k = 0; k < 8; k++) {
+            const int16_t v = _p_hall[k].get();
+            motor_cfg.hall_table_deg[k] = (v < 0) ? nanf("") : float(v);
+        }
+    }
+
     motor_control.init(motor_cfg);
 
     vesc_telem.init(vesc_uart);
@@ -226,6 +284,21 @@ void FOC_ESC::update(uint32_t now_ms)
     }
 
     vesc_telem.update();
+
+    // Persist a freshly detected hall table so it survives reboot (triggered via
+    // VESC COMM_DETECT_HALL_FOC / hall_detect.py). One-shot per detection.
+    float hd[8];
+    if (motor_control.take_hall_detect_result(hd)) {
+        for (uint8_t k = 0; k < 8; k++) {
+            int16_t v = -1;   // unused state
+            if (!isnan(hd[k])) {
+                int a = int(lroundf(hd[k])) % 360;
+                if (a < 0) a += 360;
+                v = int16_t(a);
+            }
+            _p_hall[k].set_and_save(v);
+        }
+    }
 }
 
 #endif  // HAL_PERIPH_ENABLE_FOC_ESC

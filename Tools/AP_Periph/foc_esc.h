@@ -5,6 +5,7 @@
 #ifdef HAL_PERIPH_ENABLE_FOC_ESC
 
 #include <stdint.h>
+#include <AP_Param/AP_Param.h>
 #include <AP_HAL_ChibiOS/MotorControl.h>
 #include <AP_HAL_ChibiOS/VescTelemetry.h>
 
@@ -24,9 +25,13 @@ namespace AP_HAL {
 // takes exclusive control while active. See update() for the arbiter.
 class FOC_ESC {
 public:
+    FOC_ESC() { AP_Param::setup_object_defaults(this, var_info); }
+
     // Build the board motor config, start the controller, bind the VESC link to
     // vesc_uart, and claim the PWM-input capture. Call once from AP_Periph::init.
     void init(AP_HAL::UARTDriver *vesc_uart);
+
+    static const struct AP_Param::GroupInfo var_info[];
 
     // Service the arbiter + VESC link. Call every main loop with millis().
     void update(uint32_t now_ms);
@@ -53,6 +58,12 @@ private:
 
     ChibiOS::MotorControl  motor_control;
     ChibiOS::VescTelemetry vesc_telem{motor_control, 7};
+
+    // ── Persisted config (AP_Periph storage) ────────────────────────────────
+    AP_Int8  _p_sensor_mode;   // 0 = sensorless, 1 = hall
+    // Hall table: electrical angle [deg 0..359] per hall state 0..7; -1 = invalid
+    // (unused state). Populated by set_and_save() when a detection spin completes.
+    AP_Int16 _p_hall[8];
 
     // ── Throttle-source arbiter state (each stamps its latest torque + time) ──
     float    _can_amps  = 0.0f;   // last DroneCAN RawCommand torque [A]
