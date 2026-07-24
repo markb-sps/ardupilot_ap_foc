@@ -29,16 +29,18 @@ constexpr uint8_t COMM_PRINT        = 21;   // terminal text response
 // DETECT_ENCODER=27, DETECT_HALL_FOC=28). This is what VESC Tool's hall detect
 // button sends; must match exactly or the command is silently dropped.
 constexpr uint8_t COMM_DETECT_HALL_FOC = 28;
+constexpr uint8_t COMM_SET_MCCONF         = 13;  // VESC Tool "Write Motor Configuration"
 constexpr uint8_t COMM_GET_MCCONF         = 14;  // VESC Tool "Read Motor Configuration"
 constexpr uint8_t COMM_GET_MCCONF_DEFAULT = 15;
 
 constexpr uint8_t FW_MAJOR = 6;
-constexpr uint8_t FW_MINOR = 0;
-// mc_configuration serialization signature for VESC FW 6.00 (confgenerator.h
+constexpr uint8_t FW_MINOR = 6;
+// mc_configuration serialization signature for VESC FW 6.06 (confgenerator.h
 // MCCONF_SIGNATURE). VESC Tool validates this before parsing the blob, so it is
-// version-locked: it must match the FW version reported by COMM_FW_VERSION (6.0)
-// AND the config layout emitted by handle_get_mcconf() below, field-for-field.
-constexpr uint32_t MCCONF_SIGNATURE = 776184161u;
+// version-locked: it must match the FW version reported by COMM_FW_VERSION (6.6)
+// AND the config layout emitted by handle_get_mcconf()/handle_set_mcconf() below,
+// field-for-field (order + type/scale) against release_6_06/confgenerator.c.
+constexpr uint32_t MCCONF_SIGNATURE = 788332866u;
 constexpr const char HW_NAME[] = "AP_FOC";
 
 // STM32G4 unique device ID: 96 bits at 0x1FFF7590
@@ -85,6 +87,36 @@ inline void put_f32_auto(uint8_t *&p, float number) {
     put_u32(p, res);
 }
 
+// ── Unpack helpers (big-endian, advance p) — inverse of the put_* packers ────
+inline uint16_t get_u16(const uint8_t *&p) {
+    uint16_t v = (uint16_t(p[0]) << 8) | p[1];
+    p += 2;
+    return v;
+}
+inline uint32_t get_u32(const uint8_t *&p) {
+    uint32_t v = (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) |
+                 (uint32_t(p[2]) << 8)  | p[3];
+    p += 4;
+    return v;
+}
+inline float get_f16(const uint8_t *&p, float scale) {
+    return float(int16_t(get_u16(p))) / scale;
+}
+// Inverse of put_f32_auto (VESC buffer_get_float32_auto).
+inline float get_f32_auto(const uint8_t *&p) {
+    uint32_t res = get_u32(p);
+    int      e     = (res >> 23) & 0xFF;
+    uint32_t sig_i = res & 0x7FFFFF;
+    bool     neg   = (res & (1u << 31)) != 0;
+    float    sig   = 0.0f;
+    if (e != 0) {
+        sig = float(sig_i) / (8388608.0f * 2.0f) + 0.5f;
+        e  -= 126;
+    }
+    float ret = ldexpf(sig, e);
+    return neg ? -ret : ret;
+}
+
 } // namespace
 
 // CCITT-16, poly 0x1021, init 0x0000 (matches vedderb/bldc comm/crc.c table)
@@ -104,9 +136,11 @@ void VescTelemetry::init(AP_HAL::UARTDriver *uart)
 {
     _uart = uart;
     if (_uart != nullptr) {
-        // VESC Tool over USB CDC ignores baud, but bigger buffers matter:
-        // GET_VALUES response is ~80 bytes and arrives at 50–100 Hz.
-        _uart->begin(115200, 256, 512);
+        // VESC Tool over USB CDC ignores baud, but bigger buffers matter: the
+        // GET_VALUES reply is ~80 B at 50–100 Hz, and a COMM_SET_MCCONF frame is
+        // ~470 B — the RX ring must hold a whole one so no bytes are dropped
+        // before update() drains it.
+        _uart->begin(115200, 1024, 512);
     }
 }
 
@@ -146,8 +180,9 @@ void VescTelemetry::update()
     }
 
     uint32_t avail = _uart->available();
-    // Cap per-call work to avoid starving the periph loop.
-    if (avail > 256) avail = 256;
+    // Cap per-call work to avoid starving the periph loop, but large enough to
+    // drain a whole COMM_SET_MCCONF frame (~477 B) in one service call.
+    if (avail > 512) avail = 512;
     while (avail-- > 0) {
         uint8_t b;
         if (!_uart->read(b)) break;
@@ -168,6 +203,12 @@ void VescTelemetry::feed_byte(uint8_t b)
         // real start, so the stream resyncs within one packet.
         if (b == 0x02) {
             _state = RxState::WAIT_LEN_SHORT;
+        } else if (b == 0x03) {
+            // Long frame (2-byte length). Needed for COMM_SET_MCCONF, whose
+            // ~470-byte payload can't fit a short (0x02) frame. A stray 0x03
+            // (also the end byte) that mis-latches here just fails the length
+            // bound or the final CRC check and resyncs within one frame.
+            _state = RxState::WAIT_LEN_LONG_HI;
         }
         break;
 
@@ -257,6 +298,11 @@ void VescTelemetry::dispatch()
         // VESC Tool reads the motor config (incl. the FOC hall table) via this.
         // Reply id echoes the request so the tool routes it correctly.
         handle_get_mcconf(_payload[0]);
+        break;
+    case COMM_SET_MCCONF:
+        // VESC Tool "Write Motor Configuration": persist the standard fields we
+        // back with params, then the sink reboots to apply.
+        handle_set_mcconf();
         break;
     case COMM_TERMINAL_CMD:
         handle_terminal();
@@ -501,16 +547,16 @@ void VescTelemetry::handle_terminal()
     }
 }
 
-// Serialize a full VESC FW 6.00 mc_configuration so VESC Tool's "Read Motor
-// Configuration" succeeds and populates its FOC → Hall Sensors tab. The field
-// ORDER, TYPES and MCCONF_SIGNATURE must match confgenerator.c for FW 6.00
-// exactly — VESC Tool deserializes sequentially, so any drift corrupts every
-// field after it. Only the hall/identity fields carry our live values; the rest
-// are plausible VESC defaults (they don't affect the hall read-out but must be
-// present so the byte layout matches). Field numbers below index confgenerator.
+// Serialize a full VESC FW 6.06 mc_configuration so VESC Tool's "Read Motor
+// Configuration" succeeds and populates its FOC tabs. The field ORDER, TYPES
+// and MCCONF_SIGNATURE must match release_6_06/confgenerator.c exactly — VESC
+// Tool deserializes sequentially, so any drift corrupts every field after it.
+// Fields we back with params carry live values (from MotorControl + the config
+// snapshot); the rest are plausible VESC defaults (they must be present so the
+// byte layout matches). Comment numbers index confgenerator.c fields.
 void VescTelemetry::handle_get_mcconf(uint8_t reply_id)
 {
-    // ── Live values from the controller ────────────────────────────────────
+    // ── Live / param-derived values ─────────────────────────────────────────
     const float i_max = _mc.current_limit();
     float L, R, flux;
     _mc.get_motor_lrflux(L, R, flux);
@@ -526,80 +572,84 @@ void VescTelemetry::handle_get_mcconf(uint8_t reply_id)
     uint8_t *p = buf;
 
     put_u8      (p, reply_id);                 // packet id (echoes request)
-    put_u32     (p, MCCONF_SIGNATURE);         // 1
+    put_u32     (p, MCCONF_SIGNATURE);
 
-    put_u8      (p, 0);                        // 2  pwm_mode
-    put_u8      (p, 0);                        // 3  comm_mode
-    put_u8      (p, 2);                        // 4  motor_type = FOC
-    put_u8      (p, 0);                        // 5  sensor_mode (BLDC)
-    put_f32_auto(p, i_max);                    // 6  l_current_max
-    put_f32_auto(p, -i_max);                   // 7  l_current_min
-    put_f32_auto(p, 60.0f);                    // 8  l_in_current_max
-    put_f32_auto(p, -60.0f);                   // 9  l_in_current_min
-    put_f32_auto(p, 150.0f);                   // 10 l_abs_current_max
-    put_f32_auto(p, -100000.0f);               // 11 l_min_erpm
-    put_f32_auto(p, 100000.0f);                // 12 l_max_erpm
-    put_f16     (p, 0.8f, 10000.0f);           // 13 l_erpm_start
-    put_f32_auto(p, 300.0f);                   // 14 l_max_erpm_fbrake
-    put_f32_auto(p, 1500.0f);                  // 15 l_max_erpm_fbrake_cc
-    put_f32_auto(p, 6.0f);                     // 16 l_min_vin
-    put_f32_auto(p, 57.0f);                    // 17 l_max_vin
-    put_f32_auto(p, 10.0f);                    // 18 l_battery_cut_start
-    put_f32_auto(p, 8.0f);                     // 19 l_battery_cut_end
-    put_u8      (p, 1);                        // 20 l_slow_abs_current
-    put_f16     (p, 85.0f, 10.0f);             // 21 l_temp_fet_start
-    put_f16     (p, 105.0f, 10.0f);            // 22 l_temp_fet_end
-    put_f16     (p, 85.0f, 10.0f);             // 23 l_temp_motor_start
-    put_f16     (p, 105.0f, 10.0f);            // 24 l_temp_motor_end
-    put_f16     (p, 0.15f, 10000.0f);          // 25 l_temp_accel_dec
-    put_f16     (p, 0.005f, 10000.0f);         // 26 l_min_duty
-    put_f16     (p, 0.95f, 10000.0f);          // 27 l_max_duty
-    put_f32_auto(p, 500000.0f);                // 28 l_watt_max
-    put_f32_auto(p, -500000.0f);               // 29 l_watt_min
-    put_f16     (p, 1.0f, 10000.0f);           // 30 l_current_max_scale
-    put_f16     (p, 1.0f, 10000.0f);           // 31 l_current_min_scale
-    put_f16     (p, 1.0f, 10000.0f);           // 32 l_duty_start
-    put_f32_auto(p, 150.0f);                   // 33 sl_min_erpm
-    put_f32_auto(p, 1100.0f);                  // 34 sl_min_erpm_cycle_int_limit
-    put_f32_auto(p, 10.0f);                    // 35 sl_max_fullbreak_current_dir_change
-    put_f16     (p, 62.0f, 10.0f);             // 36 sl_cycle_int_limit
-    put_f16     (p, 0.8f, 10000.0f);           // 37 sl_phase_advance_at_br
-    put_f32_auto(p, 80000.0f);                 // 38 sl_cycle_int_rpm_br
-    put_f32_auto(p, 600.0f);                    // 39 sl_bemf_coupling_k
-    for (uint8_t k = 0; k < 8; k++) put_u8(p, 255); // 40-47 hall_table[0-7] (BLDC, unused)
-    put_f32_auto(p, 2000.0f);                  // 48 hall_sl_erpm
-    put_f32_auto(p, kp);                        // 49 foc_current_kp
-    put_f32_auto(p, ki);                        // 50 foc_current_ki
-    put_f32_auto(p, 20000.0f);                 // 51 foc_f_zv (switching freq)
-    put_f32_auto(p, 0.36f);                    // 52 foc_dt_us
-    put_u8      (p, 0);                        // 53 foc_encoder_inverted
-    put_f32_auto(p, 0.0f);                     // 54 foc_encoder_offset
-    put_f32_auto(p, 7.0f);                     // 55 foc_encoder_ratio
-    put_u8      (p, is_hall ? 2 : 0);          // 56 foc_sensor_mode (2 = HALL) ← key
-    put_f32_auto(p, 2000.0f);                  // 57 foc_pll_kp
-    put_f32_auto(p, 30000.0f);                 // 58 foc_pll_ki
-    put_f32_auto(p, L);                         // 59 foc_motor_l [H]
-    put_f32_auto(p, 0.0f);                     // 60 foc_motor_ld_lq_diff
-    put_f32_auto(p, R);                         // 61 foc_motor_r [Ω]
-    put_f32_auto(p, flux);                      // 62 foc_motor_flux_linkage [Wb]
-    put_f32_auto(p, 0.001f);                   // 63 foc_observer_gain
-    put_f32_auto(p, 0.05f);                    // 64 foc_observer_gain_slow
-    put_f16     (p, 0.0f, 1000.0f);            // 65 foc_observer_offset
-    put_f32_auto(p, 10.0f);                    // 66 foc_duty_dowmramp_kp
-    put_f32_auto(p, 200.0f);                   // 67 foc_duty_dowmramp_ki
-    put_f16     (p, 1.0f, 10000.0f);           // 68 foc_start_curr_dec
-    put_f32_auto(p, 2500.0f);                  // 69 foc_start_curr_dec_rpm
-    put_f32_auto(p, 400.0f);                   // 70 foc_openloop_rpm
-    put_f16     (p, 0.0f, 1000.0f);            // 71 foc_openloop_rpm_low
-    put_f16     (p, 1.0f, 1000.0f);            // 72 foc_d_gain_scale_start
-    put_f16     (p, 0.2f, 1000.0f);            // 73 foc_d_gain_scale_max_mod
-    put_f16     (p, 0.1f, 100.0f);             // 74 foc_sl_openloop_hyst
-    put_f16     (p, 0.0f, 100.0f);             // 75 foc_sl_openloop_time_lock
-    put_f16     (p, 0.1f, 100.0f);             // 76 foc_sl_openloop_time_ramp
-    put_f16     (p, 0.05f, 100.0f);            // 77 foc_sl_openloop_time
-    put_f16     (p, 5.0f, 100.0f);             // 78 foc_sl_openloop_boost_q
-    put_f16     (p, -1.0f, 100.0f);            // 79 foc_sl_openloop_max_q
-    for (uint8_t k = 0; k < 8; k++) {          // 80-87 foc_hall_table[0-7] ← key
+    put_u8      (p, 0);                        // pwm_mode
+    put_u8      (p, 0);                        // comm_mode
+    put_u8      (p, 2);                        // motor_type = FOC
+    put_u8      (p, 0);                        // sensor_mode (BLDC)
+    put_f32_auto(p, i_max);                    // l_current_max        ← param
+    put_f32_auto(p, -i_max);                   // l_current_min        ← param
+    put_f32_auto(p, 60.0f);                    // l_in_current_max
+    put_f32_auto(p, -60.0f);                   // l_in_current_min
+    put_f16     (p, 0.5f, 10000.0f);           // l_in_current_map_start
+    put_f16     (p, 0.02f, 10000.0f);          // l_in_current_map_filter
+    put_f32_auto(p, _conf.abs_current_max);    // l_abs_current_max    ← param (hard OC)
+    put_f32_auto(p, -100000.0f);               // l_min_erpm
+    put_f32_auto(p, 100000.0f);                // l_max_erpm
+    put_f16     (p, 0.8f, 10000.0f);           // l_erpm_start
+    put_f32_auto(p, 300.0f);                   // l_max_erpm_fbrake
+    put_f32_auto(p, 1500.0f);                  // l_max_erpm_fbrake_cc
+    put_f16     (p, 6.0f, 10.0f);              // l_min_vin
+    put_f16     (p, _conf.max_vin, 10.0f);     // l_max_vin            ← param (vbus_max)
+    put_f16     (p, 10.0f, 10.0f);             // l_battery_cut_start
+    put_f16     (p, 8.0f, 10.0f);              // l_battery_cut_end
+    put_f16     (p, 100.0f, 10.0f);            // l_battery_regen_cut_start
+    put_f16     (p, 110.0f, 10.0f);            // l_battery_regen_cut_end
+    put_u8      (p, 1);                        // l_slow_abs_current
+    put_u8      (p, uint8_t(_conf.temp_fet_start)); // l_temp_fet_start ← param
+    put_u8      (p, uint8_t(_conf.temp_fet_end));   // l_temp_fet_end   ← param
+    put_u8      (p, 85);                       // l_temp_motor_start
+    put_u8      (p, 105);                      // l_temp_motor_end
+    put_f16     (p, 0.15f, 10000.0f);          // l_temp_accel_dec
+    put_f16     (p, 0.005f, 10000.0f);         // l_min_duty
+    put_f16     (p, 0.95f, 10000.0f);          // l_max_duty
+    put_f32_auto(p, 500000.0f);                // l_watt_max
+    put_f32_auto(p, -500000.0f);               // l_watt_min
+    put_f16     (p, 1.0f, 10000.0f);           // l_current_max_scale
+    put_f16     (p, 1.0f, 10000.0f);           // l_current_min_scale
+    put_f16     (p, 1.0f, 10000.0f);           // l_duty_start
+    put_f32_auto(p, 150.0f);                   // sl_min_erpm
+    put_f32_auto(p, 1100.0f);                  // sl_min_erpm_cycle_int_limit
+    put_f32_auto(p, 10.0f);                    // sl_max_fullbreak_current_dir_change
+    put_f16     (p, 62.0f, 10.0f);             // sl_cycle_int_limit
+    put_f16     (p, 0.8f, 10000.0f);           // sl_phase_advance_at_br
+    put_f32_auto(p, 80000.0f);                 // sl_cycle_int_rpm_br
+    put_f32_auto(p, 600.0f);                   // sl_bemf_coupling_k
+    for (uint8_t k = 0; k < 8; k++) put_u8(p, 255); // hall_table[0-7] (BLDC, unused)
+    put_f32_auto(p, 2000.0f);                  // hall_sl_erpm
+    put_f32_auto(p, kp);                       // foc_current_kp       ← live
+    put_f32_auto(p, ki);                       // foc_current_ki       ← live
+    put_f32_auto(p, 20000.0f);                 // foc_f_zv
+    put_f32_auto(p, 0.36f);                    // foc_dt_us
+    put_u8      (p, 0);                        // foc_encoder_inverted
+    put_f32_auto(p, 0.0f);                     // foc_encoder_offset
+    put_f32_auto(p, 7.0f);                     // foc_encoder_ratio
+    put_u8      (p, is_hall ? 2 : 0);          // foc_sensor_mode (2 = HALL) ← param
+    put_f32_auto(p, 2000.0f);                  // foc_pll_kp
+    put_f32_auto(p, 30000.0f);                 // foc_pll_ki
+    put_f32_auto(p, L);                        // foc_motor_l          ← param
+    put_f32_auto(p, 0.0f);                     // foc_motor_ld_lq_diff
+    put_f32_auto(p, R);                        // foc_motor_r          ← param
+    put_f32_auto(p, flux);                     // foc_motor_flux_linkage ← param
+    put_f32_auto(p, 0.001f);                   // foc_observer_gain
+    put_f32_auto(p, 0.05f);                    // foc_observer_gain_slow
+    put_f16     (p, 0.0f, 1000.0f);            // foc_observer_offset
+    put_f32_auto(p, 10.0f);                    // foc_duty_dowmramp_kp
+    put_f32_auto(p, 200.0f);                   // foc_duty_dowmramp_ki
+    put_f16     (p, 1.0f, 10000.0f);           // foc_start_curr_dec
+    put_f32_auto(p, 2500.0f);                  // foc_start_curr_dec_rpm
+    put_f32_auto(p, 400.0f);                   // foc_openloop_rpm
+    put_f16     (p, 0.0f, 1000.0f);            // foc_openloop_rpm_low
+    put_f16     (p, 1.0f, 1000.0f);            // foc_d_gain_scale_start
+    put_f16     (p, 0.2f, 1000.0f);            // foc_d_gain_scale_max_mod
+    put_f16     (p, 0.1f, 100.0f);             // foc_sl_openloop_hyst
+    put_f16     (p, 0.0f, 100.0f);             // foc_sl_openloop_time_lock
+    put_f16     (p, 0.1f, 100.0f);             // foc_sl_openloop_time_ramp
+    put_f16     (p, 0.05f, 100.0f);            // foc_sl_openloop_time
+    put_f16     (p, 5.0f, 100.0f);             // foc_sl_openloop_boost_q
+    put_f16     (p, -1.0f, 100.0f);            // foc_sl_openloop_max_q
+    for (uint8_t k = 0; k < 8; k++) {          // foc_hall_table[0-7]  ← param
         if (isnan(hd[k])) {
             put_u8(p, 255);                    // unmapped state
         } else {
@@ -609,105 +659,249 @@ void VescTelemetry::handle_get_mcconf(uint8_t reply_id)
             put_u8(p, uint8_t(lroundf(a * (200.0f / 360.0f)) % 200));
         }
     }
-    put_f32_auto(p, 500.0f);                   // 88 foc_hall_interp_erpm
-    put_f32_auto(p, bl_hi);                     // 89 foc_sl_erpm (hall→observer) ← relevant
-    put_u8      (p, 0);                        // 90 foc_sample_v0_v7
-    put_u8      (p, 0);                        // 91 foc_sample_high_current
-    put_u8      (p, 0);                        // 92 foc_sat_comp_mode
-    put_f16     (p, 0.0f, 1000.0f);            // 93 foc_sat_comp
-    put_u8      (p, 0);                        // 94 foc_temp_comp
-    put_f16     (p, 25.0f, 100.0f);            // 95 foc_temp_comp_base_temp
-    put_f16     (p, 0.1f, 10000.0f);           // 96 foc_current_filter_const
-    put_u8      (p, 0);                        // 97 foc_cc_decoupling
-    put_u8      (p, 0);                        // 98 foc_observer_type
-    put_f16     (p, 5.0f, 10.0f);              // 99 foc_hfi_voltage_start
-    put_f16     (p, 2.0f, 10.0f);              // 100 foc_hfi_voltage_run
-    put_f16     (p, 10.0f, 10.0f);             // 101 foc_hfi_voltage_max
-    put_f16     (p, 1.0f, 1000.0f);            // 102 foc_hfi_gain
-    put_f16     (p, 1.0f, 100.0f);             // 103 foc_hfi_hyst
-    put_f32_auto(p, 2000.0f);                  // 104 foc_sl_erpm_hfi
-    put_u16     (p, 65);                       // 105 foc_hfi_start_samples
-    put_f32_auto(p, 0.001f);                   // 106 foc_hfi_obs_ovr_sec
-    put_u8      (p, 0);                        // 107 foc_hfi_samples
-    put_u8      (p, 1);                        // 108 foc_offsets_cal_on_boot
-    for (uint8_t k = 0; k < 3; k++) put_f32_auto(p, 2048.0f);       // 109-111 foc_offsets_current
-    for (uint8_t k = 0; k < 3; k++) put_f16(p, 0.0f, 10000.0f);     // 112-114 foc_offsets_voltage
-    for (uint8_t k = 0; k < 3; k++) put_f16(p, 0.0f, 10000.0f);     // 115-117 foc_offsets_voltage_undriven
-    put_u8      (p, 0);                        // 118 foc_phase_filter_enable
-    put_u8      (p, 0);                        // 119 foc_phase_filter_disable_fault
-    put_f32_auto(p, 4000.0f);                  // 120 foc_phase_filter_max_erpm
-    put_u8      (p, 0);                        // 121 foc_mtpa_mode
-    put_f32_auto(p, 0.0f);                     // 122 foc_fw_current_max
-    put_f16     (p, 0.9f, 10000.0f);           // 123 foc_fw_duty_start
-    put_f16     (p, 0.2f, 1000.0f);            // 124 foc_fw_ramp_time
-    put_f16     (p, 0.02f, 10000.0f);          // 125 foc_fw_q_current_factor
-    put_u8      (p, 0);                        // 126 foc_speed_soure
-    put_i16     (p, 0);                        // 127 gpd_buffer_notify_left
-    put_i16     (p, 0);                        // 128 gpd_buffer_interpol
-    put_f16     (p, 0.1f, 10000.0f);           // 129 gpd_current_filter_const
-    put_f32_auto(p, 0.03f);                    // 130 gpd_current_kp
-    put_f32_auto(p, 50.0f);                    // 131 gpd_current_ki
-    put_u8      (p, 0);                        // 132 sp_pid_loop_rate
-    put_f32_auto(p, 0.004f);                   // 133 s_pid_kp
-    put_f32_auto(p, 0.004f);                   // 134 s_pid_ki
-    put_f32_auto(p, 0.0001f);                  // 135 s_pid_kd
-    put_f16     (p, 0.2f, 10000.0f);           // 136 s_pid_kd_filter
-    put_f32_auto(p, 900.0f);                   // 137 s_pid_min_erpm
-    put_u8      (p, 1);                        // 138 s_pid_allow_braking
-    put_f32_auto(p, 25000.0f);                 // 139 s_pid_ramp_erpms_s
-    put_f32_auto(p, 0.03f);                    // 140 p_pid_kp
-    put_f32_auto(p, 0.0f);                     // 141 p_pid_ki
-    put_f32_auto(p, 0.0004f);                  // 142 p_pid_kd
-    put_f32_auto(p, 0.0004f);                  // 143 p_pid_kd_proc
-    put_f16     (p, 0.2f, 10000.0f);           // 144 p_pid_kd_filter
-    put_f32_auto(p, 1.0f);                     // 145 p_pid_ang_div
-    put_f16     (p, 0.0f, 10.0f);              // 146 p_pid_gain_dec_angle
-    put_f32_auto(p, 0.0f);                     // 147 p_pid_offset
-    put_f16     (p, 0.01f, 10000.0f);          // 148 cc_startup_boost_duty
-    put_f32_auto(p, 0.0f);                     // 149 cc_min_current
-    put_f32_auto(p, 0.0046f);                  // 150 cc_gain
-    put_f16     (p, 0.04f, 10000.0f);          // 151 cc_ramp_step_max
-    put_i32     (p, 500);                      // 152 m_fault_stop_time_ms
-    put_f16     (p, 0.02f, 10000.0f);          // 153 m_duty_ramp_step
-    put_f32_auto(p, 0.5f);                     // 154 m_current_backoff_gain
-    put_u32     (p, 8192);                     // 155 m_encoder_counts
-    put_f16     (p, 0.0f, 1000.0f);            // 156 m_encoder_sin_amp
-    put_f16     (p, 0.0f, 1000.0f);            // 157 m_encoder_cos_amp
-    put_f16     (p, 0.0f, 1000.0f);            // 158 m_encoder_sin_offset
-    put_f16     (p, 0.0f, 1000.0f);            // 159 m_encoder_cos_offset
-    put_f16     (p, 0.5f, 1000.0f);            // 160 m_encoder_sincos_filter_constant
-    put_f16     (p, 0.0f, 1000.0f);            // 161 m_encoder_sincos_phase_correction
-    put_u8      (p, 0);                        // 162 m_sensor_port_mode
-    put_u8      (p, 0);                        // 163 m_invert_direction
-    put_u8      (p, 0);                        // 164 m_drv8301_oc_mode
-    put_u8      (p, 16);                       // 165 m_drv8301_oc_adj
-    put_f32_auto(p, 3000.0f);                  // 166 m_bldc_f_sw_min
-    put_f32_auto(p, 30000.0f);                 // 167 m_bldc_f_sw_max
-    put_f32_auto(p, 25000.0f);                 // 168 m_dc_f_sw
-    put_f32_auto(p, 3380.0f);                  // 169 m_ntc_motor_beta
-    put_u8      (p, 0);                        // 170 m_out_aux_mode
-    put_u8      (p, 0);                        // 171 m_motor_temp_sens_type
-    put_f32_auto(p, 0.61f);                    // 172 m_ptc_motor_coeff
-    put_f16     (p, 10000.0f, 0.1f);           // 173 m_ntcx_ptcx_res
-    put_f16     (p, 25.0f, 10.0f);             // 174 m_ntcx_ptcx_temp_base
-    put_u8      (p, 0);                        // 175 m_hall_extra_samples
-    put_u8      (p, 10);                       // 176 m_batt_filter_const
-    put_u8      (p, uint8_t(_pole_pairs * 2)); // 177 si_motor_poles ← RPM display
-    put_f32_auto(p, 1.0f);                     // 178 si_gear_ratio
-    put_f32_auto(p, 0.083f);                   // 179 si_wheel_diameter
-    put_u8      (p, 0);                        // 180 si_battery_type
-    put_u8      (p, 3);                        // 181 si_battery_cells
-    put_f32_auto(p, 0.0f);                     // 182 si_battery_ah
-    put_f32_auto(p, 0.0f);                     // 183 si_motor_nl_current
-    put_u8      (p, 0);                        // 184 bms.type
-    put_u8      (p, 0);                        // 185 bms.limit_mode
-    put_f16     (p, 0.0f, 100.0f);             // 186 bms.t_limit_start
-    put_f16     (p, 0.0f, 100.0f);             // 187 bms.t_limit_end
-    put_f16     (p, 0.0f, 1000.0f);            // 188 bms.soc_limit_start
-    put_f16     (p, 0.0f, 1000.0f);            // 189 bms.soc_limit_end
-    put_u8      (p, 0);                        // 190 bms.fwd_can_mode
+    put_f32_auto(p, 500.0f);                   // foc_hall_interp_erpm
+    put_f32_auto(p, bl_lo);                    // foc_sl_erpm_start    ← param (hall blend lo)
+    put_f32_auto(p, bl_hi);                    // foc_sl_erpm          ← param (hall blend hi)
+    put_u8      (p, 0);                        // foc_control_sample_mode
+    put_u8      (p, 0);                        // foc_current_sample_mode
+    put_u8      (p, 0);                        // foc_sat_comp_mode
+    put_f16     (p, 0.0f, 1000.0f);            // foc_sat_comp
+    put_u8      (p, 0);                        // foc_temp_comp
+    put_f16     (p, 25.0f, 100.0f);            // foc_temp_comp_base_temp
+    put_f16     (p, 0.1f, 10000.0f);           // foc_current_filter_const
+    put_u8      (p, 0);                        // foc_cc_decoupling
+    put_u8      (p, 0);                        // foc_observer_type
+    put_u8      (p, 0);                        // foc_hfi_amb_mode
+    put_f16     (p, 0.0f, 10.0f);              // foc_hfi_amb_current
+    put_u8      (p, 0);                        // foc_hfi_amb_tres
+    put_f16     (p, 5.0f, 10.0f);              // foc_hfi_voltage_start
+    put_f16     (p, 2.0f, 10.0f);              // foc_hfi_voltage_run
+    put_f16     (p, 10.0f, 10.0f);             // foc_hfi_voltage_max
+    put_f16     (p, 1.0f, 1000.0f);            // foc_hfi_gain
+    put_f16     (p, 1.0f, 1000.0f);            // foc_hfi_max_err
+    put_f16     (p, 1.0f, 100.0f);             // foc_hfi_hyst
+    put_f32_auto(p, 2000.0f);                  // foc_sl_erpm_hfi
+    put_u16     (p, 65);                       // foc_hfi_start_samples
+    put_f32_auto(p, 0.001f);                   // foc_hfi_obs_ovr_sec
+    put_u8      (p, 0);                        // foc_hfi_samples
+    put_u8      (p, 1);                        // foc_offsets_cal_mode
+    for (uint8_t k = 0; k < 3; k++) put_f32_auto(p, 2048.0f);       // foc_offsets_current[0-2]
+    for (uint8_t k = 0; k < 3; k++) put_f16(p, 0.0f, 10000.0f);     // foc_offsets_voltage[0-2]
+    for (uint8_t k = 0; k < 3; k++) put_f16(p, 0.0f, 10000.0f);     // foc_offsets_voltage_undriven[0-2]
+    put_u8      (p, 0);                        // foc_phase_filter_enable
+    put_u8      (p, 0);                        // foc_phase_filter_disable_fault
+    put_f32_auto(p, 4000.0f);                  // foc_phase_filter_max_erpm
+    put_u8      (p, 0);                        // foc_mtpa_mode
+    put_f32_auto(p, 0.0f);                     // foc_fw_current_max
+    put_f16     (p, 0.9f, 10000.0f);           // foc_fw_duty_start
+    put_f16     (p, 0.2f, 1000.0f);            // foc_fw_ramp_time
+    put_f16     (p, 0.02f, 10000.0f);          // foc_fw_q_current_factor
+    put_u8      (p, 0);                        // foc_speed_soure
+    put_u8      (p, 0);                        // foc_short_ls_on_zero_duty
+    put_f16     (p, 1.0f, 10000.0f);           // foc_overmod_factor
+    put_u8      (p, 0);                        // sp_pid_loop_rate
+    put_f32_auto(p, 0.004f);                   // s_pid_kp
+    put_f32_auto(p, 0.004f);                   // s_pid_ki
+    put_f32_auto(p, 0.0001f);                  // s_pid_kd
+    put_f16     (p, 0.2f, 10000.0f);           // s_pid_kd_filter
+    put_f32_auto(p, 900.0f);                   // s_pid_min_erpm
+    put_u8      (p, 1);                        // s_pid_allow_braking
+    put_f32_auto(p, 25000.0f);                 // s_pid_ramp_erpms_s
+    put_u8      (p, 0);                        // s_pid_speed_source
+    put_f32_auto(p, 0.03f);                    // p_pid_kp
+    put_f32_auto(p, 0.0f);                     // p_pid_ki
+    put_f32_auto(p, 0.0004f);                  // p_pid_kd
+    put_f32_auto(p, 0.0004f);                  // p_pid_kd_proc
+    put_f16     (p, 0.2f, 10000.0f);           // p_pid_kd_filter
+    put_f32_auto(p, 1.0f);                     // p_pid_ang_div
+    put_f16     (p, 0.0f, 10.0f);              // p_pid_gain_dec_angle
+    put_f32_auto(p, 0.0f);                     // p_pid_offset
+    put_f16     (p, 0.01f, 10000.0f);          // cc_startup_boost_duty
+    put_f32_auto(p, 0.0f);                     // cc_min_current
+    put_f32_auto(p, 0.0046f);                  // cc_gain
+    put_f16     (p, 0.04f, 10000.0f);          // cc_ramp_step_max
+    put_i32     (p, 500);                      // m_fault_stop_time_ms
+    put_f16     (p, 0.02f, 10000.0f);          // m_duty_ramp_step
+    put_f32_auto(p, 0.5f);                     // m_current_backoff_gain
+    put_u32     (p, 8192);                     // m_encoder_counts
+    put_f16     (p, 0.0f, 1000.0f);            // m_encoder_sin_amp
+    put_f16     (p, 0.0f, 1000.0f);            // m_encoder_cos_amp
+    put_f16     (p, 0.0f, 1000.0f);            // m_encoder_sin_offset
+    put_f16     (p, 0.0f, 1000.0f);            // m_encoder_cos_offset
+    put_f16     (p, 0.5f, 1000.0f);            // m_encoder_sincos_filter_constant
+    put_f16     (p, 0.0f, 1000.0f);            // m_encoder_sincos_phase_correction
+    put_u8      (p, 0);                        // m_sensor_port_mode
+    put_u8      (p, 0);                        // m_invert_direction
+    put_u8      (p, 0);                        // m_drv8301_oc_mode
+    put_u8      (p, 16);                       // m_drv8301_oc_adj
+    put_f32_auto(p, 3000.0f);                  // m_bldc_f_sw_min
+    put_f32_auto(p, 30000.0f);                 // m_bldc_f_sw_max
+    put_f32_auto(p, 25000.0f);                 // m_dc_f_sw
+    put_f32_auto(p, 3380.0f);                  // m_ntc_motor_beta
+    put_u8      (p, 0);                        // m_out_aux_mode
+    put_u8      (p, 0);                        // m_motor_temp_sens_type
+    put_f32_auto(p, 0.61f);                    // m_ptc_motor_coeff
+    put_f16     (p, 10000.0f, 0.1f);           // m_ntcx_ptcx_res
+    put_f16     (p, 25.0f, 10.0f);             // m_ntcx_ptcx_temp_base
+    put_u8      (p, 0);                        // m_hall_extra_samples
+    put_u8      (p, 10);                       // m_batt_filter_const
+    put_u8      (p, _conf.poles);              // si_motor_poles       ← param (pole count)
+    put_f32_auto(p, 1.0f);                     // si_gear_ratio
+    put_f32_auto(p, 0.083f);                   // si_wheel_diameter
+    put_u8      (p, 0);                        // si_battery_type
+    put_u8      (p, 3);                        // si_battery_cells
+    put_f32_auto(p, 0.0f);                     // si_battery_ah
+    put_f32_auto(p, 0.0f);                     // si_motor_nl_current
+    put_u8      (p, 0);                        // bms.type
+    put_u8      (p, 0);                        // bms.limit_mode
+    put_u8      (p, 0);                        // bms.t_limit_start
+    put_u8      (p, 0);                        // bms.t_limit_end
+    put_f16     (p, 0.0f, 1000.0f);            // bms.soc_limit_start
+    put_f16     (p, 0.0f, 1000.0f);            // bms.soc_limit_end
+    put_f16     (p, 0.0f, 1000.0f);            // bms.vmin_limit_start
+    put_f16     (p, 0.0f, 1000.0f);            // bms.vmin_limit_end
+    put_f16     (p, 0.0f, 1000.0f);            // bms.vmax_limit_start
+    put_f16     (p, 0.0f, 1000.0f);            // bms.vmax_limit_end
+    put_u8      (p, 0);                        // bms.fwd_can_mode
 
     send_packet(buf, uint16_t(p - buf));
+}
+
+// Parse VESC Tool's "Write Motor Configuration" (COMM_SET_MCCONF) blob in the
+// 6.06 field order and pull out the standard fields we back with params. Every
+// field must be consumed in order (fixed widths) so the ones we want land at the
+// right offset; fields we don't map are skipped by advancing the cursor. The
+// custom protections (stall/regen/vbus-fold/slew/current-scale) have no VESC
+// mc_configuration slot and are untouched here — set those via DroneCAN params.
+void VescTelemetry::handle_set_mcconf()
+{
+    // Blob starts after the command-id byte; first word is the signature.
+    const uint8_t *p = &_payload[1];
+    if (_payload_len < 1 + 4 || get_u32(p) != MCCONF_SIGNATURE) {
+        return;   // wrong FW/version layout — ignore (VESC Tool shows an error)
+    }
+
+    // Skip helpers: consume one field of the given type, advancing the cursor.
+    auto A  = [&]()          { (void)get_f32_auto(p); };
+    auto H  = [&](float s)   { (void)get_f16(p, s); };
+    auto U8 = [&]()          { p += 1; };
+    auto U16= [&]()          { p += 2; };
+    auto U32= [&]()          { p += 4; };
+    auto I32= [&]()          { p += 4; };
+
+    McconfIn in{};
+
+    U8(); U8(); U8(); U8();                 // pwm_mode, comm_mode, motor_type, sensor_mode
+    in.current_max = get_f32_auto(p);       // l_current_max
+    A();                                    // l_current_min
+    A(); A();                               // l_in_current_max, l_in_current_min
+    H(10000); H(10000);                     // l_in_current_map_start, _filter
+    in.abs_current_max = get_f32_auto(p);   // l_abs_current_max
+    A(); A();                               // l_min_erpm, l_max_erpm
+    H(10000);                               // l_erpm_start
+    A(); A();                               // l_max_erpm_fbrake, _cc
+    H(10);                                  // l_min_vin
+    in.max_vin = get_f16(p, 10);            // l_max_vin
+    H(10); H(10);                           // l_battery_cut_start, _end
+    H(10); H(10);                           // l_battery_regen_cut_start, _end
+    U8();                                   // l_slow_abs_current
+    in.temp_fet_start = float(*p); p += 1;  // l_temp_fet_start (u8)
+    in.temp_fet_end   = float(*p); p += 1;  // l_temp_fet_end (u8)
+    U8(); U8();                             // l_temp_motor_start, _end
+    H(10000); H(10000); H(10000);           // l_temp_accel_dec, l_min_duty, l_max_duty
+    A(); A();                               // l_watt_max, l_watt_min
+    H(10000); H(10000); H(10000);           // l_current_max_scale, min_scale, l_duty_start
+    A(); A(); A();                          // sl_min_erpm, sl_min_erpm_cycle_int_limit, sl_max_fullbreak_..
+    H(10);                                  // sl_cycle_int_limit
+    H(10000);                               // sl_phase_advance_at_br
+    A(); A();                               // sl_cycle_int_rpm_br, sl_bemf_coupling_k
+    p += 8;                                 // hall_table[0-7] u8
+    A();                                    // hall_sl_erpm
+    A(); A();                               // foc_current_kp, foc_current_ki
+    A(); A();                               // foc_f_zv, foc_dt_us
+    U8();                                   // foc_encoder_inverted
+    A(); A();                               // foc_encoder_offset, foc_encoder_ratio
+    U8();                                   // foc_sensor_mode
+    A(); A();                               // foc_pll_kp, foc_pll_ki
+    in.motor_l = get_f32_auto(p);           // foc_motor_l
+    A();                                    // foc_motor_ld_lq_diff
+    in.motor_r    = get_f32_auto(p);        // foc_motor_r
+    in.motor_flux = get_f32_auto(p);        // foc_motor_flux_linkage
+    A(); A();                               // foc_observer_gain, _slow
+    H(1000);                                // foc_observer_offset
+    A(); A();                               // foc_duty_dowmramp_kp, _ki
+    H(10000);                               // foc_start_curr_dec
+    A(); A();                               // foc_start_curr_dec_rpm, foc_openloop_rpm
+    H(1000); H(1000); H(1000);              // foc_openloop_rpm_low, d_gain_scale_start, _max_mod
+    H(100); H(100); H(100); H(100); H(100); H(100); // foc_sl_openloop_hyst, time_lock, time_ramp, time, boost_q, max_q
+    p += 8;                                 // foc_hall_table[0-7] u8
+    A(); A(); A();                          // foc_hall_interp_erpm, foc_sl_erpm_start, foc_sl_erpm
+    U8(); U8(); U8();                       // foc_control_sample_mode, foc_current_sample_mode, foc_sat_comp_mode
+    H(1000);                                // foc_sat_comp
+    U8();                                   // foc_temp_comp
+    H(100);                                 // foc_temp_comp_base_temp
+    H(10000);                               // foc_current_filter_const
+    U8(); U8();                             // foc_cc_decoupling, foc_observer_type
+    U8();                                   // foc_hfi_amb_mode
+    H(10);                                  // foc_hfi_amb_current
+    U8();                                   // foc_hfi_amb_tres
+    H(10); H(10); H(10);                    // foc_hfi_voltage_start, _run, _max
+    H(1000); H(1000);                       // foc_hfi_gain, foc_hfi_max_err
+    H(100);                                 // foc_hfi_hyst
+    A();                                    // foc_sl_erpm_hfi
+    U16();                                  // foc_hfi_start_samples
+    A();                                    // foc_hfi_obs_ovr_sec
+    U8(); U8();                             // foc_hfi_samples, foc_offsets_cal_mode
+    A(); A(); A();                          // foc_offsets_current[0-2]
+    H(10000); H(10000); H(10000);           // foc_offsets_voltage[0-2]
+    H(10000); H(10000); H(10000);           // foc_offsets_voltage_undriven[0-2]
+    U8(); U8();                             // foc_phase_filter_enable, _disable_fault
+    A();                                    // foc_phase_filter_max_erpm
+    U8();                                   // foc_mtpa_mode
+    A();                                    // foc_fw_current_max
+    H(10000); H(1000); H(10000);            // foc_fw_duty_start, _ramp_time, _q_current_factor
+    U8(); U8();                             // foc_speed_soure, foc_short_ls_on_zero_duty
+    H(10000);                               // foc_overmod_factor
+    U8();                                   // sp_pid_loop_rate
+    A(); A(); A();                          // s_pid_kp, ki, kd
+    H(10000);                               // s_pid_kd_filter
+    A();                                    // s_pid_min_erpm
+    U8();                                   // s_pid_allow_braking
+    A();                                    // s_pid_ramp_erpms_s
+    U8();                                   // s_pid_speed_source
+    A(); A(); A(); A();                     // p_pid_kp, ki, kd, kd_proc
+    H(10000);                               // p_pid_kd_filter
+    A();                                    // p_pid_ang_div
+    H(10);                                  // p_pid_gain_dec_angle
+    A();                                    // p_pid_offset
+    H(10000);                               // cc_startup_boost_duty
+    A(); A();                               // cc_min_current, cc_gain
+    H(10000);                               // cc_ramp_step_max
+    I32();                                  // m_fault_stop_time_ms
+    H(10000);                               // m_duty_ramp_step
+    A();                                    // m_current_backoff_gain
+    U32();                                  // m_encoder_counts
+    H(1000); H(1000); H(1000); H(1000); H(1000); H(1000); // encoder sin/cos amp/offset, sincos filter/phase
+    U8(); U8(); U8(); U8();                 // m_sensor_port_mode, m_invert_direction, m_drv8301_oc_mode, _oc_adj
+    A(); A(); A(); A();                     // m_bldc_f_sw_min, _max, m_dc_f_sw, m_ntc_motor_beta
+    U8(); U8();                             // m_out_aux_mode, m_motor_temp_sens_type
+    A();                                    // m_ptc_motor_coeff
+    H(0.1f); H(10);                         // m_ntcx_ptcx_res, m_ntcx_ptcx_temp_base
+    U8(); U8();                             // m_hall_extra_samples, m_batt_filter_const
+    in.poles = *p; p += 1;                  // si_motor_poles (u8) — last field we need
+
+    // Guard against a short/truncated frame walking past the payload.
+    if (uintptr_t(p - &_payload[0]) > _payload_len) {
+        return;
+    }
+
+    if (_conf_cb != nullptr) {
+        _conf_cb(_conf_ctx, in);   // persist + schedule reboot to apply
+    }
+    // Ack with the bare command id (VESC commands.c convention) so VESC Tool
+    // reports the write succeeded before we reboot.
+    uint8_t ack = COMM_SET_MCCONF;
+    send_packet(&ack, 1);
 }
 
 } // namespace ChibiOS

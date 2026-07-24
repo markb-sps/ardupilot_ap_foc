@@ -6,6 +6,8 @@
 #include <AP_Math/AP_Math.h>
 #include <AP_HAL_ChibiOS/stm32_pwm_input.h>
 
+extern const AP_HAL::HAL& hal;
+
 // ── Current-sense scale (v2 PCB hardware) ───────────────────────────────────
 // Exact scale = 1 / (Rshunt · input_attenuation · amp_gain).
 namespace {
@@ -74,6 +76,96 @@ const AP_Param::GroupInfo FOC_ESC::var_info[] = {
     // @Param: HALL7
     // @Description: Hall table angle for state 7 (deg, -1 = unused).
     AP_GROUPINFO("HALL7", 9, FOC_ESC, _p_hall[7], -1),
+
+    // ── Motor identity (VESC Tool "Write Motor Configuration" writes these) ──
+    // @Param: M_RS
+    // @DisplayName: Motor phase resistance
+    // @Units: Ohm
+    // @User: Standard
+    AP_GROUPINFO("M_RS", 10, FOC_ESC, _p_motor_rs, 0.055f),
+    // @Param: M_LS
+    // @DisplayName: Motor phase inductance
+    // @Units: H
+    // @User: Standard
+    AP_GROUPINFO("M_LS", 11, FOC_ESC, _p_motor_ls, 80e-6f),
+    // @Param: M_FLUX
+    // @DisplayName: Motor PM flux linkage
+    // @Units: Wb
+    // @User: Standard
+    AP_GROUPINFO("M_FLUX", 12, FOC_ESC, _p_motor_flux, 4.6e-3f),
+    // @Param: M_POLES
+    // @DisplayName: Motor pole pairs
+    // @Range: 1 30
+    // @User: Standard
+    AP_GROUPINFO("M_POLES", 13, FOC_ESC, _p_motor_poles, 7),
+
+    // ── Current loop / limits ────────────────────────────────────────────────
+    // @Param: I_MAX
+    // @DisplayName: Max motor current (iq ceiling)
+    // @Units: A
+    // @User: Standard
+    AP_GROUPINFO("I_MAX", 14, FOC_ESC, _p_i_max, 15.0f),
+    // @Param: I_OC
+    // @DisplayName: Overcurrent trip (debounced, per phase)
+    // @Units: A
+    // @User: Advanced
+    AP_GROUPINFO("I_OC", 15, FOC_ESC, _p_i_oc, 30.0f),
+    // @Param: I_OCHARD
+    // @DisplayName: Instant overcurrent trip (per phase)
+    // @Units: A
+    // @User: Advanced
+    AP_GROUPINFO("I_OCHARD", 16, FOC_ESC, _p_i_oc_hard, 45.0f),
+    // @Param: I_REGEN
+    // @DisplayName: Max braking/regen current
+    // @Units: A
+    // @User: Advanced
+    AP_GROUPINFO("I_REGEN", 17, FOC_ESC, _p_i_regen, 5.0f),
+    // @Param: I_SLEW
+    // @DisplayName: Torque-command slew limit
+    // @Units: A/s
+    // @User: Advanced
+    AP_GROUPINFO("I_SLEW", 18, FOC_ESC, _p_i_slew, 150.0f),
+    // @Param: I_SCALE
+    // @DisplayName: Current-sense scale (ADC volts to amps)
+    // @User: Advanced
+    AP_GROUPINFO("I_SCALE", 19, FOC_ESC, _p_i_scale, 50.0f),
+
+    // ── Bus / thermal / stall protections ────────────────────────────────────
+    // @Param: V_MAX
+    // @DisplayName: Bus voltage at which regen is fully cut
+    // @Units: V
+    // @User: Advanced
+    AP_GROUPINFO("V_MAX", 20, FOC_ESC, _p_v_max, 40.0f),
+    // @Param: V_FOLD
+    // @DisplayName: Bus over-voltage foldback band
+    // @Units: V
+    // @User: Advanced
+    AP_GROUPINFO("V_FOLD", 21, FOC_ESC, _p_v_fold, 3.0f),
+    // @Param: T_START
+    // @DisplayName: FET temperature derate onset
+    // @Units: degC
+    // @User: Advanced
+    AP_GROUPINFO("T_START", 22, FOC_ESC, _p_t_start, 80.0f),
+    // @Param: T_MAX
+    // @DisplayName: FET over-temperature hard trip
+    // @Units: degC
+    // @User: Advanced
+    AP_GROUPINFO("T_MAX", 23, FOC_ESC, _p_t_max, 100.0f),
+    // @Param: STL_RPM
+    // @DisplayName: Stall speed threshold
+    // @Units: rpm
+    // @User: Advanced
+    AP_GROUPINFO("STL_RPM", 24, FOC_ESC, _p_stall_rpm, 250.0f),
+    // @Param: STL_I
+    // @DisplayName: Stall current threshold
+    // @Units: A
+    // @User: Advanced
+    AP_GROUPINFO("STL_I", 25, FOC_ESC, _p_stall_i, 2.0f),
+    // @Param: STL_T
+    // @DisplayName: Stall dwell before trip
+    // @Units: s
+    // @User: Advanced
+    AP_GROUPINFO("STL_T", 26, FOC_ESC, _p_stall_t, 1.0f),
 
     AP_GROUPEND
 };
@@ -146,6 +238,26 @@ void FOC_ESC::init(AP_HAL::UARTDriver *vesc_uart)
     motor_cfg.current_slew_a_s = 150.0f;   // [A/s]
 
     // ── Apply persisted config (AP_Periph storage) over the defaults ────────
+    // Motor identity + limits + protections are now params (tunable over
+    // DroneCAN/MAVLink, and the identity/limit subset over VESC Tool). These
+    // override the compile-time defaults set above.
+    motor_cfg.motor_Rs             = _p_motor_rs.get();
+    motor_cfg.motor_Ls             = _p_motor_ls.get();
+    motor_cfg.motor_flux           = _p_motor_flux.get();
+    motor_cfg.current_max          = _p_i_max.get();
+    motor_cfg.overcurrent_trip     = _p_i_oc.get();
+    motor_cfg.overcurrent_trip_hard = _p_i_oc_hard.get();
+    motor_cfg.regen_current_max    = _p_i_regen.get();
+    motor_cfg.current_slew_a_s     = _p_i_slew.get();
+    motor_cfg.current_scale        = _p_i_scale.get();
+    motor_cfg.vbus_max             = _p_v_max.get();
+    motor_cfg.vbus_fold_band       = _p_v_fold.get();
+    motor_cfg.fet_temp_start       = _p_t_start.get();
+    motor_cfg.fet_temp_max         = _p_t_max.get();
+    motor_cfg.stall_erpm           = _p_stall_rpm.get();
+    motor_cfg.stall_current        = _p_stall_i.get();
+    motor_cfg.stall_time_s         = _p_stall_t.get();
+
     motor_cfg.sensor_mode = (_p_sensor_mode.get() == 0)
                                 ? ChibiOS::MotorControl::SensorMode::SENSORLESS
                                 : ChibiOS::MotorControl::SensorMode::HALL;
@@ -164,10 +276,43 @@ void FOC_ESC::init(AP_HAL::UARTDriver *vesc_uart)
 
     motor_control.init(motor_cfg);
 
+    // Give the VESC link the param-derived values it can't read from
+    // MotorControl (for the GET_MCCONF read-out) and register the write-back
+    // sink for VESC Tool's "Write Motor Configuration".
+    ChibiOS::VescTelemetry::ConfSnapshot snap;
+    snap.poles           = uint8_t(_p_motor_poles.get() * 2);  // count = 2×pairs
+    snap.max_vin         = _p_v_max.get();
+    snap.temp_fet_start  = _p_t_start.get();
+    snap.temp_fet_end    = _p_t_max.get();
+    snap.abs_current_max = _p_i_oc_hard.get();
+    vesc_telem.set_conf_snapshot(snap);
+    vesc_telem.set_mcconf_sink(this, &FOC_ESC::mcconf_write_trampoline);
+
     vesc_telem.init(vesc_uart);
 
     // J305 PWM RC throttle input (TIM3_CH1 / PC6) — polled in read_pwm_throttle().
     ChibiOS::stm32_pwm_input_init();
+}
+
+// VESC Tool wrote a motor config (COMM_SET_MCCONF). Persist the standard fields
+// that map to our params, then schedule a reboot so the controller re-inits with
+// the new values (reboot-to-apply — matching how the params load at boot). Only
+// the fields VESC exposes are here; the custom protections stay DroneCAN-only.
+void FOC_ESC::on_mcconf_write(const ChibiOS::VescTelemetry::McconfIn &in)
+{
+    _p_motor_rs.set_and_save(in.motor_r);
+    _p_motor_ls.set_and_save(in.motor_l);
+    _p_motor_flux.set_and_save(in.motor_flux);
+    if (in.poles >= 2) {
+        _p_motor_poles.set_and_save(int8_t(in.poles / 2));   // count → pairs
+    }
+    _p_i_max.set_and_save(in.current_max);
+    _p_i_oc_hard.set_and_save(in.abs_current_max);
+    _p_v_max.set_and_save(in.max_vin);
+    _p_t_start.set_and_save(in.temp_fet_start);
+    _p_t_max.set_and_save(in.temp_fet_end);
+
+    _reboot_ms = AP_HAL::millis();   // deferred reboot (see update())
 }
 
 // Poll the TIM3 capture and, on a valid in-range frame, refresh the PWM source.
@@ -298,6 +443,16 @@ void FOC_ESC::update(uint32_t now_ms)
             }
             _p_hall[k].set_and_save(v);
         }
+    }
+
+    // Deferred reboot after a VESC-Tool config write: give the COMM_SET_MCCONF
+    // ack time to go out and the param storage flush to settle, then re-init the
+    // controller with the new values. Coast the motor first for safety.
+    if (_reboot_ms != 0 && (now_ms - _reboot_ms) > 400) {
+        _reboot_ms = 0;
+        motor_control.set_current(0.0f);
+        motor_control.disable_outputs();
+        hal.scheduler->reboot(false);
     }
 }
 

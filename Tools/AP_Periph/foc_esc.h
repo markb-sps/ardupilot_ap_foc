@@ -42,6 +42,18 @@ public:
     void set_can_throttle(float frac);
 
 private:
+    // Sink for VESC Tool "Write Motor Configuration": persist the mapped params
+    // and schedule a reboot so they apply (reboot-to-apply model). The static
+    // trampoline is what gets registered with vesc_telem.
+    void on_mcconf_write(const ChibiOS::VescTelemetry::McconfIn &in);
+    static void mcconf_write_trampoline(void *ctx,
+                                        const ChibiOS::VescTelemetry::McconfIn &in) {
+        static_cast<FOC_ESC *>(ctx)->on_mcconf_write(in);
+    }
+    // millis() at which a VESC-Tool config write asked for a reboot (0 = none).
+    // Deferred so the COMM_SET_MCCONF ack + storage flush complete first.
+    uint32_t _reboot_ms = 0;
+
     // Poll the J305 TIM3 capture and refresh the PWM throttle source (with the
     // boot-low arming gate + out-of-range coast).
     void read_pwm_throttle(uint32_t now_ms);
@@ -64,6 +76,29 @@ private:
     // Hall table: electrical angle [deg 0..359] per hall state 0..7; -1 = invalid
     // (unused state). Populated by set_and_save() when a detection spin completes.
     AP_Int16 _p_hall[8];
+
+    // ── Motor identity (VESC-writable via COMM_SET_MCCONF) ───────────────────
+    AP_Float _p_motor_rs;      // phase resistance [Ω]      → foc_motor_r
+    AP_Float _p_motor_ls;      // phase inductance [H]      → foc_motor_l
+    AP_Float _p_motor_flux;    // PM flux linkage λ [Wb]    → foc_motor_flux_linkage
+    AP_Int8  _p_motor_poles;   // pole PAIRS (si_motor_poles = 2×)
+
+    // ── Current loop / limits (I_MAX + I_OCHARD VESC-writable) ───────────────
+    AP_Float _p_i_max;         // iq command ceiling [A]    → l_current_max
+    AP_Float _p_i_oc;          // debounced per-phase OC trip [A] (DroneCAN-only)
+    AP_Float _p_i_oc_hard;     // instant per-phase OC trip [A] → l_abs_current_max
+    AP_Float _p_i_regen;       // max braking/regen current [A] (DroneCAN-only)
+    AP_Float _p_i_slew;        // torque-command slew [A/s]     (DroneCAN-only)
+    AP_Float _p_i_scale;       // ADC volts → amps sense scale  (DroneCAN-only)
+
+    // ── Bus / thermal / stall protections ────────────────────────────────────
+    AP_Float _p_v_max;         // regen fully cut at this bus V → l_max_vin
+    AP_Float _p_v_fold;        // OV foldback band [V]          (DroneCAN-only)
+    AP_Float _p_t_start;       // FET derate onset [°C]         → l_temp_fet_start
+    AP_Float _p_t_max;         // FET hard trip [°C]            → l_temp_fet_end
+    AP_Float _p_stall_rpm;     // stall speed threshold [eRPM]  (DroneCAN-only)
+    AP_Float _p_stall_i;       // stall current threshold [A]   (DroneCAN-only)
+    AP_Float _p_stall_t;       // stall dwell before trip [s]   (DroneCAN-only)
 
     // ── Throttle-source arbiter state (each stamps its latest torque + time) ──
     float    _can_amps  = 0.0f;   // last DroneCAN RawCommand torque [A]

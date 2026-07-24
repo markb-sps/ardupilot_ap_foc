@@ -751,6 +751,12 @@ const AP_Param::Info AP_Periph_FW::var_info[] = {
     GSCALAR(servo_command_timeout_ms, "SRV_CMD_TIME_OUT", 200),
 #endif
 
+#ifdef HAL_PERIPH_ENABLE_FOC_ESC
+    // @Group: FOC_
+    // @Path: foc_esc.cpp
+    GOBJECT(foc, "FOC_", FOC_ESC),
+#endif
+
     AP_VAREND
 };
 
