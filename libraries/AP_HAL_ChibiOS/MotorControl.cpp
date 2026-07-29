@@ -19,6 +19,46 @@ constexpr float ADC_LSB_VOLTS   = 3.3f / 4095.0f;
 constexpr uint16_t ZERO_SAMPLES = 64;       // zero-current calibration window
 constexpr uint16_t OC_DEBOUNCE      = 3;    // consecutive over-limit samples before tripping
 constexpr uint16_t OC_BLANK_SAMPLES = 16;   // trip-blank window after the bridge arms
+// Under-voltage samples before the bus trip fires: ONE. There is no safe amount
+// of time to keep driving a bridge whose gate-drive rail is collapsing, so this
+// deliberately does not debounce — the first reading below the floor latches the
+// fault and gates the bridge.
+//
+// What makes a lone sample trustworthy is that the measurement is real by the
+// time the check is armed: the divider is RC filtered in hardware (357k||10k
+// against 100 nF), and _vbus_ready below withholds the protection until that
+// filter has demonstrably settled. Arming against an unsettled node was what
+// produced spurious trips, not the lack of a debounce.
+constexpr uint16_t UV_DEBOUNCE = 1;
+// Consecutive healthy bus samples required before the under-voltage protection
+// arms at all (~50 ms at 20 kHz).
+//
+// The VBUS divider is RC filtered — 357k||10k ≈ 9.7 kOhm against 100 nF, so
+// τ ≈ 1 ms and the node needs ~5 ms to settle. Nothing else in the start-up
+// sequence waits for that: the chime gates on zero_valid(), which depends on the
+// INA181 reference rail, a different and much faster node. So the bridge could
+// arm — and the UV check go live — while the bus measurement was still charging
+// through its own filter, tripping on a reading that had simply not arrived yet.
+// This is a measurement-readiness gate, not a debounce; 50 ms is ~50τ.
+constexpr uint16_t VBUS_READY_SAMPLES = 1000;
+// ── Trip latch / repeat-trip escalation ─────────────────────────────────────
+// Minimum bridge-off time after a trip before the latch may be released, even
+// once the host has commanded zero. Bounds how often a persistent fault can be
+// re-entered: the old behaviour (any command clears the fault) re-armed at the
+// ~1 kHz command rate, turning every protection into a duty-cycle limiter on a
+// destructive condition instead of a shutdown.
+constexpr uint32_t TRIP_REARM_COOLDOWN_MS = 500;
+// A trip landing within this long of the previous one counts as a repeat: the
+// drive is not recovering, it is being re-armed into the same fault.
+constexpr uint32_t TRIP_FORGET_MS         = 5000;
+// Repeats before the cooldown escalates to TRIP_LOCKOUT_MS. Deliberately
+// recoverable rather than absolute — a hard latch needing a power cycle would
+// be worse in the field — but slow enough that a persistent fault can no longer
+// cook the bridge. stop() clears the history immediately.
+constexpr uint8_t  TRIP_MAX_CONSEC        = 3;
+constexpr uint32_t TRIP_LOCKOUT_MS        = 10000;
+// How long a cleared trip keeps being reported to the host (see reported_fault).
+constexpr uint32_t FAULT_REPORT_HOLD_MS   = 5000;
 // At zero current the INA181 outputs sit at the ~1.8 V reference (~2233 counts).
 // If the ref rail (VBUS-derived) is not up yet — e.g. the board booted on USB
 // before the motor supply was applied — the ADC reads ~0. Only begin the zero
@@ -30,7 +70,9 @@ constexpr uint16_t SENSE_ALIVE_COUNTS = 1000;
 constexpr uint16_t SENSE_REF_MAX      = 3200;
 constexpr float TWO_PI          = 6.28318530718f;
 constexpr float PI_F            = 3.14159265359f;
-constexpr float DT_COMP_I_BAND  = 1.0f;     // [A] current band over which dead-time sign() is softened
+// dq-current low-pass coefficient, used only to pick the dead-time correction
+// sign. Matches VESC's MCCONF_FOC_CURRENT_FILTER_CONST.
+constexpr float CURRENT_FILT_K  = 0.1f;
 constexpr float OL_IQ_RAMP_S    = 0.2f;   // capture soft-start: OL current ramp-in time
 
 // ── Hall sensors ────────────────────────────────────────────────────────────
@@ -43,8 +85,22 @@ constexpr float    HALL_HALF_SECTOR   = 0.52359878f;   // 30° electrical [rad]
 constexpr uint8_t  HALL_BREAKAWAY_N   = 2;    // hall transitions confirming motion → release full current
 // Hall-table detection spin: slow current-controlled forced rotation, forward
 // then reverse (averaging both directions cancels the hall hysteresis bias).
-constexpr float    HD_HZ              = 3.0f;  // forced electrical rotation [Hz]
-constexpr float    HD_RAMP_S          = 0.2f;  // detect-current ramp-in / initial align [s]
+// Forced electrical rotation [Hz]. The whole method assumes the rotor TRACKS the
+// commanded vector like a stepper — the recorded sector centre is the circular
+// mean of the COMMANDED angle, so any lag between command and rotor lands
+// straight in the table. 3.0 Hz was too fast for a 6374 rotor to follow against
+// its own cogging and inertia: it snapped detent-to-detent, and the resulting
+// table had 60° sectors scattered from 36° to 94° (one entry ~30° out of place),
+// failing update_hall_table_valid() and silently blocking all HALL drive.
+// VESC steps 1° every 5 ms = 1.8 s per electrical revolution.
+constexpr float    HD_HZ              = 0.556f;  // was 3.0 — matched to VESC
+// Detect-current ramp-in / initial align [s]. This is the rotor's only chance to
+// settle onto the forced vector BEFORE angle recording starts — a rotor still
+// swinging when sampling begins biases every recorded sector angle, and a
+// uniformly biased table passes the geometry check silently (a rotated table has
+// perfect 60° spacing). VESC ramps its detect current over ~1000 ms; 0.2 s here
+// was five times shorter with no reason behind it. Matched to VESC.
+constexpr float    HD_RAMP_S          = 1.0f;
 constexpr float    HD_REVS            = 3.0f;  // electrical revolutions per direction to average over
 
 inline float wrap_pi(float a)
@@ -99,7 +155,7 @@ bool MotorControl::init(const Config &cfg)
     setup.pwm_clock_hz               = cfg.pwm_clock_hz;
     setup.pwm_frequency_hz           = cfg.pwm_frequency_hz;
     setup.current_sample_delay_ticks = cfg.current_sample_delay_ticks;
-    setup.deadtime_ticks             = cfg.deadtime_ticks;
+    setup.deadtime_ns                = cfg.deadtime_ns;
     setup.center_aligned             = cfg.center_aligned;
     setup.break_input_enabled        = cfg.break_input_enabled;
 
@@ -114,6 +170,7 @@ bool MotorControl::init(const Config &cfg)
     _period_ticks              = r.period_ticks;
     _pwm_update_rate_hz        = r.update_rate_hz;
     _current_sense_initialized = r.current_sense_ok;
+    _deadtime_ns               = r.deadtime_ns_actual;
 
     // ── Precompute control constants ───────────────────────────────────────
     _dt            = 1.0f / float(_pwm_update_rate_hz);
@@ -128,18 +185,31 @@ bool MotorControl::init(const Config &cfg)
     _oc_trip_hard  = cfg.overcurrent_trip_hard;
     _regen_max     = cfg.regen_current_max;
     _vbus_max      = cfg.vbus_max;
-    _vbus_fold_inv = (cfg.vbus_fold_band > 0.1f) ? (1.0f / cfg.vbus_fold_band) : 10.0f;
+    // Under-voltage floor, held below vbus_max by at least the foldback band so
+    // the two limits can never invert (which would fold the drive to zero at
+    // every bus voltage).
+    _vbus_min      = (cfg.vbus_min < cfg.vbus_max - cfg.vbus_fold_band)
+                         ? cfg.vbus_min : (cfg.vbus_max - cfg.vbus_fold_band);
+    _vbus_fold_inv   = (cfg.vbus_fold_band > 0.1f) ? (1.0f / cfg.vbus_fold_band) : 10.0f;
+    _vbus_uvfold_inv = (cfg.vbus_uv_fold_band > 0.1f) ? (1.0f / cfg.vbus_uv_fold_band) : 10.0f;
     _mode_switch_i = cfg.mode_switch_current;
     // vbus-dependent constants: seeded from cfg.vbus here, recomputed each ISR
     // cycle from the measured, filtered bus voltage.
     _vbus_flt      = cfg.vbus;
-    _mod_to_vmax   = cfg.max_modulation * 0.57735026919f; // /√3
-    _dt_comp_volts = cfg.deadtime_comp_volts;
+    // Duty ceiling first: the linear modulation range must not be able to demand
+    // more duty than the hard clamp allows, or write_duties() would be saturating
+    // continuously and the current PI would wind up against a limit it can't see.
+    // With min-max zero-sequence injection the peak phase duty is
+    //   d_max = 0.5 + 0.5·max_modulation
+    // so cap max_modulation at 2·(duty_max − 0.5) and the two stay consistent.
+    _duty_max = clampf(cfg.duty_max, 0.55f, 0.98f);
+    const float mod_ceiling = 2.0f * (_duty_max - 0.5f);
+    const float eff_max_mod = (cfg.max_modulation < mod_ceiling) ? cfg.max_modulation : mod_ceiling;
+    _mod_to_vmax   = eff_max_mod * 0.57735026919f; // /√3
+    _dt_comp_volts   = cfg.deadtime_comp_volts;
+    _dt_comp_on_duty = cfg.deadtime_comp_on_duty;
     _v_max         = _mod_to_vmax * cfg.vbus;
     _inv_vbus_half = 2.0f / cfg.vbus;
-    // Dead-time comp: convert the lost voltage [V] into a per-phase duty step
-    // (phase-to-midpoint voltage = (duty-0.5)·vbus, so Δduty = ΔV / vbus).
-    _dt_comp_duty  = (cfg.vbus > 0.0f) ? (cfg.deadtime_comp_volts / cfg.vbus) : 0.0f;
 
     _fet_t_start = cfg.fet_temp_start;
     _fet_t_max   = (cfg.fet_temp_max > cfg.fet_temp_start + 1.0f)
@@ -226,6 +296,7 @@ void MotorControl::reset_control()
     _track_timer = 0.0f;
     _lock_count = 0;
     _v_alpha_prev = _v_beta_prev = 0.0f;
+    _id_filt = _iq_filt = 0.0f;
     _obs_x1 = _obs_x2 = _obs_theta = _obs_omega = 0.0f;
     _pll_theta = 0.0f;
     _stall_timer = 0.0f;
@@ -241,13 +312,117 @@ void MotorControl::reset_control()
     _hall_move_count = 0;
 }
 
+// Gate the output stage off (bare MOE clear) and mark the bridge disarmed so
+// the next arm_bridge() re-applies the overcurrent blanking window. ISR-safe.
+void MotorControl::gate_off()
+{
+    stm32_foc_motor_control_disable_outputs_isr();
+    _outputs_on = false;
+}
+
+// Enforce the per-phase duty ceiling, then write the CCRs. Every drive path
+// funnels through here so none can bypass the limit.
+//
+// The ceiling exists because the high side is bootstrapped: the MP1918 refills
+// BST only while SW is pulled low, and its BST-SW ESD clamp actively bleeds the
+// cap down, so a phase parked near 100% duty loses its high-side rail and drops
+// the FET on UVLO with no warning to the firmware. The low-side conduction
+// window it guarantees is also exactly what the shunt ADC needs to sample in.
+//
+// Excess is removed as a COMMON-MODE shift rather than by clipping the offending
+// phase: the zero sequence is free in a 3-wire motor, so shifting all three
+// equally preserves every line-to-line voltage — and therefore the applied
+// vector — exactly, where per-phase clipping would distort it and make the
+// current PI fight a disturbance it can't observe.
+void MotorControl::write_duties(float da, float db, float dc)
+{
+    const float d_hi = fmaxf(da, fmaxf(db, dc));
+    if (d_hi > _duty_max) {
+        const float shift = d_hi - _duty_max;
+        da -= shift;
+        db -= shift;
+        dc -= shift;
+    }
+    // Backstop. The vector is already bounded by _v_max (derived from _duty_max
+    // in init), so a shift big enough to drive a phase negative shouldn't be
+    // reachable — clip rather than hand a wrapped value to the CCR cast.
+    da = clampf(da, 0.0f, _duty_max);
+    db = clampf(db, 0.0f, _duty_max);
+    dc = clampf(dc, 0.0f, _duty_max);
+
+    const float pf = float(_period_ticks);
+    stm32_foc_motor_control_write_pwm(uint16_t(da * pf), uint16_t(db * pf), uint16_t(dc * pf));
+}
+
+void MotorControl::arm_bridge()
+{
+    if (_outputs_on) {
+        return;   // already driving — do NOT re-blank the overcurrent trip
+    }
+    _oc_over_count = 0;
+    _oc_blank      = OC_BLANK_SAMPLES;
+    _outputs_on    = true;
+    stm32_foc_motor_control_enable_outputs();
+}
+
+// Thread context. See the header for the contract.
+bool MotorControl::fault_gate(bool release, uint32_t now_ms)
+{
+    if (!_fault_latched) {
+        return true;
+    }
+    if (!_trip_seen) {
+        // Book the trip once, thread-side (the ISR only sets the latch).
+        _trip_seen = true;
+        const bool repeat = (_last_trip_ms != 0) && ((now_ms - _last_trip_ms) < TRIP_FORGET_MS);
+        _trip_count   = repeat ? uint8_t((_trip_count < 255) ? _trip_count + 1 : 255) : 1;
+        _last_trip_ms = now_ms;
+        _rearm_ok_ms  = now_ms + ((_trip_count >= TRIP_MAX_CONSEC)
+                                      ? TRIP_LOCKOUT_MS
+                                      : TRIP_REARM_COOLDOWN_MS * _trip_count);
+    }
+    // A live (nonzero) command must NEVER clear a trip, and even a release only
+    // counts once the cooldown has run — so a host that streams zero between
+    // throttle applications still can't shorten the bridge-off time.
+    if (!release || int32_t(now_ms - _rearm_ok_ms) < 0) {
+        return false;
+    }
+    _fault_latched = false;
+    _fault_code    = FAULT_NONE;
+    _trip_seen     = false;
+    // Park the drive so the re-arm after this release starts from zero rather
+    // than from the set-point that was live when the fault tripped.
+    _mode               = Mode::STOP;
+    _cmd_current        = 0.0f;
+    _cmd_current_target = 0.0f;
+    return false;   // released on this call; the next command may arm
+}
+
 void MotorControl::trip_fault(uint8_t code)
 {
-    // ISR context: cut the output stage immediately via a bare MOE clear.
-    stm32_foc_motor_control_disable_outputs_isr();
-    _fault_code = code;
-    _state      = State::FAULT;
+    // ISR context: cut the output stage immediately via a bare MOE clear. The
+    // latch keeps it off until the host releases (see fault_gate).
+    gate_off();
+    _fault_code    = code;
+    _fault_latched = true;
+    _fault_last    = code;                 // sticky, for host reporting
+    _fault_last_ms = AP_HAL::millis();     // ISR-safe (systick read)
+    _state         = State::FAULT;
     reset_control();
+}
+
+// See header. Holds a cleared trip in the reported field long enough for a
+// polling host to actually see it.
+uint8_t MotorControl::reported_fault() const
+{
+    if (_fault_code != FAULT_NONE) {
+        return _fault_code;
+    }
+    if (_fault_last != FAULT_NONE &&
+        (AP_HAL::millis() - _fault_last_ms) < FAULT_REPORT_HOLD_MS) {
+        return _fault_last;
+    }
+    return FAULT_NONE;
 }
 
 // Bridge held off (STOP / latched fault): truly high-Z the outputs (MOE=0) so
@@ -257,18 +432,19 @@ void MotorControl::trip_fault(uint8_t code)
 void MotorControl::hold_off(State s)
 {
     reset_control();
-    stm32_foc_motor_control_disable_outputs_isr();
+    gate_off();
     stm32_foc_motor_control_write_pwm(0, 0, 0);
     _state = s;
     _t_id = _t_iq = _t_vd = _t_vq = _t_duty = _t_erpm = 0.0f;
     _v_alpha_prev = _v_beta_prev = 0.0f;
+    _id_filt = _iq_filt = 0.0f;
 }
 
 void MotorControl::enable_outputs()
 {
 #if HAL_USE_PWM == TRUE && STM32_PWM_USE_TIM1 == TRUE
     if (_initialized) {
-        stm32_foc_motor_control_enable_outputs();
+        arm_bridge();
     }
 #endif
 }
@@ -277,6 +453,7 @@ void MotorControl::disable_outputs()
 {
 #if HAL_USE_PWM == TRUE && STM32_PWM_USE_TIM1 == TRUE
     if (_initialized) {
+        _outputs_on = false;
         stm32_foc_motor_control_disable_outputs();
     }
 #endif
@@ -338,19 +515,39 @@ bool MotorControl::mode_change_allowed(Mode target) const
 
 void MotorControl::set_current(float amps)
 {
+    const uint32_t now_ms = AP_HAL::millis();
+    _last_cmd_ms = now_ms;            // still a live host even when held off
+    const bool release = fabsf(amps) < 0.01f;
+
+    // Clear the start lockout HERE, before the fault gate, not in the release
+    // block further down. fault_gate() returns false on EVERY release path —
+    // including the one that successfully clears the fault — so set_current()
+    // returns early and never reached the clear below. The result was a
+    // permanently unclearable lockout: the fault code cleared (telemetry then
+    // reported fault=0), but every subsequent nonzero command was still
+    // silently refused at the _ol_locked_out check, leaving the controller in
+    // IDLE with no torque, no fault, and no way out but a power cycle.
+    if (release) {
+        _ol_locked_out = false;
+        _ol_attempts   = 0;
+    }
+
+    // A trip is a shutdown, not a blip. Only a zero/stop command clears one, and
+    // only after the re-arm cooldown — a nonzero command never does. Clearing on
+    // every command re-armed the bridge into live faults at the ~1 kHz command
+    // rate, which is what destroyed the previous power stages.
+    if (!fault_gate(release, now_ms)) {
+        return;
+    }
     // Sensorless-start lockout: after too many failed forced starts the bridge is
     // latched off (thermal cap). A nonzero command must NOT clear it — otherwise
     // the arbiter re-commanding every loop would retry forever. Only a zero/stop
     // command (below) releases it.
-    if (_ol_locked_out && fabsf(amps) >= 0.01f) {
-        _last_cmd_ms = AP_HAL::millis();  // still a live host, just held off
+    if (_ol_locked_out && !release) {
         return;
     }
-    _last_cmd_ms = AP_HAL::millis();
-    _fault_code  = FAULT_NONE;        // any host current command clears a latched trip
-    if (fabsf(amps) < 0.01f) {
-        _ol_locked_out = false;       // throttle released → clear the start lockout
-        _ol_attempts   = 0;
+    if (release) {
+        // (lockout already cleared above, before the fault gate)
         // Zero command: while running keep the loop alive at iq=0 (current loop
         // drives vd/vq to hold zero current → smooth coast, no bridge cliff-cut).
         // From idle/fault, stay idle so a zero command can't spin the motor up.
@@ -373,8 +570,7 @@ void MotorControl::set_current(float amps)
     }
     _cmd_current_target = clampf(amps, -_current_max, _current_max);
     _mode = Mode::CURRENT;                      // set mode first so a racing ISR sees CURRENT not STOP
-    _oc_over_count = 0; _oc_blank = OC_BLANK_SAMPLES;
-    stm32_foc_motor_control_enable_outputs();   // re-arm bridge if previously released
+    arm_bridge();                               // re-arm bridge if previously released
 }
 
 // VESC COMM_SET_CURRENT_BRAKE: apply iq opposite to rotation for regenerative
@@ -383,12 +579,15 @@ void MotorControl::set_current(float amps)
 // drops below the safe-release threshold (see adc_sample_isr).
 void MotorControl::set_brake_current(float amps)
 {
-    _last_cmd_ms = AP_HAL::millis();
-    _fault_code  = FAULT_NONE;
+    const uint32_t now_ms = AP_HAL::millis();
+    _last_cmd_ms = now_ms;
     const float mag = fabsf(amps);
-    if (mag < 0.01f) {           // zero brake ≡ coast
+    if (mag < 0.01f) {           // zero brake ≡ coast (and releases a latched trip)
         set_current(0.0f);
         return;
+    }
+    if (!fault_gate(false, now_ms)) {
+        return;                  // latched trip: a live brake command must not clear it
     }
     _cmd_current = (mag > _regen_max) ? _regen_max : mag;  // magnitude, capped to regen limit
     _mode = Mode::BRAKE;
@@ -396,24 +595,26 @@ void MotorControl::set_brake_current(float amps)
 
 void MotorControl::set_rpm(float erpm)
 {
-    _last_cmd_ms = AP_HAL::millis();
+    const uint32_t now_ms = AP_HAL::millis();
+    _last_cmd_ms = now_ms;
     if (fabsf(erpm) < 1.0f) {    // zero command = explicit stop (also clears a latched fault)
         stop();
+        return;
+    }
+    // A live RPM command must not clear a latched trip: doing so armed the bridge
+    // for one cycle per packet before the fault path cut it again — a short-brake
+    // blip at the command rate. An RPM-streaming host recovers by commanding zero
+    // (or stop), which releases the latch once the cooldown has run.
+    if (!fault_gate(false, now_ms)) {
         return;
     }
     // Refuse a hot swap from another active controller under load (see set_current).
     if (!mode_change_allowed(Mode::SPEED)) {
         return;
     }
-    // Clear a latched trip like set_current does — without this a stall fault
-    // is unrecoverable for an RPM-streaming host: each packet would arm the
-    // bridge for one cycle before the fault path cuts it (a short-brake blip at
-    // the command rate), and the fault never clears.
-    _fault_code = FAULT_NONE;
     _cmd_erpm = erpm;
     _mode = Mode::SPEED;
-    _oc_over_count = 0; _oc_blank = OC_BLANK_SAMPLES;
-    stm32_foc_motor_control_enable_outputs();
+    arm_bridge();
 }
 
 void MotorControl::check_command_timeout(uint32_t now_ms)
@@ -428,29 +629,45 @@ void MotorControl::notify_host_alive()
     _last_cmd_ms = AP_HAL::millis();
 }
 
+// Explicit host stop: the one command that clears everything immediately —
+// latched trip, re-arm cooldown and the repeat-trip history. This is the
+// deliberate operator-level reset; ordinary throttle release goes through
+// fault_gate() and still has to wait out the cooldown.
 void MotorControl::stop()
 {
     _mode = Mode::STOP;
-    _fault_code = FAULT_NONE;   // clear latched fault on explicit stop
-    _ol_attempts = 0;           // fresh sensorless-start retry budget
-    _ol_cooldown = 0.0f;
+    _cmd_current        = 0.0f;
+    _cmd_current_target = 0.0f;
+    _fault_code    = FAULT_NONE;
+    _fault_latched = false;
+    _fault_last    = FAULT_NONE;   // explicit stop also clears the sticky report
+    _trip_seen     = false;
+    _trip_count    = 0;
+    _last_trip_ms  = 0;
+    _rearm_ok_ms   = 0;
+    _ol_attempts   = 0;         // fresh sensorless-start retry budget
+    _ol_cooldown   = 0.0f;
     _ol_locked_out = false;
 }
 
 void MotorControl::set_debug_voltage(float duty)
 {
-    _last_cmd_ms = AP_HAL::millis();
+    const uint32_t now_ms = AP_HAL::millis();
+    _last_cmd_ms = now_ms;
     const float a = fabsf(duty);
+    // Same rule as the real set-points: a zero-duty command releases a latched
+    // trip (after the cooldown), a live one never does.
+    if (!fault_gate(a < 0.001f, now_ms)) {
+        return;
+    }
     if (a < 0.001f) {
         _mode = Mode::STOP;
         return;
     }
     _debug_mod = (a > _debug_max_mod) ? _debug_max_mod : a;
     _debug_dir = (duty >= 0.0f) ? 1.0f : -1.0f;
-    _fault_code = FAULT_NONE;   // a fresh debug command clears a latched trip
     _mode = Mode::DEBUG_VOLTAGE;
-    _oc_over_count = 0; _oc_blank = OC_BLANK_SAMPLES;
-    stm32_foc_motor_control_enable_outputs();
+    arm_bridge();
 }
 
 // Play a tone through the motor (see header). A fixed-axis (α) voltage vector
@@ -459,7 +676,10 @@ void MotorControl::set_debug_voltage(float duty)
 // through the ~55 mΩ winding resistance (the hard OC trip still backstops it).
 void MotorControl::play_tone(float freq_hz, float amplitude, uint16_t duration_ms)
 {
-    if (!_initialized || duration_ms == 0) {
+    // A tone is never a reason to re-arm a tripped bridge — refuse while a fault
+    // is latched rather than clearing it (the power-on chime in particular must
+    // not put current back into a faulted power stage).
+    if (!_initialized || duration_ms == 0 || _fault_latched) {
         return;
     }
     if (freq_hz < 200.0f) freq_hz = 200.0f;   // keep inductive reactance meaningful
@@ -467,10 +687,8 @@ void MotorControl::play_tone(float freq_hz, float amplitude, uint16_t duration_m
     _beep_phase_step = TWO_PI * freq_hz * _dt;
     _beep_amp        = clampf(amplitude, 0.0f, _debug_max_mod);
     _beep_ticks_left = uint32_t(duration_ms) * (_pwm_update_rate_hz / 1000U);
-    _fault_code      = FAULT_NONE;
     _mode            = Mode::BEEP;
-    _oc_over_count = 0; _oc_blank = OC_BLANK_SAMPLES;
-    stm32_foc_motor_control_enable_outputs();
+    arm_bridge();
 }
 
 // ── ISR path ────────────────────────────────────────────────────────────────
@@ -518,26 +736,66 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
     _adc_sample_cb_count++;
 
     // ── Bus voltage tracking ────────────────────────────────────────────────
-    // Filter the measured vbus (τ ≈ 5 ms at 20 kHz) and recompute the
-    // vbus-dependent constants each cycle, so the volts→duty conversion and the
-    // observer's assumed applied voltage stay correct whatever the actual
-    // supply is. Below the plausible-supply floor keep the last good value.
+    // Recompute the vbus-dependent constants each cycle so the volts→duty
+    // conversion and the observer's assumed applied voltage stay correct
+    // whatever the actual supply is.
+    //
+    // The filter tracks ASYMMETRICALLY: slow up (τ ≈ 5 ms, for noise immunity on
+    // the modulation math) but fast down (τ ≈ 0.5 ms). A supply hitting its
+    // current limit collapses in well under 5 ms, and lagging that sag means
+    // computing duties against a bus that is no longer there. Erring toward the
+    // lower reading is also the safe direction — it under-modulates.
+    const float vraw = stm32_foc_vbus_read_volts();
     {
-        const float vraw = stm32_foc_vbus_read_volts();
+        _vbus_raw_v = vraw;
         if (vraw > 6.0f) {
-            _vbus_flt += (vraw - _vbus_flt) * 0.01f;
+            if (!_vbus_valid) {
+                // First plausible reading: SNAP the filter to it. _vbus_flt is
+                // seeded with the configured nominal, so ramping from that seed
+                // would drag the derived limits (_v_max, uv_scale) through a
+                // transient that never physically happened.
+                _vbus_valid = true;
+                _vbus_flt   = vraw;
+            } else {
+                _vbus_flt += (vraw - _vbus_flt) * ((vraw < _vbus_flt) ? 0.1f : 0.01f);
+            }
+        }
+        // Measurement-readiness latch: the RC-filtered divider needs ~5 ms to
+        // settle, and nothing else in start-up waits for it (see
+        // VBUS_READY_SAMPLES). Until the bus has read healthy continuously, a low
+        // sample means "not measured yet" and must not arm the protections.
+        if (!_vbus_ready) {
+            if (vraw >= _vbus_min) {
+                if (++_vbus_ready_count >= VBUS_READY_SAMPLES) {
+                    _vbus_ready = true;
+                }
+            } else {
+                _vbus_ready_count = 0;
+            }
         }
         const float inv_vbus = 1.0f / _vbus_flt;
         _inv_vbus_half = 2.0f * inv_vbus;
         _v_max         = _mod_to_vmax * _vbus_flt;
-        _dt_comp_duty  = _dt_comp_volts * inv_vbus;
         _vbus          = _vbus_flt;
     }
     // Bus-OV regen foldback: scales any decelerating (bus-charging) current
     // from full at (vbus_max - band) to zero at vbus_max.
     const float ov_scale = clampf((_vbus_max - _vbus_flt) * _vbus_fold_inv, 0.0f, 1.0f);
+    // Bus-UV foldback: the mirror image, on MOTORING current — that is what
+    // loads the supply. As the bus sags toward vbus_min the torque command is
+    // scaled back, which unloads the supply and lets it recover: a negative
+    // feedback that settles at whatever the PSU can actually deliver, instead of
+    // collapsing into the hard trip below and oscillating trip/re-arm. Uses its
+    // own band (see Config::vbus_uv_fold_band) — sharing the OV band put the
+    // onset within a volt of nominal and quietly derated torque on any sag.
+    // Gated on _vbus_ready for the same reason as the trip: before the divider
+    // has settled, derating against an unsettled reading would silently crush the
+    // torque limit toward zero on a bus that is actually fine.
+    const float uv_scale = _vbus_ready
+                               ? clampf((_vbus_flt - _vbus_min) * _vbus_uvfold_inv, 0.0f, 1.0f)
+                               : 1.0f;
     // Thermal derate of the iq limit (thread-computed from the board NTC).
-    const float i_max = _current_max * _i_derate;
+    const float i_max = _current_max * _i_derate * uv_scale;
 
     // ── Phase currents ──────────────────────────────────────────────────────
     // Low-side shunt polarity: positive phase current pulls the amplified ADC
@@ -580,6 +838,34 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
         }
     } else {
         _oc_over_count = 0;
+    }
+
+    // ── Bus under-voltage trip ──────────────────────────────────────────────
+    // Checked only while the bridge is armed, and against the RAW sample rather
+    // than _vbus_flt: a collapse outruns even the fast-tracking filter, and this
+    // is the one protection that must not lag. Debounced a few samples so a
+    // single noisy conversion can't gate the drive.
+    //
+    // There is no lower guard on vraw — a reading near zero while driving is
+    // itself the fault (either the bus is gone or the divider has failed), and
+    // in both cases the safe response is the same: stop driving.
+    if (_outputs_on && _vbus_ready) {
+        // Record what the trip actually saw — the single most useful number when
+        // an under-voltage fires unexpectedly, since the filtered value reported
+        // to the host can differ from this by a lot.
+        if (vraw < _vbus_min_seen) {
+            _vbus_min_seen = vraw;
+        }
+        if (vraw < _vbus_min) {
+            if (++_uv_count >= UV_DEBOUNCE) {
+                trip_fault(FAULT_UNDER_VOLTAGE);
+                return;
+            }
+        } else {
+            _uv_count = 0;
+        }
+    } else {
+        _uv_count = 0;
     }
 
     float i_alpha, i_beta;
@@ -629,8 +915,7 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
         FOC::inv_clarke(m_alpha, m_beta, va, vb, vc);
         float da, db, dc;
         FOC::svpwm(va, vb, vc, da, db, dc);
-        const float pf = float(_period_ticks);
-        stm32_foc_motor_control_write_pwm(uint16_t(da * pf), uint16_t(db * pf), uint16_t(dc * pf));
+        write_duties(da, db, dc);
 
         const float vbus_half = _vbus * 0.5f;
         _v_alpha_prev = m_alpha * vbus_half;   // applied volts → observer next cycle
@@ -653,8 +938,7 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
         FOC::inv_clarke(m_alpha, m_beta, va, vb, vc);
         float da, db, dc;
         FOC::svpwm(va, vb, vc, da, db, dc);
-        const float pf = float(_period_ticks);
-        stm32_foc_motor_control_write_pwm(uint16_t(da * pf), uint16_t(db * pf), uint16_t(dc * pf));
+        write_duties(da, db, dc);
 
         const float vbus_half = _vbus * 0.5f;
         _v_alpha_prev = m_alpha * vbus_half;   // applied volts → observer next cycle
@@ -702,6 +986,8 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
         // anti-windup / vector clamp as the main current loop below.
         float id_m, iq_m;
         FOC::park(i_alpha, i_beta, st, ct, id_m, iq_m);
+        _id_filt += (id_m - _id_filt) * CURRENT_FILT_K;
+        _iq_filt += (iq_m - _iq_filt) * CURRENT_FILT_K;
         _integ_d = clampf(_integ_d + (id_target - id_m) * _cur_ki_dt, -_v_max, _v_max);
         _integ_q = clampf(_integ_q + (0.0f      - iq_m) * _cur_ki_dt, -_v_max, _v_max);
         float vd = clampf((id_target - id_m) * _cur_kp + _integ_d,
@@ -718,10 +1004,17 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
         float va, vb, vc, da, db, dc;
         FOC::inv_clarke(m_alpha, m_beta, va, vb, vc);
         FOC::svpwm(va, vb, vc, da, db, dc);
-        const float pf = float(_period_ticks);
-        stm32_foc_motor_control_write_pwm(uint16_t(da * pf), uint16_t(db * pf), uint16_t(dc * pf));
-        _v_alpha_prev = v_alpha;   // keep the observer input sane during the spin
-        _v_beta_prev  = v_beta;
+        // Same dead-time treatment as the main loop — VESC's hall detect reuses
+        // control_current() outright, so it gets this for free; ours duplicates
+        // the modulation, and the two must not drift apart. This sweep runs at
+        // the lowest modulation of any mode, so it is where the uncompensated
+        // dead-band distorts the applied vector most.
+        dt_comp_apply_duties(st, ct, da, db, dc);
+        write_duties(da, db, dc);
+        float dv_alpha_hd, dv_beta_hd;
+        dt_comp_alpha_beta(st, ct, dv_alpha_hd, dv_beta_hd);
+        _v_alpha_prev = v_alpha - dv_alpha_hd;  // keep the observer input sane during the spin
+        _v_beta_prev  = v_beta  - dv_beta_hd;
 
         // Record ALL states 0..7 (the valid six are motor-specific — this motor
         // uses {0,1,2,5,6,7}, others {1..6} — we don't presume which), but only
@@ -823,7 +1116,7 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
     // TRACK/hysteresis path below re-arms the next forced attempt.
     if (_ol_cooldown > 0.0f) {
         _ol_cooldown -= _dt;
-        stm32_foc_motor_control_disable_outputs_isr();
+        gate_off();
         stm32_foc_motor_control_write_pwm(0, 0, 0);
         _state = State::IDLE;
         _t_id = _t_iq = _t_vd = _t_vq = _t_duty = 0.0f;
@@ -937,6 +1230,11 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
     const float cos_t = cosf(theta);
     float id, iq;
     FOC::park(i_alpha, i_beta, sin_t, cos_t, id, iq);
+    // Low-pass the dq currents purely to give the dead-time correction a stable
+    // sign (VESC id_filter/iq_filter). The control loop itself still uses the
+    // unfiltered id/iq — this must not add lag to the current regulator.
+    _id_filt += (id - _id_filt) * CURRENT_FILT_K;
+    _iq_filt += (iq - _iq_filt) * CURRENT_FILT_K;
 
     // ── Stall protection ────────────────────────────────────────────────────
     // SENSORLESS/CLOSED: during the open-loop override the observer is seeded to
@@ -993,38 +1291,38 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
     float da, db, dc;
     FOC::svpwm(va, vb, vc, da, db, dc);
 
-    // ── Dead-time compensation ──────────────────────────────────────────────
-    // During the bridge's dead-time (both FETs briefly off at each switch-over)
+    dt_comp_apply_duties(sin_t, cos_t, da, db, dc);
+    write_duties(da, db, dc);
+
+    // ── Dead-time handling ──────────────────────────────────────────────────
+    // During the bridge's dead time (both FETs briefly off at each switch-over)
     // the phase current — not the PWM — sets the output: a phase sourcing
-    // current (i>0) gets pulled low, so it delivers LESS voltage than commanded;
-    // a phase sinking current (i<0) gets pulled high and delivers MORE. The
-    // error is a roughly fixed magnitude (_dt_comp_duty, = V_dt/vbus) whose sign
-    // follows the phase current. We cancel it by nudging each phase's duty in
-    // the SAME direction as its current: add duty where i>0, subtract where i<0.
+    // current (i>0) gets pulled low and so delivers LESS voltage than commanded;
+    // a phase sinking current (i<0) gets pulled high and delivers MORE.
     //
-    // sign(i) is softened to a linear ramp across ±DT_COMP_I_BAND amps so the
-    // correction doesn't chatter at the current zero-crossing, where both the
-    // current sign and the dead-time effect itself are ill-defined.
+    // Two places that error can be dealt with, selected by
+    // cfg.deadtime_comp_on_duty:
     //
-    // This makes the *delivered* voltage match the desired v_alpha/v_beta, which
-    // is exactly what the observer assumes — so the observer's angle estimate
-    // stays accurate even at low speed, where the lost ~0.1V was otherwise a
-    // large fraction of the back-EMF and pushed the sensorless floor up.
-    if (_dt_comp_duty > 0.0f) {
-        constexpr float inv_band = 1.0f / DT_COMP_I_BAND;
-        da = clampf(da + clampf(ia * inv_band, -1.0f, 1.0f) * _dt_comp_duty, 0.0f, 1.0f);
-        db = clampf(db + clampf(ib * inv_band, -1.0f, 1.0f) * _dt_comp_duty, 0.0f, 1.0f);
-        dc = clampf(dc + clampf(ic * inv_band, -1.0f, 1.0f) * _dt_comp_duty, 0.0f, 1.0f);
-    }
-
-    const float pf = float(_period_ticks);
-    stm32_foc_motor_control_write_pwm(uint16_t(da * pf), uint16_t(db * pf), uint16_t(dc * pf));
-
-    // Applied voltage for the next observer iteration. With dead-time comp on,
-    // the delivered voltage ≈ this desired value, so no separate correction is
-    // needed on the observer input.
-    _v_alpha_prev = v_alpha;
-    _v_beta_prev  = v_beta;
+    //   duty feed-forward (default) — dt_comp_apply_duties() above already
+    //     nudged the duties so the bridge delivers what was asked. The observer
+    //     then wants the COMMANDED voltage, and dt_comp_alpha_beta() returns
+    //     zero so nothing is subtracted twice.
+    //
+    //   observer-side (VESC) — the duties go out untouched and the estimate of
+    //     what was applied is corrected instead. This is what vedderb/bldc does:
+    //     mod_alpha_raw/mod_beta_raw reach foc_svm() unmodified, while
+    //     update_valpha_vbeta() subtracts the dead-time term only from the
+    //     modulation used to derive state->v_alpha/v_beta ("Note that these are
+    //     not used to control the switching times", mcpwm_foc.c).
+    //
+    // VESC gets away with the second because its current loop closes on measured
+    // current and absorbs the error. Ours has to push through a low-current hall
+    // break-away phase where V_dt is a large fraction of the total drive, so the
+    // feed-forward earns its keep — leaving it out measurably cost torque here.
+    float dv_alpha, dv_beta;
+    dt_comp_alpha_beta(sin_t, cos_t, dv_alpha, dv_beta);
+    _v_alpha_prev = v_alpha - dv_alpha;   // applied αβ volts → observer next cycle
+    _v_beta_prev  = v_beta  - dv_beta;
 
     // ── Telemetry snapshots ─────────────────────────────────────────────────
     _t_id    = id;
@@ -1034,6 +1332,70 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
     _t_duty  = sqrtf(m_alpha * m_alpha + m_beta * m_beta); // modulation depth (1.0 ≈ full)
     _t_erpm  = omega_ctrl * _w_to_erpm;
     _t_theta = theta;
+}
+
+// Dead-time voltage error projected into αβ, for subtracting from the commanded
+// voltage to get what the bridge actually delivered. Mirrors vedderb/bldc
+// update_valpha_vbeta():
+//     mod_alpha_sgn = 1/3·(2·sgn(ia) − sgn(ib) − sgn(ic))
+//     mod_beta_sgn  = 1/√3·(sgn(ib) − sgn(ic))
+// which is just the Clarke transform of the per-phase error, each phase being
+// off by ±V_dt = ±t_dead·f_sw·vbus depending on its current direction.
+//
+// Scale note: VESC expresses this in its own modulation units (mod 1 ≡ ⅔·vbus,
+// factor foc_dt_us·foc_f_zv), so its volt-domain magnitude works out to ⅔·V_dt.
+// We keep our physically-derived V_dt (cfg.deadtime_comp_volts) rather than
+// copying that ⅔ — in VESC foc_dt_us is a hand-tuned knob that absorbs the
+// convention, whereas ours is computed from the real dead time.
+//
+// Sign comes from the FILTERED dq currents rotated back to phase currents, not
+// the raw samples: at the zero-crossing the raw sign chatters, and chatter here
+// would inject noise straight into the observer's voltage input.
+void MotorControl::dt_comp_phase_signs(float sin_t, float cos_t,
+                                       float &sa, float &sb, float &sc) const
+{
+    float ia_f, ib_f;
+    FOC::inv_park(_id_filt, _iq_filt, sin_t, cos_t, ia_f, ib_f);   // dq → αβ
+    float pa, pb, pc;
+    FOC::inv_clarke(ia_f, ib_f, pa, pb, pc);                       // αβ → abc
+    sa = (pa >= 0.0f) ? 1.0f : -1.0f;
+    sb = (pb >= 0.0f) ? 1.0f : -1.0f;
+    sc = (pc >= 0.0f) ? 1.0f : -1.0f;
+}
+
+void MotorControl::dt_comp_alpha_beta(float sin_t, float cos_t,
+                                      float &dv_alpha, float &dv_beta) const
+{
+    if (_dt_comp_volts <= 0.0f || _dt_comp_on_duty) {
+        // Nothing to correct: either disabled, or the duties were already
+        // compensated so the commanded voltage IS the delivered voltage.
+        dv_alpha = dv_beta = 0.0f;
+        return;
+    }
+    float sa, sb, sc;
+    dt_comp_phase_signs(sin_t, cos_t, sa, sb, sc);
+    dv_alpha = _dt_comp_volts * (1.0f / 3.0f) * (2.0f * sa - sb - sc);
+    dv_beta  = _dt_comp_volts * 0.57735026919f * (sb - sc);
+}
+
+// Feed-forward form: nudge each phase's duty in the SAME direction as its
+// current (add where i>0, subtract where i<0) so the bridge actually delivers
+// the commanded voltage. Clamped to [0,1] only — write_duties() owns the real
+// ceiling and shifts all three together, which preserves the zero-sequence
+// relationship SVPWM just established. Clamping to _duty_max here instead would
+// saturate one phase early and distort the vector.
+void MotorControl::dt_comp_apply_duties(float sin_t, float cos_t,
+                                        float &da, float &db, float &dc) const
+{
+    if (_dt_comp_volts <= 0.0f || !_dt_comp_on_duty || _inv_vbus_half <= 0.0f) {
+        return;
+    }
+    const float step = _dt_comp_volts * _inv_vbus_half * 0.5f;   // = V_dt / vbus
+    float sa, sb, sc;
+    dt_comp_phase_signs(sin_t, cos_t, sa, sb, sc);
+    da = clampf(da + sa * step, 0.0f, 1.0f);
+    db = clampf(db + sb * step, 0.0f, 1.0f);
+    dc = clampf(dc + sc * step, 0.0f, 1.0f);
 }
 
 // Ortega flux-linkage observer (vedderb/bldc foc_observer_update).
@@ -1227,6 +1589,7 @@ bool MotorControl::run_sensorless(Mode mode, float dir, float iq_cmd,
             if (_ol_attempts >= _ol_max_attempts) {
                 _ol_locked_out = true;         // stop retrying until throttle released
                 _fault_code    = FAULT_STALL;
+                _fault_latched = true;
                 hold_off(State::FAULT);        // (counters/lockout survive reset_control)
                 return false;
             }
@@ -1381,7 +1744,10 @@ bool MotorControl::update_hall()
 // while it is in progress (it would coast the spin early).
 void MotorControl::start_hall_detect()
 {
-    if (!_initialized) {
+    // Refuse while a trip is latched rather than clearing it: detection drives
+    // real current into the motor, so the host must release the fault (command
+    // zero/stop) before asking for a spin.
+    if (!_initialized || _fault_latched) {
         return;
     }
     for (uint8_t k = 0; k < 8; k++) {
@@ -1393,10 +1759,8 @@ void MotorControl::start_hall_detect()
     _hall_detect_done = false;
     _integ_d = _integ_q = 0.0f;   // detection runs the current PI — start clean
     _last_cmd_ms = AP_HAL::millis();
-    _fault_code  = FAULT_NONE;
     _mode        = Mode::HALL_DETECT;
-    _oc_over_count = 0; _oc_blank = OC_BLANK_SAMPLES;
-    stm32_foc_motor_control_enable_outputs();
+    arm_bridge();
 }
 
 bool MotorControl::hall_detect_result(float out_deg[8]) const

@@ -38,6 +38,9 @@ constexpr ChimeNote CHIME[] = { {1047, 120}, {1319, 120}, {1568, 200} };  // C6�
 constexpr uint8_t   CHIME_LEN       = sizeof(CHIME) / sizeof(CHIME[0]);
 constexpr float     CHIME_AMPLITUDE = 0.08f;  // modulation fraction (capped in play_tone)
 constexpr uint16_t  CHIME_GAP_MS    = 40;     // silence between notes
+// How long to wait for the controller to become ready before giving up and
+// skipping the chime. Must not be indefinite — see update_startup_chime().
+constexpr uint32_t  CHIME_READY_TIMEOUT_MS = 3000;
 }
 
 const AP_Param::GroupInfo FOC_ESC::var_info[] = {
@@ -166,6 +169,18 @@ const AP_Param::GroupInfo FOC_ESC::var_info[] = {
     // @Units: s
     // @User: Advanced
     AP_GROUPINFO("STL_T", 26, FOC_ESC, _p_stall_t, 1.0f),
+    // @Param: V_MIN
+    // @DisplayName: Bus under-voltage floor
+    // @Description: Bridge is gated off below this bus voltage on a single reading (no debounce); motoring current folds back over V_FOLD above it. Protects the bus-derived gate-drive rail from a current-limited supply collapsing while driving. Keep above the gate driver supply's dropout.
+    // @Units: V
+    // @User: Advanced
+    AP_GROUPINFO("V_MIN", 27, FOC_ESC, _p_v_min, 14.0f),
+    // @Param: V_UVFOLD
+    // @DisplayName: Bus under-voltage foldback band
+    // @Description: Motoring current scales from full at (V_MIN + this) down to zero at V_MIN. Separate from V_FOLD, which is the over-voltage regen band. Keep V_MIN + V_UVFOLD comfortably below the lowest bus voltage you actually run at, or normal supply sag will silently derate torque. VESC's equivalent (l_battery_cut_start/end) sits far below normal running voltage.
+    // @Units: V
+    // @User: Advanced
+    AP_GROUPINFO("V_UVFOLD", 28, FOC_ESC, _p_v_uvfold, 2.0f),
 
     AP_GROUPEND
 };
@@ -176,7 +191,12 @@ void FOC_ESC::init(AP_HAL::UARTDriver *vesc_uart)
     motor_cfg.pwm_clock_hz = 20000000;
     motor_cfg.pwm_frequency_hz = 20000;
     motor_cfg.current_sample_delay_ticks = 5;
-    motor_cfg.deadtime_ticks = 8;
+    // Bridge dead time, in real nanoseconds — the driver encodes it against the
+    // timer kernel clock. This was previously "8", intended as 8 PWM counter
+    // ticks (400 ns) but applied as 8 DTG steps of the 160 MHz kernel clock =
+    // 50 ns. Verify the achieved value with motor_control.deadtime_ns() and on
+    // a scope before running the bridge hard.
+    motor_cfg.deadtime_ns = 200;
     motor_cfg.center_aligned = true;
     motor_cfg.break_input_enabled = false;
     // BDUAV 6374-170kv electrical parameters (tune on hardware via VESC Tool).
@@ -184,6 +204,14 @@ void FOC_ESC::init(AP_HAL::UARTDriver *vesc_uart)
     motor_cfg.motor_Ls   = 80e-6f;   // phase inductance [H]
     motor_cfg.motor_flux = 4.6e-3f;  // PM flux linkage λ [Wb] (≈60/(√3·π·Kv·poles))
     motor_cfg.vbus       = 18.0f;    // DC bus [V] (fixed until bus ADC added)
+    // Per-phase duty ceiling. The MP1918 high side is bootstrapped, so 100% duty
+    // is not a supported state, and the low-side window it reserves is also what
+    // the shunt ADC samples in. 0.80 is deliberately conservative for bring-up
+    // (10 µs of low-side conduction per period at 20 kHz — ~2.8x the ADC needs);
+    // it caps the modulation index at 2*(0.80-0.5) = 0.60, i.e. about a third
+    // less top speed than the old 0.90. Raise toward 0.92 once the stage is
+    // trusted and the sampling has been checked on a scope.
+    motor_cfg.duty_max         = 0.80f;
     // Conservative limits for first bring-up — raise once verified.
     motor_cfg.current_max      = 15.0f;
     motor_cfg.overcurrent_trip = 30.0f;
@@ -251,7 +279,9 @@ void FOC_ESC::init(AP_HAL::UARTDriver *vesc_uart)
     motor_cfg.current_slew_a_s     = _p_i_slew.get();
     motor_cfg.current_scale        = _p_i_scale.get();
     motor_cfg.vbus_max             = _p_v_max.get();
+    motor_cfg.vbus_min             = _p_v_min.get();
     motor_cfg.vbus_fold_band       = _p_v_fold.get();
+    motor_cfg.vbus_uv_fold_band    = _p_v_uvfold.get();
     motor_cfg.fet_temp_start       = _p_t_start.get();
     motor_cfg.fet_temp_max         = _p_t_max.get();
     motor_cfg.stall_erpm           = _p_stall_rpm.get();
@@ -372,15 +402,37 @@ bool FOC_ESC::update_startup_chime(uint32_t now_ms, bool any_command)
         return false;
     }
     if (any_command || motor_control.get_fault() != 0) {
-        if (motor_control.is_beeping()) {
+        // Abort the chime. Never stop() on a fault — stop() is the operator-level
+        // reset and would clear the latched trip we are aborting for. The ISR
+        // already holds the bridge off, so just stand down.
+        if (motor_control.is_beeping() && motor_control.get_fault() == 0) {
             motor_control.stop();
         }
         _chime_state = ChimeState::DONE;
         return false;
     }
     if (_chime_state == ChimeState::WAIT) {
-        if (!motor_control.zero_valid()) {
-            return true;   // calibrating — hold the arbiter off, stay silent
+        // Two independent readiness conditions, and the chime needs BOTH before it
+        // may drive the bridge:
+        //   zero_valid()  — phase-current baseline captured (INA181 ref rail up)
+        //   vbus_ready()  — bus measurement has settled through its RC filter
+        // They settle on very different timescales: the INA reference comes up
+        // fast, the VBUS divider is 357k||10k against 100 nF (τ ≈ 1 ms). Waiting
+        // only on the first one armed the bridge — and the under-voltage trip
+        // with it — against a bus reading that had not arrived yet, which is what
+        // killed the chime part-way through.
+        if (!motor_control.zero_valid() || !motor_control.vbus_ready()) {
+            // Don't wait forever: returning true holds the arbiter off, so a bus
+            // that never reads ready (e.g. V_MIN set above the actual supply)
+            // would silently block throttle entirely. Give up and skip the chime
+            // instead — losing a beep is preferable to losing the motor.
+            if (_chime_step_ms == 0) {
+                _chime_step_ms = now_ms + CHIME_READY_TIMEOUT_MS;
+            } else if (int32_t(now_ms - _chime_step_ms) >= 0) {
+                _chime_state = ChimeState::DONE;
+                return false;
+            }
+            return true;   // not ready — hold the arbiter off, stay silent
         }
         _chime_idx = 0;
         motor_control.play_tone(CHIME[0].freq_hz, CHIME_AMPLITUDE, CHIME[0].ms);

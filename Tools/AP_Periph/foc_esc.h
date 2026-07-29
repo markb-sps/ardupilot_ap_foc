@@ -93,7 +93,9 @@ private:
 
     // ── Bus / thermal / stall protections ────────────────────────────────────
     AP_Float _p_v_max;         // regen fully cut at this bus V → l_max_vin
-    AP_Float _p_v_fold;        // OV foldback band [V]          (DroneCAN-only)
+    AP_Float _p_v_fold;        // OV regen foldback band [V]    (DroneCAN-only)
+    AP_Float _p_v_min;         // bus under-voltage floor [V]   (DroneCAN-only)
+    AP_Float _p_v_uvfold;      // UV foldback band [V]          (DroneCAN-only)
     AP_Float _p_t_start;       // FET derate onset [°C]         → l_temp_fet_start
     AP_Float _p_t_max;         // FET hard trip [°C]            → l_temp_fet_end
     AP_Float _p_stall_rpm;     // stall speed threshold [eRPM]  (DroneCAN-only)

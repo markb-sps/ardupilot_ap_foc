@@ -8,7 +8,12 @@ struct Stm32FocMotorControlSetup {
     uint32_t pwm_clock_hz = 0;
     uint32_t pwm_frequency_hz = 0;
     uint16_t current_sample_delay_ticks = 2;
-    uint8_t  deadtime_ticks = 0;
+    // Bridge dead time in NANOSECONDS — not PWM counter ticks. The BDTR DTG
+    // field is clocked from t_DTS (the timer kernel clock, i.e. before the
+    // prescaler), which is not the counter clock: on a 160 MHz G4 running a
+    // 20 MHz PWM counter they differ by 8x. Passing real time units and doing
+    // the encoding against the measured kernel clock keeps that from biting.
+    uint16_t deadtime_ns = 0;
     bool     center_aligned = true;
     bool     break_input_enabled = false;
 };
@@ -25,6 +30,10 @@ struct Stm32FocMotorControlInitResult {
     bool current_sense_ok = false;
     uint16_t period_ticks = 0;
     uint32_t update_rate_hz = 0;
+    // Dead time the hardware was actually programmed with, after DTG encoding
+    // and rounding. Report it — a silently-wrong dead time is invisible in
+    // telemetry and destroys the power stage, so it must be observable.
+    uint16_t deadtime_ns_actual = 0;
 };
 
 Stm32FocMotorControlInitResult stm32_foc_motor_control_init(const Stm32FocMotorControlSetup &setup,

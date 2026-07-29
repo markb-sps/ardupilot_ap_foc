@@ -25,6 +25,7 @@ public:
     // VESC enum range, so they can't be confused with a real VESC fault.
     enum Fault : uint8_t {
         FAULT_NONE            = 0,
+        FAULT_UNDER_VOLTAGE   = 2,
         FAULT_ABS_OVERCURRENT = 4,
         FAULT_OVER_TEMP_FET   = 5,
         FAULT_STALL           = 30,
@@ -70,7 +71,10 @@ public:
         uint32_t pwm_clock_hz               = 20000000;
         uint32_t pwm_frequency_hz           = 20000;
         uint16_t current_sample_delay_ticks = 5;
-        uint8_t  deadtime_ticks             = 3;
+        // Bridge dead time in NANOSECONDS (see Stm32FocMotorControlSetup). Do
+        // not express this in PWM counter ticks — the DTG hardware field runs
+        // off the timer kernel clock, not the counter clock.
+        uint16_t deadtime_ns                = 400;
         bool     center_aligned             = true;
         bool     break_input_enabled        = false;
         float    current_scale              = 36.5f;   // ADC volts → amps
@@ -93,7 +97,17 @@ public:
         // Instant trip [A]: no debounce and active even inside the post-arm
         // blanking window, so an arm-into-a-short is caught within one sample.
         float    overcurrent_trip_hard = 60.0f;
-        float    max_modulation    = 0.90f;   // SVPWM duty ceiling [0..~0.95]
+        // Hard per-phase duty ceiling. The high side is bootstrapped (MP1918
+        // charges BST only while SW is low, and its BST-SW ESD clamp actively
+        // discharges the cap), so 100% duty is NOT a supported state: the
+        // high-side rail would decay into UVLO and drop the FET asynchronously.
+        // The same low-side conduction window is what the shunt ADC samples in,
+        // so one ceiling serves both. At 20 kHz, 0.80 leaves 10 µs of low-side
+        // conduction per period — deep margin on both counts.
+        //   d_max = 0.5 + 0.5·max_modulation, so init() caps max_modulation to
+        //   2·(duty_max - 0.5) and the two can never drift apart.
+        float    duty_max          = 0.80f;   // per-phase duty ceiling [0.55..0.98]
+        float    max_modulation    = 0.90f;   // SVPWM vector ceiling (capped by duty_max)
         // Max braking/regen MOTOR current [A]. Caps the negative (decelerating)
         // iq in SPEED mode and the magnitude in BRAKE mode. Keep conservative:
         // braking energy returns to the bus, a bench PSU can't sink it, and
@@ -104,7 +118,34 @@ public:
         // reaching zero at vbus_max — keeps regen from pumping the bus past
         // vbus_max even without a brake resistor / OV clamp.
         float    vbus_max          = 40.0f;   // regen fully cut at this bus voltage [V]
-        float    vbus_fold_band    = 3.0f;    // foldback starts at vbus_max - band [V]
+        float    vbus_fold_band    = 3.0f;    // OVER-voltage regen foldback band [V]
+        // UNDER-voltage foldback band [V]: motoring current scales from full at
+        // (vbus_min + this) to zero at vbus_min. Kept separate from the OV band
+        // because the two sit at opposite ends of the range and want different
+        // widths — sharing one number forced the UV band to be as wide as the OV
+        // one, which pushed foldback to within a volt of an 18 V nominal bus and
+        // silently robbed torque on any supply sag.
+        //
+        // VESC models this as l_battery_cut_start/l_battery_cut_end (10 V → 8 V,
+        // with l_min_vin = 8), i.e. a band that ends exactly at the hard trip and
+        // sits FAR below normal running voltage so it never engages in service.
+        // Match that intent: keep vbus_min + vbus_uv_fold_band comfortably under
+        // the lowest bus you actually run at.
+        float    vbus_uv_fold_band = 2.0f;
+        // Bus UNDER-voltage floor [V]. A supply that hits its current limit
+        // collapses the bus while the bridge is still driving, and the gate-drive
+        // rail (VCC/BST) is bus-derived: a partly-enhanced GaN FET carrying
+        // current sits in its linear region and dissipates enormously — the FET
+        // dies before the MCU ever browns out, and nothing in the phase currents
+        // shows it. The INA181 reference the current sense is calibrated against
+        // is bus-derived too, so the measurements go quietly wrong at the same
+        // time. Below this, the bridge is gated off and FAULT_UNDER_VOLTAGE
+        // latches; motoring current folds back over the band above it, which
+        // lets the drive settle at whatever the supply can actually deliver
+        // instead of oscillating between collapse and re-arm.
+        // Keep above the gate-driver supply's dropout, not just above "some volts".
+        // Trips on a SINGLE sample — no debounce; see UV_DEBOUNCE.
+        float    vbus_min          = 14.0f;
         // FET thermal limit (PCB NTC next to the bridge): iq limit derates
         // linearly from full at fet_temp_start to zero at fet_temp_max, where a
         // FAULT_OVER_TEMP_FET also trips; the trip releases 10°C lower.
@@ -124,6 +165,18 @@ public:
         // ~fixed voltage the bridge loses to dead-time per phase; measure it with
         // the 2-point static debug method (slope fit gives V_dt). ~0.10V here.
         float    deadtime_comp_volts = 0.10f;
+        // WHERE the dead-time error is corrected.
+        //   true  — feed-forward onto the phase duties, so the delivered voltage
+        //           matches the command. Cancels the dead-band around zero
+        //           differential duty, which matters here because the hall
+        //           break-away clamp and the detect sweep both operate at low
+        //           modulation where V_dt is a large fraction of the drive.
+        //   false — leave the switching times alone and instead correct the
+        //           observer's estimate of the applied voltage (vedderb/bldc
+        //           update_valpha_vbeta). VESC can afford this; it has no
+        //           low-current break-away phase to push through.
+        // Kept switchable so the two can be compared on hardware.
+        bool     deadtime_comp_on_duty = true;
         uint16_t command_timeout_ms = 1000;   // coast if no host packet within this (comms failsafe)
         // Torque-command slew limit [A/s]: the CURRENT-mode setpoint is ramped
         // toward each new command at this rate so a step throttle input (e.g. a
@@ -193,6 +246,8 @@ public:
 
     bool is_initialized()   const { return _initialized; }
     bool zero_valid()       const { return _current_zero_valid; }
+    // Dead time the bridge is actually running, after DTG encoding/rounding.
+    uint16_t deadtime_ns()  const { return _deadtime_ns; }
     // True when the bridge should be driving: calibrated, unfaulted, commanded.
     bool is_active()        const {
         return _current_zero_valid && _fault_code == FAULT_NONE && _mode != Mode::STOP;
@@ -253,6 +308,12 @@ public:
     // True once the hall table maps all six real states (i.e. a valid detected
     // table is loaded). HALL mode refuses to drive while this is false.
     bool hall_table_valid() const { return _hall_table_valid; }
+    // Sensorless-start lockout: latched after _ol_max_attempts failed forced
+    // starts, cleared only by a zero/stop command. Silently refuses every
+    // nonzero set_current() while set, so it MUST be observable — a locked-out
+    // controller reports no fault and looks identical to "makes no torque".
+    bool ol_locked_out()    const { return _ol_locked_out; }
+    uint8_t ol_attempts()   const { return _ol_attempts; }
     // Copy the live hall table out as electrical degrees [0..360), NaN = unmapped.
     void get_hall_table_deg(float out_deg[8]) const {
         for (uint8_t k = 0; k < 8; k++) {
@@ -278,12 +339,43 @@ public:
     float get_erpm()          const { return _t_erpm; }    // electrical RPM
     float get_estimated_angle() const { return _t_theta; }     // control angle [rad]
     float get_observer_angle()  const { return _t_obs_theta; } // observer angle [rad]
-    float get_vbus()          const { return _vbus; }
-    // Filtered bus volts, maintained by the control ISR from the PA0 divider.
-    float read_vbus() { return _vbus; }
+    // Filtered bus volts from the PA0 divider — or exactly 0 if the ADC has
+    // never produced a plausible reading. Reporting 0 rather than the seeded
+    // default is deliberate: a silent fallback to cfg.vbus makes a dead sense
+    // path look like a perfectly steady nominal bus, which is indistinguishable
+    // from healthy right up until a bus-derived protection trips on the real
+    // (zero) reading. If this reads 0, the divider/ADC is the problem.
+    float get_vbus()          const { return _vbus_valid ? _vbus : 0.0f; }
+    float read_vbus()               { return get_vbus(); }
+    // True once any plausible (>6 V) bus reading has been seen since boot.
+    bool  vbus_valid()        const { return _vbus_valid; }
+    // True once the bus measurement has settled through its RC filter and the
+    // under-voltage protections are armed. False here with a healthy bus means
+    // V_MIN is set above the actual supply.
+    bool  vbus_ready()        const { return _vbus_ready; }
+    // Last RAW (unfiltered) bus reading — what the under-voltage trip actually
+    // compares against, before any filtering.
+    float get_vbus_raw()      const { return _vbus_raw_v; }
+    // Lowest raw bus reading seen while the bridge was armed, since boot. The
+    // smoking gun for an under-voltage trip: it says what the trip actually saw.
+    float get_vbus_min_seen() const { return (_vbus_min_seen > 1e8f) ? 0.0f : _vbus_min_seen; }
     float get_fet_temp()      const { return _t_fet_temp; }  // board NTC [°C]
     uint8_t get_fault()       const { return _fault_code; }
+    // Fault code for HOST reporting. A trip is often cleared within ~500 ms (the
+    // host commands zero, the latch releases), which is far too short for a
+    // polling GUI to ever observe — so a trip stays reported for
+    // FAULT_REPORT_HOLD_MS after it clears. Without this a real fault looks like
+    // "the motor just didn't run" with no code attached.
+    uint8_t reported_fault() const;
+    // Last trip code since boot (sticky; cleared only by stop()).
+    uint8_t last_fault()      const { return _fault_last; }
     uint8_t get_state()       const { return uint8_t(_state); }
+    // True while a trip is latched: the bridge is off and stays off until the
+    // host commands zero/stop AND the re-arm cooldown has elapsed.
+    bool    fault_latched()   const { return _fault_latched; }
+    // Consecutive trips inside the repeat-trip window (see fault_gate). >1 means
+    // the drive is not recovering, it is being re-armed into the same fault.
+    uint8_t trip_count()      const { return _trip_count; }
     float   current_limit()   const { return _current_max; }   // iq command ceiling [A]
 
     // ── Config read-back (for the VESC-Tool COMM_GET_MCCONF responder) ──────
@@ -305,6 +397,20 @@ private:
     static void adc_sample_callback(void *ctx, uint16_t sample_u, uint16_t sample_v, uint16_t sample_w);
     void        adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t sample_w);
     void        observer_update(float v_alpha, float v_beta, float i_alpha, float i_beta);
+    // Dead-time voltage error in the αβ frame, for correcting the *estimate* of
+    // the applied voltage that feeds the observer. Follows vedderb/bldc
+    // update_valpha_vbeta(): sign taken from the filtered dq currents rotated
+    // back to phase currents, never from the raw (noisy) phase samples. The
+    // switching times are deliberately left uncompensated — see the call site.
+    void        dt_comp_alpha_beta(float sin_t, float cos_t,
+                                   float &dv_alpha, float &dv_beta) const;
+    // sign(i) per phase, from the filtered dq currents. Shared by both
+    // dead-time correction modes so they can never disagree about direction.
+    void        dt_comp_phase_signs(float sin_t, float cos_t,
+                                    float &sa, float &sb, float &sc) const;
+    // Apply the dead-time feed-forward to the phase duties (deadtime_comp_on_duty).
+    void        dt_comp_apply_duties(float sin_t, float cos_t,
+                                     float &da, float &db, float &dc) const;
     // Sensorless (observer + I/f) angle/torque state machine. Sets theta/id_set/
     // iq_set for the shared current loop; returns false if it aborted the cycle
     // (bridge already gated off — the caller must return without writing PWM).
@@ -327,13 +433,31 @@ private:
     void        reset_control();
     void        trip_fault(uint8_t code);
     void        hold_off(State s);   // gate bridge off, park control state
+    // Gate the output stage off and mark the bridge disarmed. ISR-safe.
+    void        gate_off();
+    // Apply the bridge duty ceiling and write the CCRs. EVERY path that drives
+    // the bridge must go through here — see Config::duty_max.
+    void        write_duties(float da, float db, float dc);
+    // Arm the output stage. Applies the overcurrent blanking window only on a
+    // genuine off→on transition — re-applying it on every repeat command (which
+    // arrive at ~1 kHz) kept the debounced trip permanently blanked.
+    void        arm_bridge();
+    // Thread-context fault gate. Returns true if the bridge may be driven now.
+    // A latched trip is cleared ONLY by `release` (a zero/stop command) and only
+    // after the re-arm cooldown; a live command can never clear one. `release`
+    // must be true exactly when the caller's set-point is zero/stop.
+    bool        fault_gate(bool release, uint32_t now_ms);
 
     // ── Hardware / init ────────────────────────────────────────────────────
     bool     _initialized               = false;
     bool     _current_sense_initialized = false;
     uint16_t _period_ticks              = 0;
+    uint16_t _deadtime_ns               = 0;   // achieved bridge dead time [ns]
     uint32_t _pwm_update_rate_hz        = 0;
     volatile float _vbus                = 18.0f;  // filtered bus volts (ISR → thread)
+    volatile bool  _vbus_valid          = false;  // a plausible bus reading has been seen
+    volatile float _vbus_raw_v          = 0.0f;   // last unfiltered bus reading [V]
+    volatile float _vbus_min_seen       = 1e9f;   // lowest raw reading while armed [V]
     float    _current_scale             = 36.5f;
 
     // ── Zero-current calibration ───────────────────────────────────────────
@@ -365,21 +489,45 @@ private:
     float _oc_trip_hard    = 60.0f;  // instant trip, active during blanking too [A]
     float _regen_max       = 5.0f;   // max braking/regen motor current [A]
     float _vbus_max        = 40.0f;  // regen folds to zero at this bus voltage [V]
-    float _vbus_fold_inv   = 1.0f/3.0f; // 1 / vbus_fold_band
+    float _vbus_min        = 10.0f;  // hard under-voltage trip [V]
+    float _vbus_fold_inv   = 1.0f/3.0f; // 1 / vbus_fold_band     (over-voltage)
+    float _vbus_uvfold_inv = 1.0f/2.0f; // 1 / vbus_uv_fold_band  (under-voltage)
+    volatile uint16_t _uv_count = 0; // consecutive under-voltage samples
+    // One-way latch: the bus measurement has settled through its RC filter and
+    // the under-voltage protection may arm. Until then a low reading means "not
+    // measured yet", not "under-voltage". See VBUS_READY_SAMPLES.
+    volatile bool _vbus_ready = false;
+    uint16_t      _vbus_ready_count = 0;
     float _mode_switch_i   = 1.0f;   // CURRENT↔SPEED switch blocked above this |Iphase| [A]
     // Overcurrent trip is debounced (needs OC_DEBOUNCE consecutive over-limit
     // samples) and blanked for OC_BLANK_SAMPLES samples after each output enable
     // to reject the switching-noise spike when the bridge first arms.
     volatile uint16_t _oc_over_count = 0;
     volatile uint16_t _oc_blank      = 0;
+    // ── Fault latch / repeat-trip escalation ───────────────────────────────
+    // A trip must be a shutdown, not a blip. _fault_latched is set by every
+    // trip and cleared ONLY by a zero/stop command that arrives after the
+    // re-arm cooldown, so a host streaming set-points cannot re-arm the bridge
+    // into a live fault at the command rate (which is what cooked the previous
+    // power stages). Trips that repeat inside TRIP_FORGET_MS escalate the
+    // cooldown; stop() clears the whole history.
+    volatile bool     _fault_latched = false;
+    volatile uint8_t  _fault_last  = FAULT_NONE; // sticky last trip (host reporting)
+    volatile uint32_t _fault_last_ms = 0;        // millis() of that trip
+    volatile bool     _outputs_on    = false;  // bridge armed (gates the OC blank re-arm)
+    bool              _trip_seen     = false;  // thread has booked the current trip
+    uint8_t           _trip_count    = 0;      // consecutive trips in the window
+    uint32_t          _last_trip_ms  = 0;      // millis() of the last booked trip
+    uint32_t          _rearm_ok_ms   = 0;      // earliest millis() the latch may clear
     // vbus-dependent constants: seeded from cfg.vbus in init, then recomputed
     // every cycle in the ISR from the measured, filtered bus voltage.
     float _v_max           = 0.0f;   // max |v_dq| = max_mod·vbus/√3
     float _inv_vbus_half   = 0.0f;   // 2/vbus
-    float _dt_comp_duty    = 0.0f;   // dead-time comp expressed as a per-phase duty step
     float _vbus_flt        = 18.0f;  // ISR-side filtered bus volts
-    float _mod_to_vmax     = 0.0f;   // max_modulation/√3
+    float _mod_to_vmax     = 0.0f;   // effective max_modulation/√3
+    float _duty_max        = 0.80f;  // hard per-phase duty ceiling (bootstrap + ADC window)
     float _dt_comp_volts   = 0.0f;   // cfg.deadtime_comp_volts
+    bool  _dt_comp_on_duty = true;   // cfg.deadtime_comp_on_duty
     // VESC-style open-loop override constants
     float _ol_boost_q        = 0.0f; // boost current during override [A]
     float _ol_max_q          = 3.0f; // open-loop iq cap [A]
@@ -485,6 +633,12 @@ private:
     float    _debug_theta  = 0.0f;
     float    _v_alpha_prev = 0.0f;   // applied αβ volts, fed to observer next cycle
     float    _v_beta_prev  = 0.0f;
+    // Low-passed dq currents. Used ONLY to pick the dead-time correction sign:
+    // filtering in dq (where a steady operating point is DC) avoids the phase
+    // lag that filtering the AC phase currents would add. Mirrors VESC's
+    // id_filter/iq_filter with foc_current_filter_const.
+    float    _id_filt      = 0.0f;
+    float    _iq_filt      = 0.0f;
 
     // ── Observer state (ISR-only except snapshots) ─────────────────────────
     float _obs_x1     = 0.0f;

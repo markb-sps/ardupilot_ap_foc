@@ -113,6 +113,8 @@ private:
     // the hall table (works even if a VESC Tool version can't read MCCONF).
     void handle_terminal();
     void print_hall_table();
+    // 'diag' terminal command: dump the throttle-arbiter decision inputs.
+    void print_diag();
     void send_print(const char *s);   // emit one COMM_PRINT line
 
     static uint16_t crc16(const uint8_t *data, uint16_t len);

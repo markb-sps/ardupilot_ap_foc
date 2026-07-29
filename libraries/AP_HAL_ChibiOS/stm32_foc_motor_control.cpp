@@ -12,13 +12,40 @@ namespace ChibiOS {
 
 namespace {
 
+// Phase-current sample time, halved from the original 47.5 cycles to the next
+// hardware step down (24.5; the SMP field is not continuous). The INA181 drives
+// the pin from an op-amp output, so a long aperture buys nothing — but it costs
+// duty headroom, because the whole sample-and-hold must fall inside the
+// low-side conduction window. At 40 MHz (HCLK/4) a conversion is now 37 cycles
+// = 925 ns instead of 1.5 µs, so the ADC1 rank-2 channel (phase W, which waits
+// for rank 1 to finish) stays valid to ~0.93 duty instead of ~0.88.
 constexpr uint32_t PHASE_CURRENT_SAMPLE_TIME =
-#if defined(ADC_SMPR_SMP_47P5)
-    ADC_SMPR_SMP_47P5;
-#elif defined(ADC_SMPR_SMP_61P5)
-    ADC_SMPR_SMP_61P5;
+#if defined(ADC_SMPR_SMP_24P5)
+    ADC_SMPR_SMP_24P5;
+#elif defined(ADC_SMPR_SMP_19P5)
+    ADC_SMPR_SMP_19P5;
 #else
     0U;  // ADC HAL not built (e.g. bootloader); value is unused there
+#endif
+
+// VBUS and board temp are REGULAR conversions with a whole PWM period to
+// complete, so there is no reason for them to share the phase-current budget —
+// nothing about them needs to fit inside the low-side conduction window.
+//
+// The long aperture is cheaper, not dearer: the regular conversion re-arms
+// itself from its own EOC interrupt, so conversion time sets the ADC1 IRQ rate.
+// 247.5+12.5 cycles = 6.5 µs at 40 MHz puts that at ~150 kHz — still ~7x the
+// rate the 20 kHz control loop consumes it at — instead of the ~670 kHz the old
+// 47.5-cycle setting was costing. Settling is not the motivation: both nodes are
+// RC filtered on the board (VBUS has 100 nF across the divider), so the ADC's
+// sampling capacitor charges from that reservoir, not through the divider.
+constexpr uint32_t AUX_SAMPLE_TIME =
+#if defined(ADC_SMPR_SMP_247P5)
+    ADC_SMPR_SMP_247P5;
+#elif defined(ADC_SMPR_SMP_181P5)
+    ADC_SMPR_SMP_181P5;
+#else
+    0U;
 #endif
 
 // v2 PCB: phase currents come from external INA181A1 amps (gain 20 V/V) on
@@ -48,6 +75,9 @@ constexpr uint8_t  PHASE_CURRENT_PENDING_W      = 4U;
 constexpr uint8_t  PHASE_CURRENT_PENDING_ALL    =
     PHASE_CURRENT_PENDING_U | PHASE_CURRENT_PENDING_V | PHASE_CURRENT_PENDING_W;
 
+// One board-temp conversion per this many VBUS conversions (see DriverState).
+constexpr uint16_t TEMP_DIVIDER = 64U;
+
 const ioline_t PHASE_I1_LINE = PAL_LINE(GPIOA, 1U);  // ADC1_IN2  (U)
 const ioline_t PHASE_I2_LINE = PAL_LINE(GPIOA, 7U);  // ADC2_IN4  (V)
 const ioline_t PHASE_I3_LINE = PAL_LINE(GPIOB, 0U);  // ADC1_IN15 (W)
@@ -56,6 +86,7 @@ struct DriverState {
     bool     initialized              = false;
     bool     current_sense_ok         = false;
     uint16_t period_ticks             = 0;
+    uint16_t deadtime_ns_actual       = 0;
     uint16_t current_sample_delay_ticks = 1;
     Stm32FocMotorControlCallbacks callbacks{};
     PWMConfig pwm_cfg{};
@@ -65,13 +96,87 @@ struct DriverState {
     volatile uint8_t  pending_mask     = 0U;
     // VBUS + board temp: sampled by ADC1 regular conversions (PA0 / ADC1_IN1
     // and PB12 / ADC1_IN11), opportunistically driven from the ADC1 ISR so the
-    // thread side never has to wait on the ADC. The single regular conversion
-    // alternates between the two channels, so each updates at ~10 kHz.
+    // thread side never has to wait on the ADC. VBUS gets every conversion but
+    // one in TEMP_DIVIDER: it backs the bus under-voltage trip and must beat a
+    // collapsing supply, whereas the NTC is consumed at 10 Hz by update_thermal()
+    // and is thermally slow anyway. At the AUX_SAMPLE_TIME conversion rate that
+    // puts VBUS at ~150 kHz and temp at ~2.4 kHz — both far above what consumes
+    // them, so the control loop always reads a fresh bus value.
     volatile uint16_t vbus_raw         = 0U;
     volatile uint16_t temp_raw         = 0U;
     bool              regular_is_temp  = false;   // which channel converts next
+    uint16_t          regular_count    = 0U;      // conversions since the last temp sample
 } driver_state;
 
+
+// TIM1's kernel clock (CK_INT) — the same selection ChibiOS's PWM driver makes
+// for PWMD1. This is the DTG time base, NOT the PWM counter clock.
+#if defined(STM32_TIM1CLK)
+#define FOC_TIM1_KERNEL_CLK  STM32_TIM1CLK
+#else
+#define FOC_TIM1_KERNEL_CLK  STM32_TIMCLK2
+#endif
+
+// Encode a dead time in nanoseconds into the BDTR DTG field.
+//
+// DTG is counted in t_DTS, which with CKD = 00 (what ChibiOS programs, and we
+// leave alone) is one period of the timer KERNEL clock — before the prescaler.
+// On this board that is 160 MHz (6.25 ns) while the PWM counter runs at 20 MHz
+// (50 ns), so a DTG value written as if it were counter ticks comes out 8x
+// short. That is exactly the trap this helper exists to close.
+//
+// Encoding (RM0440, TIMx_BDTR), in units of t_DTS:
+//   DTG[7:5] = 0xx : 0..127    step 1
+//   DTG[7:5] = 10x : 128..254  step 2
+//   DTG[7:5] = 110 : 256..504  step 8
+//   DTG[7:5] = 111 : 512..1008 step 16
+// 255 and 505..511 have no encoding; those round up to the next representable
+// value. Rounding is always UP: dead time is a shoot-through guard, so long is
+// the safe direction to err.
+uint8_t encode_deadtime_dtg(uint32_t deadtime_ns, uint32_t kernel_clk_hz)
+{
+    if (deadtime_ns == 0U || kernel_clk_hz == 0U) {
+        return 0U;
+    }
+    const uint64_t num = uint64_t(deadtime_ns) * uint64_t(kernel_clk_hz);
+    uint32_t ticks = uint32_t((num + 999999999ULL) / 1000000000ULL);  // ceil to t_DTS
+
+    if (ticks <= 127U) {
+        return uint8_t(ticks);                                    // 0xx, step 1
+    }
+    if (ticks <= 254U) {
+        return uint8_t(0x80U | (((ticks + 1U) / 2U) - 64U));      // 10x, step 2
+    }
+    if (ticks <= 504U) {
+        if (ticks < 256U) { ticks = 256U; }                       // 255 unencodable
+        return uint8_t(0xC0U | (((ticks + 7U) / 8U) - 32U));      // 110, step 8
+    }
+    if (ticks <= 1008U) {
+        if (ticks < 512U) { ticks = 512U; }                       // 505..511 unencodable
+        return uint8_t(0xE0U | (((ticks + 15U) / 16U) - 32U));    // 111, step 16
+    }
+    return 0xFFU;   // saturate at the longest dead time the hardware can produce
+}
+
+// Inverse of encode_deadtime_dtg(): the dead time the hardware will actually
+// apply for a given DTG code, so the achieved value can be reported.
+uint32_t decode_deadtime_ns(uint8_t dtg, uint32_t kernel_clk_hz)
+{
+    if (kernel_clk_hz == 0U) {
+        return 0U;
+    }
+    uint32_t ticks;
+    if ((dtg & 0x80U) == 0U) {
+        ticks = uint32_t(dtg);
+    } else if ((dtg & 0xC0U) == 0x80U) {
+        ticks = (64U + uint32_t(dtg & 0x3FU)) * 2U;
+    } else if ((dtg & 0xE0U) == 0xC0U) {
+        ticks = (32U + uint32_t(dtg & 0x1FU)) * 8U;
+    } else {
+        ticks = (32U + uint32_t(dtg & 0x1FU)) * 16U;
+    }
+    return uint32_t((uint64_t(ticks) * 1000000000ULL) / uint64_t(kernel_clk_hz));
+}
 
 void init_tim1_adc_trigger(uint16_t period_ticks, uint16_t delay_ticks)
 {
@@ -115,16 +220,14 @@ void calibrate_adc(ADC_TypeDef *adc)
 
 // Program the per-channel sample time. Channels 0..9 live in SMPR1, 10..18 in
 // SMPR2 (three bits each).
-void set_channel_sample_time(ADC_TypeDef *adc, uint32_t channel)
+void set_channel_sample_time(ADC_TypeDef *adc, uint32_t channel, uint32_t smp)
 {
     if (channel < 10U) {
         const uint32_t smp_shift = channel * 3U;
-        adc->SMPR1 = (adc->SMPR1 & ~(0x7U << smp_shift)) |
-                      (uint32_t(PHASE_CURRENT_SAMPLE_TIME) << smp_shift);
+        adc->SMPR1 = (adc->SMPR1 & ~(0x7U << smp_shift)) | (smp << smp_shift);
     } else {
         const uint32_t smp_shift = (channel - 10U) * 3U;
-        adc->SMPR2 = (adc->SMPR2 & ~(0x7U << smp_shift)) |
-                      (uint32_t(PHASE_CURRENT_SAMPLE_TIME) << smp_shift);
+        adc->SMPR2 = (adc->SMPR2 & ~(0x7U << smp_shift)) | (smp << smp_shift);
     }
 }
 
@@ -137,13 +240,13 @@ void init_adc_unit(ADC_TypeDef *adc, uint32_t ch1, uint32_t ch2, uint8_t nconv)
 
     adc->CR   = ADC_CR_ADVREGEN;
     adc->ISR  = adc->ISR;  // clear all flags
-    set_channel_sample_time(adc, ch1);
+    set_channel_sample_time(adc, ch1, PHASE_CURRENT_SAMPLE_TIME);
     uint32_t jsqr =
         (PHASE_CURRENT_ADC_JEXTSEL << ADC_JSQR_JEXTSEL_Pos)  |  // TIM1_TRGO2 (STM32G4 ADC1/2)
         ADC_JSQR_JEXTEN_0                                    |  // rising edge
         (ch1 << ADC_JSQR_JSQ1_Pos);                             // rank 1 = ch1
     if (nconv >= 2U) {
-        set_channel_sample_time(adc, ch2);
+        set_channel_sample_time(adc, ch2, PHASE_CURRENT_SAMPLE_TIME);
         jsqr |= (1U << ADC_JSQR_JL_Pos)     |                   // 2 injected conversions (JL = N-1)
                 (ch2 << ADC_JSQR_JSQ2_Pos);                     // rank 2 = ch2
     }
@@ -179,9 +282,8 @@ bool init_current_sense()
     // each result, alternating channels — see motor_control_adc1_irq_hook.
     palSetLineMode(PAL_LINE(GPIOA, 0U), PAL_MODE_INPUT_ANALOG);
     palSetLineMode(PAL_LINE(GPIOB, 12U), PAL_MODE_INPUT_ANALOG);
-    ADC1->SMPR1 = (ADC1->SMPR1 & ~ADC_SMPR1_SMP1_Msk) |
-                   ADC_SMPR1_SMP_AN1(PHASE_CURRENT_SAMPLE_TIME);
-    set_channel_sample_time(ADC1, TEMP_ADC1_CHANNEL);
+    set_channel_sample_time(ADC1, VBUS_ADC1_CHANNEL, AUX_SAMPLE_TIME);
+    set_channel_sample_time(ADC1, TEMP_ADC1_CHANNEL, AUX_SAMPLE_TIME);
     driver_state.regular_is_temp = false;
     ADC1->SQR1  = (VBUS_ADC1_CHANNEL << ADC_SQR1_SQ1_Pos);   // L=0 (one conv)
     ADC1->IER  |= ADC_IER_EOCIE;              // route EOC into the existing ADC1 ISR
@@ -236,6 +338,7 @@ Stm32FocMotorControlInitResult stm32_foc_motor_control_init(const Stm32FocMotorC
         result.current_sense_ok = driver_state.current_sense_ok;
         result.period_ticks    = driver_state.period_ticks;
         result.update_rate_hz  = setup.pwm_frequency_hz;
+        result.deadtime_ns_actual = driver_state.deadtime_ns_actual;
         return result;
     }
 
@@ -269,8 +372,9 @@ Stm32FocMotorControlInitResult stm32_foc_motor_control_init(const Stm32FocMotorC
     driver_state.pwm_cfg.channels[1].mode = PWM_OUTPUT_ACTIVE_HIGH | PWM_COMPLEMENTARY_OUTPUT_ACTIVE_HIGH;
     driver_state.pwm_cfg.channels[2].mode = PWM_OUTPUT_ACTIVE_HIGH | PWM_COMPLEMENTARY_OUTPUT_ACTIVE_HIGH;
     driver_state.pwm_cfg.channels[3].mode = PWM_OUTPUT_DISABLED;
+    uint8_t dtg = encode_deadtime_dtg(setup.deadtime_ns, FOC_TIM1_KERNEL_CLK);
     driver_state.pwm_cfg.bdtr =
-        STM32_TIM_BDTR_DTG(setup.deadtime_ticks) |
+        STM32_TIM_BDTR_DTG(dtg) |
         STM32_TIM_BDTR_OSSI |
         STM32_TIM_BDTR_OSSR;
     if (setup.break_input_enabled) {
@@ -278,6 +382,29 @@ Stm32FocMotorControlInitResult stm32_foc_motor_control_init(const Stm32FocMotorC
     }
 
     pwmStart(&PWMD1, &driver_state.pwm_cfg);
+
+    // Make the fail-safe state explicit rather than inherited. With OSSI set,
+    // clearing MOE does not release the pins — it drives all six outputs to the
+    // IDLE level defined by the OISx/OISxN bits. Force those to 0 so "MOE = 0"
+    // provably means both driver inputs LOW on every leg: both FETs off, bridge
+    // high-Z, motor coasting. Actively driven low (not Hi-Z) is what we want —
+    // a released pin would leave the MP1918 inputs floating.
+    TIM1->CR2 &= ~(TIM_CR2_OIS1 | TIM_CR2_OIS1N | TIM_CR2_OIS2 | TIM_CR2_OIS2N |
+                   TIM_CR2_OIS3 | TIM_CR2_OIS3N | TIM_CR2_OIS4);
+
+    // pwmStart() resolved the real kernel clock into PWMD1.clock and left MOE
+    // SET. Re-derive DTG from that authoritative value (rather than trusting the
+    // compile-time macro) and write BDTR back with MOE clear — which also ends
+    // the all-low-sides-on window pwmStart opens with CCR = 0, well before the
+    // ADC calibration below.
+    if (PWMD1.clock != FOC_TIM1_KERNEL_CLK) {
+        dtg = encode_deadtime_dtg(setup.deadtime_ns, PWMD1.clock);
+        driver_state.pwm_cfg.bdtr =
+            (driver_state.pwm_cfg.bdtr & ~uint32_t(TIM_BDTR_DTG_Msk)) | STM32_TIM_BDTR_DTG(dtg);
+    }
+    TIM1->BDTR = driver_state.pwm_cfg.bdtr;      // MOE stays clear until armed
+    driver_state.deadtime_ns_actual = uint16_t(decode_deadtime_ns(dtg, PWMD1.clock));
+
     if (setup.center_aligned) {
         TIM1->CR1 &= ~STM32_TIM_CR1_CMS_MASK;
         TIM1->CR1 |=  STM32_TIM_CR1_CMS(1);
@@ -299,6 +426,7 @@ Stm32FocMotorControlInitResult stm32_foc_motor_control_init(const Stm32FocMotorC
     result.current_sense_ok = driver_state.current_sense_ok;
     result.period_ticks    = driver_state.period_ticks;
     result.update_rate_hz  = setup.pwm_frequency_hz;
+    result.deadtime_ns_actual = driver_state.deadtime_ns_actual;
 #else
     (void)setup;
     (void)callbacks;
@@ -389,8 +517,12 @@ extern "C" void motor_control_adc1_irq_hook(uint32_t isr)
             driver_state.regular_is_temp = false;
         } else {
             driver_state.vbus_raw = dr;
-            ADC1->SQR1 = (TEMP_ADC1_CHANNEL << ADC_SQR1_SQ1_Pos);
-            driver_state.regular_is_temp = true;
+            // Stay on VBUS unless the temp slot is due — see TEMP_DIVIDER.
+            if (++driver_state.regular_count >= TEMP_DIVIDER) {
+                driver_state.regular_count   = 0U;
+                driver_state.regular_is_temp = true;
+                ADC1->SQR1 = (TEMP_ADC1_CHANNEL << ADC_SQR1_SQ1_Pos);
+            }
         }
         ADC1->ISR = ADC_ISR_EOC | ADC_ISR_OVR;
         ADC1->CR |= ADC_CR_ADSTART;

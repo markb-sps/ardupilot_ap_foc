@@ -402,7 +402,7 @@ void VescTelemetry::handle_get_values()
     put_f32(p, 0.0f,     10000.0f);// watt_hours_charged
     put_i32(p, _mc.get_state());   // tachometer ← FOC state (0=IDLE 1=ALIGN 2=OPENLOOP 3=BLEND 4=CLOSED 5=FAULT 6=DEBUG)
     put_i32(p, 0);                 // tachometer_abs
-    put_u8 (p, _mc.get_fault());   // fault_code
+    put_u8 (p, _mc.reported_fault());   // fault_code (held briefly after clearing)
     put_f32(p, 0.0f,     1000000.0f); // pid_pos (position control not used)
     put_u8 (p, 0);                 // controller_id (vesc_id)
     put_f16(p, 25.0f,    10.0f);   // temp_mos_1
@@ -522,6 +522,42 @@ void VescTelemetry::print_hall_table()
     }
 }
 
+// Dump every input the throttle arbiter decides on. The arbiter picks, in
+// order: chime → override → CAN → USB → PWM → coast, and a motor that sits in
+// IDLE with no fault means one of the earlier branches is winning or the whole
+// block is being skipped. Nothing here is inferable from COMM_GET_VALUES, which
+// is why a stuck arbiter looks identical to "no torque" from the outside.
+void VescTelemetry::print_diag()
+{
+    const uint32_t now = AP_HAL::millis();
+    char line[96];
+    float amps = 0.0f;
+    const bool usb_ok = usb_current(now, 200, amps);
+    const bool ovr_ok = override_active(now, 200);
+
+    hal.util->snprintf(line, sizeof(line), "init=%u state=%u fault=%u zero=%u vbus_rdy=%u",
+                       unsigned(_mc.is_initialized()), unsigned(_mc.get_state()),
+                       unsigned(_mc.get_fault()), unsigned(_mc.zero_valid()),
+                       unsigned(_mc.vbus_ready()));
+    send_print(line);
+    hal.util->snprintf(line, sizeof(line), "usb_fresh=%u amps=%.2f set_ms=%lu age=%lu",
+                       unsigned(usb_ok), double(amps),
+                       (unsigned long)_usb_current_ms,
+                       (unsigned long)(now - _host_alive_ms));
+    send_print(line);
+    hal.util->snprintf(line, sizeof(line), "override=%u ovr_ms=%lu hall_pending=%u",
+                       unsigned(ovr_ok), (unsigned long)_override_ms,
+                       unsigned(_hall_detect_pending));
+    send_print(line);
+    // The silent refusal paths. A locked-out controller reports fault=0 and
+    // sits in IDLE, indistinguishable from "makes no torque" without this.
+    hal.util->snprintf(line, sizeof(line), "sensor=%s ol_lock=%u ol_try=%u hall_tab=%u",
+                       (_mc.get_sensor_mode() == MotorControl::SensorMode::HALL) ? "HALL" : "SNSRLESS",
+                       unsigned(_mc.ol_locked_out()), unsigned(_mc.ol_attempts()),
+                       unsigned(_mc.hall_table_valid()));
+    send_print(line);
+}
+
 // VESC-Tool terminal command (ascii payload after the id byte). Minimal set so
 // the hall table can be read/triggered from VESC Tool without MCCONF support.
 void VescTelemetry::handle_terminal()
@@ -542,8 +578,10 @@ void VescTelemetry::handle_terminal()
         send_print("hall detect started (~2 s); keep the motor free to spin, then run 'hall'");
     } else if (strncmp(cmd, "hall", 4) == 0) {
         print_hall_table();
+    } else if (strncmp(cmd, "diag", 4) == 0) {
+        print_diag();
     } else {
-        send_print("commands: hall (show table) | hall_detect (run detection)");
+        send_print("commands: hall (show table) | hall_detect (run detection) | diag (arbiter state)");
     }
 }
 
