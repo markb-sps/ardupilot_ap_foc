@@ -495,6 +495,35 @@ void stm32_foc_motor_control_write_pwm(uint16_t phase_u, uint16_t phase_v, uint1
 #endif
 }
 
+// Diagnostic read-back — see the header. Reads only; writes no register, so it
+// is safe to call while the bridge is driving.
+bool stm32_foc_motor_control_moe_set()
+{
+#if HAL_USE_PWM == TRUE && STM32_PWM_USE_TIM1 == TRUE
+    if (!driver_state.initialized) {
+        return false;
+    }
+    return (TIM1->BDTR & TIM_BDTR_MOE) != 0U;
+#else
+    return false;
+#endif
+}
+
+void stm32_foc_motor_control_read_ccr(uint16_t &ccr_u, uint16_t &ccr_v, uint16_t &ccr_w)
+{
+#if HAL_USE_PWM == TRUE && STM32_PWM_USE_TIM1 == TRUE
+    if (!driver_state.initialized) {
+        ccr_u = ccr_v = ccr_w = 0U;
+        return;
+    }
+    ccr_u = uint16_t(TIM1->CCR1 & 0xFFFFU);
+    ccr_v = uint16_t(TIM1->CCR2 & 0xFFFFU);
+    ccr_w = uint16_t(TIM1->CCR3 & 0xFFFFU);
+#else
+    ccr_u = ccr_v = ccr_w = 0U;
+#endif
+}
+
 extern "C" void motor_control_adc1_irq_hook(uint32_t isr)
 {
     // JEOS = injected sequence complete: both ranks converted, JDR1 (U) and

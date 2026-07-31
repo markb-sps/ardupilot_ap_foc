@@ -1026,6 +1026,17 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
             _hd_n[s]++;
         }
         _state = State::HALL_DETECT;
+        // Publish the loop's own view of the spin. Without this the detect is
+        // opaque from the host — id/iq/vd read 0 throughout, so a run that makes
+        // no torque is indistinguishable from one that is regulating correctly
+        // into a jammed rotor. id vs _hd_current shows whether the current loop
+        // is tracking; vd against _v_max shows whether it is saturated trying.
+        _t_id    = id_m;
+        _t_iq    = iq_m;
+        _t_vd    = vd;
+        _t_vq    = vq;
+        _t_theta = _hd_angle;
+        _t_duty  = id_target;   // what the loop is being asked for [A]
 
         if (++_hd_ticks >= ramp_ticks + 2 * half) {
             // A real state is dwelt in for a full 60° sector each rev; a glitch

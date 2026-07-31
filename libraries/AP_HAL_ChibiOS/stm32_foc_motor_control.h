@@ -47,6 +47,17 @@ void stm32_foc_motor_control_disable_outputs_isr();
 // Write CCR values directly — must be called from ISR context (no syslock).
 void stm32_foc_motor_control_write_pwm(uint16_t phase_u, uint16_t phase_v, uint16_t phase_w);
 
+// ── Diagnostic read-back (thread context, read-only) ────────────────────────
+// What the BRIDGE HARDWARE actually has, as opposed to what the driver state
+// machine believes. These exist because MOE can be cleared behind the driver's
+// back — motor_control_fault_stop() does a bare BDTR write from the CPU
+// exception handlers and deliberately touches no C++ state — after which
+// MotorControl::arm_bridge() short-circuits on its own _outputs_on flag and
+// silently never re-enables. Everything upstream then reports normal while the
+// bridge coasts. Reads only; changes no register.
+bool stm32_foc_motor_control_moe_set();
+void stm32_foc_motor_control_read_ccr(uint16_t &ccr_u, uint16_t &ccr_v, uint16_t &ccr_w);
+
 // Single-shot VBUS read via ADC1 IN1 (PA0). Returns DC-bus volts after the
 // 357k/22k divider. Blocking (~1 µs); coexists with the injected current-sense
 // channel, which has priority and will preempt the regular conversion.

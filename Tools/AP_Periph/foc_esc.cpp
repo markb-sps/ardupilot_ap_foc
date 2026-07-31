@@ -4,6 +4,7 @@
 
 #include <AP_HAL/AP_HAL.h>
 #include <AP_Math/AP_Math.h>
+#include <AP_Param/AP_Param.h>
 #include <AP_HAL_ChibiOS/stm32_pwm_input.h>
 
 extern const AP_HAL::HAL& hal;
@@ -341,6 +342,19 @@ void FOC_ESC::on_mcconf_write(const ChibiOS::VescTelemetry::McconfIn &in)
     _p_v_max.set_and_save(in.max_vin);
     _p_t_start.set_and_save(in.temp_fet_start);
     _p_t_max.set_and_save(in.temp_fet_end);
+
+    // set_and_save() only QUEUES the write for the background IO thread
+    // (AP_Param::save_queue). The deferred reboot below fires 400 ms later,
+    // which on this G431's flash-emulated EEPROM is not long enough to drain
+    // nine of them — a single page erase is tens of ms. The reboot then threw
+    // every write away, so NO VESC-Tool config write ever persisted: the board
+    // kept reporting param defaults after a confirmed write-and-reboot cycle.
+    //
+    // Coast first: flush() blocks this (the periph main) thread for as long as
+    // the queue takes, up to 2 s, and the motor must not be left under command
+    // while the loop that feeds the throttle arbiter is stalled.
+    motor_control.set_current(0.0f);
+    AP_Param::flush();               // blocks until saved; uses expect_delay_ms
 
     _reboot_ms = AP_HAL::millis();   // deferred reboot (see update())
 }

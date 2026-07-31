@@ -254,6 +254,11 @@ public:
     }
     bool current_sense_ready() const { return _current_sense_initialized; }
     uint16_t period_ticks() const { return _initialized ? _period_ticks : 0U; }
+    // What the driver BELIEVES about the bridge. Compare against the hardware
+    // MOE bit (stm32_foc_motor_control_moe_set()): if this is true while MOE is
+    // clear, arm_bridge() is short-circuiting on a stale flag and the bridge can
+    // never be re-enabled, while every layer above still reports normal.
+    bool outputs_on()       const { return _outputs_on; }
 
     void enable_outputs();
     void disable_outputs();

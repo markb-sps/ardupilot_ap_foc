@@ -1,5 +1,6 @@
 #include "VescTelemetry.h"
 #include "MotorControl.h"
+#include "stm32_foc_motor_control.h"
 
 #include <AP_HAL/AP_HAL_Boards.h>
 
@@ -7,6 +8,7 @@
 
 #include <hal.h>
 #include <string.h>
+#include <stdlib.h>
 #include <math.h>
 
 extern const AP_HAL::HAL& hal;
@@ -556,6 +558,20 @@ void VescTelemetry::print_diag()
                        unsigned(_mc.ol_locked_out()), unsigned(_mc.ol_attempts()),
                        unsigned(_mc.hall_table_valid()));
     send_print(line);
+    // Bridge hardware vs what the driver believes. `on` is MotorControl's
+    // _outputs_on; `moe` is the live TIM1 BDTR bit. on=1 moe=0 means the bridge
+    // is coasting while arm_bridge() short-circuits on the stale flag — no
+    // differential reaches the motor and nothing upstream reports a fault.
+    // The CCRs show whether the duties written are actually differential:
+    // all three equal = common mode only = no torque whatever MOE says.
+    uint16_t ccr_u = 0, ccr_v = 0, ccr_w = 0;
+    stm32_foc_motor_control_read_ccr(ccr_u, ccr_v, ccr_w);
+    hal.util->snprintf(line, sizeof(line), "on=%u moe=%u ccr=%u/%u/%u top=%u",
+                       unsigned(_mc.outputs_on()),
+                       unsigned(stm32_foc_motor_control_moe_set()),
+                       unsigned(ccr_u), unsigned(ccr_v), unsigned(ccr_w),
+                       unsigned(_mc.period_ticks()));
+    send_print(line);
 }
 
 // VESC-Tool terminal command (ascii payload after the id byte). Minimal set so
@@ -563,6 +579,7 @@ void VescTelemetry::print_diag()
 void VescTelemetry::handle_terminal()
 {
     char cmd[48];
+    char line[96];
     uint16_t n = (_payload_len > 1) ? (_payload_len - 1) : 0;
     if (n >= sizeof(cmd)) n = sizeof(cmd) - 1;
     memcpy(cmd, &_payload[1], n);
@@ -580,8 +597,27 @@ void VescTelemetry::handle_terminal()
         print_hall_table();
     } else if (strncmp(cmd, "diag", 4) == 0) {
         print_diag();
+    } else if (strncmp(cmd, "beep", 4) == 0) {
+        // On-demand tone: "beep [freq_hz] [amp] [ms]". The power-on chime is the
+        // only thing known to push current through the windings on a board that
+        // otherwise looks dead, but it fires before USB enumerates, so it can
+        // never be observed over this link. Triggering it on demand makes that
+        // current measurable while a telemetry poll is already running.
+        const char *a = cmd + 4;
+        char *end = nullptr;
+        float   freq = strtof(a, &end);
+        float   amp  = (end != nullptr) ? strtof(end, &end) : 0.0f;
+        long    ms   = (end != nullptr) ? strtol(end, &end, 10) : 0;
+        if (!(freq >= 200.0f))  { freq = 2000.0f; }
+        if (!(amp  >  0.0f))    { amp  = 0.06f; }
+        if (ms <= 0 || ms > 5000) { ms = 500; }
+        _mc.play_tone(freq, amp, uint16_t(ms));
+        _override_ms = AP_HAL::millis();   // bench override: arbiter stands off
+        hal.util->snprintf(line, sizeof(line), "beep %.0f Hz amp %.3f for %ld ms",
+                           double(freq), double(amp), ms);
+        send_print(line);
     } else {
-        send_print("commands: hall (show table) | hall_detect (run detection) | diag (arbiter state)");
+        send_print("commands: hall | hall_detect | diag | beep [hz] [amp] [ms]");
     }
 }
 
