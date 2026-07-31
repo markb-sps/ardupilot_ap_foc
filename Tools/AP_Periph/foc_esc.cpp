@@ -224,9 +224,14 @@ void FOC_ESC::init(AP_HAL::UARTDriver *vesc_uart)
     // from (vbus_max - band) to vbus_max.
     motor_cfg.vbus_max       = 40.0f;
     motor_cfg.vbus_fold_band = 3.0f;
-    // Startup torque: the OL cap was leaving a third of the current budget
-    // unused (easily hand-stalled) — let open loop use the full iq limit.
-    motor_cfg.openloop_current = 10.0f;
+    // Startup torque boost added on top of the commanded iq during the forced
+    // I/f sequence. This is the single highest-stress routine in the firmware:
+    // it holds this current on a FORCED angle, into a rotor that may not be
+    // following, for openloop_lock_s + ramp_s + const_s (~1.1 s) — so even a
+    // 1 A command drives this much. Five gate drivers have died on this bench;
+    // start conservative and only raise it if the rotor demonstrably fails to
+    // spin up (watch `lag` shrinking as back-EMF appears). Was 10 A.
+    motor_cfg.openloop_current = 4.0f;
     // Max braking/regen motor current [A]. Deliberately low: braking energy
     // returns to the bus, a bench PSU can't sink it, and there is no bus-OV
     // clamp yet. Raise once OV handling / a brake resistor exists.
@@ -342,6 +347,16 @@ void FOC_ESC::on_mcconf_write(const ChibiOS::VescTelemetry::McconfIn &in)
     _p_v_max.set_and_save(in.max_vin);
     _p_t_start.set_and_save(in.temp_fet_start);
     _p_t_max.set_and_save(in.temp_fet_end);
+
+    // foc_sensor_mode. VESC: 0 = SENSORLESS, 1 = ENCODER, 2 = HALL, 3 = HFI; we
+    // implement only the first and third of those. Deliberately NOT a plain
+    // "== 2 ? hall : sensorless": ENCODER/HFI are modes this firmware cannot run,
+    // and silently reading either as SENSORLESS would drop a sensored motor onto
+    // the observer path without the operator ever asking for it. Anything we do
+    // not implement leaves the param untouched. 0xFF = field absent (see McconfIn).
+    if (in.sensor_mode == 0 || in.sensor_mode == 2) {
+        _p_sensor_mode.set_and_save(int8_t(in.sensor_mode == 2 ? 1 : 0));
+    }
 
     // set_and_save() only QUEUES the write for the background IO thread
     // (AP_Param::save_queue). The deferred reboot below fires 400 ms later,

@@ -33,6 +33,12 @@ public:
         float   temp_fet_start;   // l_temp_fet_start [°C]
         float   temp_fet_end;     // l_temp_fet_end [°C]
         uint8_t poles;            // si_motor_poles (pole COUNT, = 2·pole_pairs)
+        // foc_sensor_mode, VESC encoding: 0 = SENSORLESS, 1 = ENCODER, 2 = HALL,
+        // 3 = HFI. 0xFF = "not supplied by this packet" so the sink can tell a
+        // genuine 0 (sensorless) from an absent field and leave the param alone.
+        // Only 0 and 2 are implemented here; the sink must ignore 1 and 3 rather
+        // than falling through to sensorless on a mode we cannot actually run.
+        uint8_t sensor_mode = 0xFF;
     };
     // Param-derived values the GET_MCCONF responder needs but MotorControl does
     // not expose. Pushed once at boot (reboot-to-apply model); poles also drives

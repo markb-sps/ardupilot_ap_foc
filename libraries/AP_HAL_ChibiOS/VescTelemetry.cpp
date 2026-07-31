@@ -895,7 +895,7 @@ void VescTelemetry::handle_set_mcconf()
     A(); A();                               // foc_f_zv, foc_dt_us
     U8();                                   // foc_encoder_inverted
     A(); A();                               // foc_encoder_offset, foc_encoder_ratio
-    U8();                                   // foc_sensor_mode
+    in.sensor_mode = p[0]; p += 1;          // foc_sensor_mode (0=sensorless, 2=hall)
     A(); A();                               // foc_pll_kp, foc_pll_ki
     in.motor_l = get_f32_auto(p);           // foc_motor_l
     A();                                    // foc_motor_ld_lq_diff

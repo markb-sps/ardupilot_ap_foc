@@ -42,7 +42,12 @@ SWEEP_FREQS = [500, 800, 1500, 2500, 4000]
 SWEEP_AMP   = 0.06
 SWEEP_MS    = 400     # tone length per shot
 SWEEP_DWELL = 2.5     # seconds of polling per frequency
-CFG_R, CFG_L = 0.055, 80e-6   # what the firmware is configured with, for comparison
+# What the firmware is configured with, for comparison. These are HARDCODED here,
+# NOT read from the board — keep them in step with the M_RS / M_LS params or the
+# "x off" line below compares against a stale literal and lies. M_LS was 80e-6 for
+# a long time while the real motor measured ~9e-6, which made every sweep report a
+# ~9x error that was really a wrong param, not a wrong measurement.
+CFG_R, CFG_L = 0.055, 9e-6
 def crc16(d):
     c = 0
     for b in d:
@@ -245,6 +250,7 @@ try:
                   f"pk={pk[0]:.2f}/{pk[1]:.2f}/{pk[2]:.2f}  "
                   f"erpm={erpm:+7.0f}  theta={theta:+.2f} obs={obs:+.2f} "
                   f"lag={math.degrees(lag):+5.0f}deg  vd={g(65,1000):+.2f} "
+                  f"vq={g(69,1000):+.2f} "
                   f"hall={p[102]} tab={p[103]}")
         elif p and p[0] == 4:
             # Short packet = firmware predating the appended bring-up fields.

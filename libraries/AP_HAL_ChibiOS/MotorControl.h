@@ -220,8 +220,23 @@ public:
         // This is what keeps the open-loop hard-switch convergence from blipping.
         float    observer_gain_mod_full  = 0.4f;   // modulation at which gain hits full
         float    observer_gain_slow_frac = 0.25f;  // floor fraction at standstill (VESC foc_observer_gain_slow)
-        float    speed_kp      = 0.0005f;  // outer speed PI [A per eRPM]
-        float    speed_ki      = 0.001f;   // outer speed PI [A per eRPM·s]
+        // Outer speed PI. NOTE: FOC_ESC::init() OVERRIDES both of these — the
+        // board-specific tuning lives there (Tools/AP_Periph/foc_esc.cpp), and
+        // these values are never what actually runs on the TEST-G4-FOC-ESC.
+        // They differ by 10x/50x from the override, so do not reason about loop
+        // behaviour from the numbers here. Neither set has been tuned against a
+        // real rotor; tune Kp first with Ki = 0 on a speed step, then add Ki.
+        // Anti-windup is back-calculation against the i_max and regen clamps,
+        // not an integrator clamp — see the SPEED branch of the run loop.
+        float    speed_kp      = 0.0005f;  // outer speed PI [A per eRPM]  (overridden)
+        float    speed_ki      = 0.001f;   // outer speed PI [A per eRPM·s] (overridden)
+        // VESC s_pid_min_erpm. Below this SETPOINT the speed loop resets its
+        // integrator and releases the motor (iq = 0) instead of regulating —
+        // speed control is meaningless at a speed the feedback cannot resolve,
+        // and without the guard the loop integrates a setpoint it can never
+        // reach while standing still. VESC's stock value, also what our
+        // GET_MCCONF responder already reports.
+        float    speed_min_erpm = 900.0f;
         // VESC s_pid_ramp_erpms_s: slew the speed setpoint toward the command at
         // this accel limit. Keeps the post-handover acceleration controlled so the
         // observer/PLL can track it (no desync on large speed commands).
@@ -566,6 +581,7 @@ private:
     float _spd_kp          = 0.0f;
     float _spd_ki_dt       = 0.0f;
     float _spd_ramp_erpm_s = 0.0f;   // speed-setpoint slew rate [eRPM/s]
+    float _spd_min_erpm    = 0.0f;   // below this setpoint SPEED releases the motor
     float _spd_set_erpm    = 0.0f;   // ramped speed setpoint (follows _cmd_erpm)
     float _pll_kp          = 0.0f;   // observer-angle PLL gains (speed estimate)
     float _pll_ki          = 0.0f;
@@ -603,6 +619,16 @@ private:
     float    _hall_base     = 0.0f; // interpolation origin (sector entry edge) [rad]
     float    _hall_theta    = 0.0f; // interpolated commutation angle [rad]
     float    _hall_omega    = 0.0f; // electrical speed from hall timing [rad/s]
+    // Is _hall_omega a MEASUREMENT, or the fabricated zero the stop timeout
+    // writes? Hall speed comes from the interval between 60° transitions, so
+    // below ~1 sector per HALL_STOP_S there is simply no measurement, and
+    // update_hall() forces 0 — correct for commutation (a stopped rotor needs
+    // no interpolation) but a lie to any loop that closes on speed. The SPEED
+    // PI must freeze its integrator while this is false, or it integrates
+    // setpoint-minus-nothing at low RPM and dumps the wound-up current the
+    // instant the rotor moves. Always true in SENSORLESS (the observer/PLL
+    // estimate is continuous).
+    bool     _hall_omega_valid = false;
     uint32_t _hall_ticks    = 0;    // ISR ticks since the last committed transition
     uint16_t _hall_fault    = 0;    // consecutive invalid-read samples
     // Hall-table detection accumulators (circular mean of the forced angle seen
