@@ -305,7 +305,7 @@ void MotorControl::reset_control()
     _hall_state = HALL_NONE;
     _hall_raw_prev = _hall_deb = 0;
     _hall_omega = 0.0f;
-    _hall_omega_valid = false;   // no transition timed yet → no speed measurement
+    _spd_pll_theta = _spd_pll_omega = 0.0f;
     _hall_ticks = 0;
     _hall_fault = 0;
     // Motion must be re-confirmed after any stop/hold-off before full current is
@@ -1099,9 +1099,25 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
             return;
         }
     }
-    // Unified control-speed estimate: hall timing when sensored, observer PLL
-    // otherwise. Used by the shared coast/regen/speed-loop logic below.
-    const float omega_ctrl = (_sensor_mode == SensorMode::HALL) ? _hall_omega : _obs_omega;
+    // Unified control-speed estimate: the PLL locked to the CORRECTED commutation
+    // angle, in both sensor modes — VESC S_PID_SPEED_SRC_PLL / m_pll_speed
+    // (foc_math.c foc_run_pid_control_speed) fed by FOC_SPEED_SRC_CORRECTED
+    // (mcpwm_foc.c: phase_for_speed_est = state->phase).
+    //
+    // This deliberately does NOT read _hall_omega. Hall sector timing yields six
+    // samples per electrical revolution and the HALL_STOP_S timeout forces it to
+    // zero below ~200 eRPM, so as outer-loop feedback it is both coarse and, at
+    // low speed, simply false — the loop would integrate against a fabricated
+    // zero and dump the accumulated current the moment the rotor moved. The PLL
+    // tracks the same hall-derived angle but interpolates continuously, so it
+    // stays smooth all the way down. _hall_omega now only informs the
+    // hall→observer blend, which is what it is actually good for.
+    //
+    // Lags the commutation angle by one control cycle (50 µs): speed_pll_run()
+    // is called below, after theta is chosen. VESC has the same one-sample
+    // relationship — its PLL runs in the ISR and the speed PID consumes the
+    // result on a later pass.
+    const float omega_ctrl = _spd_pll_omega;
 
     // ── Coast (CURRENT @ iq=0) / Brake: hold the loop alive, never let OL
     //    re-arm and re-spin the motor, auto-release once safely slow. Without
@@ -1154,7 +1170,7 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
         _hyst_timer   = 0.0f;
         _track_timer  = _resync_t;
         _lock_count   = 0;
-        _spd_set_erpm = _obs_omega * _w_to_erpm;  // VESC: init setpoint to current speed
+        _spd_set_erpm = _spd_pll_omega * _w_to_erpm;  // VESC: init setpoint to current speed
     }
 
     const float dir = (mode == Mode::SPEED)
@@ -1184,10 +1200,11 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
 
         // Minimum-speed guard (VESC foc_run_pid_control_speed s_pid_min_erpm):
         // below this SETPOINT the loop resets its integrator and RELEASES the
-        // motor rather than trying to regulate. Speed control has no meaning at
-        // a speed the feedback cannot resolve, and without this the loop sits at
-        // a standstill integrating a setpoint it can never reach. Note the test
-        // is on the setpoint, not the measurement — same as VESC.
+        // motor (iq = 0) rather than regulating. A commanded crawl is treated as
+        // "stop", not as a target to hold torque against — otherwise a near-zero
+        // setpoint leaves the loop pushing current into a stationary rotor
+        // indefinitely. Tested on the SETPOINT, not the measurement, so a motor
+        // dragged to a standstill under a real command still gets regulated.
         if (fabsf(_spd_set_erpm) < _spd_min_erpm) {
             _integ_spd = 0.0f;
             iq_cmd     = 0.0f;
@@ -1202,20 +1219,7 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
             // then scales by current_max; working directly in amps is the same
             // thing with i_max as the limit.
             iq_cmd = clampf(erpm_err * _spd_kp + _integ_spd, -i_max, i_max);
-
-            // Integrate only against a REAL speed measurement. DEVIATION from
-            // VESC, and only because our speed SOURCE differs: VESC feeds the
-            // PID from the PLL (S_PID_SPEED_SRC_PLL, m_pll_speed), continuous at
-            // any speed, whereas we feed _hall_omega — timed between 60°
-            // transitions and FORCED to zero once none arrives within
-            // HALL_STOP_S (~200 eRPM). Integrating through that fabricated zero
-            // winds the term up against an error that is largely fiction and
-            // dumps it the moment the rotor moves. The proportional term still
-            // acts, so break-away torque is unaffected; only accumulation is
-            // held. Remove this if the PID is ever moved onto the PLL estimate.
-            if ((_sensor_mode != SensorMode::HALL) || _hall_omega_valid) {
-                _integ_spd = clampf(_integ_spd + erpm_err * _spd_ki_dt, -i_max, i_max);
-            }
+            _integ_spd = clampf(_integ_spd + erpm_err * _spd_ki_dt, -i_max, i_max);
         }
         // Regen limit: when iq opposes rotation (decelerating) the braking energy
         // returns to the bus, which a bench PSU can't sink — cap the braking
@@ -1271,6 +1275,14 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
                                theta, id_set, iq_set)) {
         return;   // sensorless start abandoned this cycle — bridge already gated off
     }
+
+    // Speed estimate, from the angle we are ACTUALLY commutating with — hall
+    // interpolation, blend, observer or the forced I/f angle, whichever this
+    // cycle selected. VESC runs its PLL here for the same reason (mcpwm_foc.c
+    // phase_for_speed_est = state->phase). Consumed as omega_ctrl on the next
+    // cycle. Not reached on the abandoned-start path above, which is correct:
+    // that cycle gates the bridge off and commutates nothing.
+    speed_pll_run(theta);
 
     // ── dq current PI (Kp = L·ωbw, Ki = R·ωbw) with anti-windup ─────────────
     const float sin_t = sinf(theta);
@@ -1445,6 +1457,19 @@ void MotorControl::dt_comp_apply_duties(float sin_t, float cos_t,
     dc = clampf(dc + sc * step, 0.0f, 1.0f);
 }
 
+// Speed-estimate PLL — vedderb/bldc foc_pll_run() (foc_math.c), same form and
+// the same gains as the observer-angle PLL inside observer_update():
+//   phase += (speed + kp·Δ)·dt ;  speed += ki·Δ·dt ,  Δ = wrap(phase_in − phase)
+// Its input is the CORRECTED commutation angle (VESC FOC_SPEED_SRC_CORRECTED),
+// so it works identically in hall, blended and sensorless modes, and gives the
+// outer loops a continuous speed where hall sector timing gives them a staircase.
+void MotorControl::speed_pll_run(float phase)
+{
+    const float delta = wrap_pi(phase - _spd_pll_theta);
+    _spd_pll_theta = wrap_pi(_spd_pll_theta + (_spd_pll_omega + _pll_kp * delta) * _dt);
+    _spd_pll_omega += _pll_ki * delta * _dt;
+}
+
 // Ortega flux-linkage observer (vedderb/bldc foc_observer_update).
 //   x_dot = v − R·i + (γ/2)·(x − L·i)·(λ² − |x − L·i|²)
 //   θ     = atan2(x2 − L·iβ, x1 − L·iα)
@@ -1610,7 +1635,7 @@ bool MotorControl::run_sensorless(Mode mode, float dir, float iq_cmd,
                 if (mode == Mode::SPEED) {
                     // Seed the speed loop to the speed the observer found
                     // (same reset as the OL handover).
-                    _spd_set_erpm = _obs_omega * _w_to_erpm;
+                    _spd_set_erpm = _spd_pll_omega * _w_to_erpm;
                     _integ_spd    = 0.0f;
                 }
             } else {
@@ -1659,7 +1684,7 @@ bool MotorControl::run_sensorless(Mode mode, float dir, float iq_cmd,
             // subsequent acceleration is governed by the setpoint slew
             // (speed_ramp_erpm_s), which the observer/PLL can track.
             if (handover) {
-                _spd_set_erpm = _obs_omega * _w_to_erpm;
+                _spd_set_erpm = _spd_pll_omega * _w_to_erpm;
                 _integ_spd    = 0.0f;
                 iq_set        = 0.0f;
             }
@@ -1754,14 +1779,12 @@ bool MotorControl::update_hall()
             _hall_base  = ang;
             _hall_dir   = 1.0f;
             _hall_omega = 0.0f;
-            _hall_omega_valid = false;   // first fix: no interval to time yet
         } else {
             // Direction + speed from the 60° step between sector centres.
             const float d   = wrap_pi(ang - _hall_table[_hall_state]);
             _hall_dir       = (d >= 0.0f) ? 1.0f : -1.0f;
             const float dts = float(_hall_ticks) * _dt;
             _hall_omega     = (dts > 1e-6f) ? (_hall_dir * HALL_SECTOR / dts) : 0.0f;
-            _hall_omega_valid = (dts > 1e-6f);   // a real interval was timed
             // The rotor just crossed into this sector, so it is one half-sector
             // before the centre (in the direction of travel).
             _hall_base      = wrap_pi(ang - _hall_dir * HALL_HALF_SECTOR);
@@ -1780,12 +1803,11 @@ bool MotorControl::update_hall()
     _hall_theta = wrap_pi(_hall_base + adv);
 
     // No transition for a while → the rotor has stopped (or is turning too
-    // slowly to time); drop the speed estimate. Mark it INVALID as well: zero
-    // here means "no measurement", not "measured zero", and the SPEED PI has to
-    // be able to tell those apart — see _hall_omega_valid.
+    // slowly to time); drop the speed estimate. Only the hall→observer blend
+    // reads this; the outer loops close on _spd_pll_omega, which stays
+    // continuous here (VESC S_PID_SPEED_SRC_PLL).
     if (float(_hall_ticks) * _dt > HALL_STOP_S) {
         _hall_omega = 0.0f;
-        _hall_omega_valid = false;
     }
 
     _t_hall_state = _hall_state;

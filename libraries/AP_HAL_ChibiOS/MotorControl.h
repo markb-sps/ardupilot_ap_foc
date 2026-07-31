@@ -445,6 +445,10 @@ private:
     // and _hall_omega (speed from transition timing). Returns false on an invalid
     // (0/7) or unmapped state.
     bool        update_hall();
+    // Speed-estimate PLL on the corrected commutation angle. VESC foc_pll_run()
+    // (foc_math.c), run once per control cycle on the angle the bridge is
+    // actually commutating with.
+    void        speed_pll_run(float phase);
     // Largest |phase current| across U/V/W [A] (lock-free telemetry snapshot).
     float       peak_phase_current() const;
     // False if `target` would hot-swap between active drive modes (CURRENT/
@@ -618,17 +622,11 @@ private:
     float    _hall_dir      = 1.0f; // rotation sign from the last transition
     float    _hall_base     = 0.0f; // interpolation origin (sector entry edge) [rad]
     float    _hall_theta    = 0.0f; // interpolated commutation angle [rad]
-    float    _hall_omega    = 0.0f; // electrical speed from hall timing [rad/s]
-    // Is _hall_omega a MEASUREMENT, or the fabricated zero the stop timeout
-    // writes? Hall speed comes from the interval between 60° transitions, so
-    // below ~1 sector per HALL_STOP_S there is simply no measurement, and
-    // update_hall() forces 0 — correct for commutation (a stopped rotor needs
-    // no interpolation) but a lie to any loop that closes on speed. The SPEED
-    // PI must freeze its integrator while this is false, or it integrates
-    // setpoint-minus-nothing at low RPM and dumps the wound-up current the
-    // instant the rotor moves. Always true in SENSORLESS (the observer/PLL
-    // estimate is continuous).
-    bool     _hall_omega_valid = false;
+    // Electrical speed from hall transition timing [rad/s]. Quantised to 6
+    // samples per electrical revolution and FORCED to zero by the HALL_STOP_S
+    // timeout, so it is only fit for the hall→observer blend decision, never as
+    // outer-loop feedback — use _spd_pll_omega for that.
+    float    _hall_omega    = 0.0f;
     uint32_t _hall_ticks    = 0;    // ISR ticks since the last committed transition
     uint16_t _hall_fault    = 0;    // consecutive invalid-read samples
     // Hall-table detection accumulators (circular mean of the forced angle seen
@@ -677,6 +675,20 @@ private:
     float _obs_theta  = 0.0f;
     float _obs_omega  = 0.0f;   // electrical speed [rad/s] — PLL output
     float _pll_theta  = 0.0f;   // PLL tracked angle (follows _obs_theta)
+    // Second PLL, on the FINAL (corrected) commutation angle rather than the raw
+    // observer angle — VESC m_pll_phase / m_pll_speed with foc_speed_soure =
+    // FOC_SPEED_SRC_CORRECTED (mcpwm_foc.c: phase_for_speed_est = state->phase).
+    // This is the speed the outer loops close on (VESC S_PID_SPEED_SRC_PLL),
+    // and it is what makes HALL mode usable for speed control: it is continuous
+    // at any speed, where hall sector timing quantises to 6 samples per
+    // electrical revolution and collapses to zero below ~200 eRPM.
+    // Kept SEPARATE from _obs_omega, which must keep tracking the observer angle
+    // alone — the sensorless start/handover logic uses it to decide whether the
+    // observer has something real, and feeding it the forced open-loop angle
+    // would make it report the speed we are commanding rather than the speed
+    // the machine is actually doing.
+    float _spd_pll_theta = 0.0f;   // tracked angle [rad]
+    float _spd_pll_omega = 0.0f;   // electrical speed [rad/s] — outer-loop feedback
 
     // ── Telemetry snapshots (ISR → thread) ─────────────────────────────────
     volatile State   _state      = State::IDLE;
