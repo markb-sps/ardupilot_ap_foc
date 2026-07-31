@@ -80,6 +80,11 @@ constexpr uint8_t  HALL_NONE          = 0xFF; // "no committed state yet" sentin
 constexpr uint8_t  HALL_DEBOUNCE      = 2;    // identical raw reads before a state commit
 constexpr uint16_t HALL_FAULT_SAMPLES = 200;  // consecutive invalid reads → FAULT (~10 ms @20 kHz)
 constexpr float    HALL_STOP_S        = 0.05f;// no transition for this long → treat speed as 0
+// Floor speed for the commutation-angle rate limiter, VESC foc_hall_interp_erpm.
+// Sets how fast the angle may slew when the measured hall speed is ~0, so a 60°
+// sector step is still crossed promptly at standstill without being applied as
+// an instantaneous jump.
+constexpr float    HALL_INTERP_ERPM   = 500.0f;
 constexpr float    HALL_SECTOR        = 1.04719755f;   // 60° electrical [rad]
 constexpr float    HALL_HALF_SECTOR   = 0.52359878f;   // 30° electrical [rad]
 constexpr uint8_t  HALL_BREAKAWAY_N   = 2;    // hall transitions confirming motion → release full current
@@ -177,8 +182,12 @@ bool MotorControl::init(const Config &cfg)
     _vbus          = cfg.vbus;
     _current_scale = cfg.current_scale;
 
-    _cur_kp    = cfg.current_bw_rad * cfg.motor_Ls;
-    _cur_ki_dt = cfg.current_bw_rad * cfg.motor_Rs * _dt;
+    // Explicit gains win; otherwise derive them the way VESC's tool would.
+    _cur_kp    = (cfg.current_kp > 0.0f) ? cfg.current_kp
+                                         : (cfg.current_bw_rad * cfg.motor_Ls);
+    _cur_ki    = (cfg.current_ki > 0.0f) ? cfg.current_ki
+                                         : (cfg.current_bw_rad * cfg.motor_Rs);
+    _cur_ki_dt = _cur_ki * _dt;
     _current_max   = cfg.current_max;
     _i_slew_per_tick = cfg.current_slew_a_s * _dt;   // 0 → instant (slew disabled)
     _oc_trip       = cfg.overcurrent_trip;
@@ -305,6 +314,7 @@ void MotorControl::reset_control()
     _hall_state = HALL_NONE;
     _hall_raw_prev = _hall_deb = 0;
     _hall_omega = 0.0f;
+    _hall_theta = _hall_theta_rl = 0.0f;
     _spd_pll_theta = _spd_pll_omega = 0.0f;
     _hall_ticks = 0;
     _hall_fault = 0;
@@ -689,7 +699,28 @@ void MotorControl::play_tone(float freq_hz, float amplitude, uint16_t duration_m
     _beep_phase_step = TWO_PI * freq_hz * _dt;
     _beep_amp        = clampf(amplitude, 0.0f, _debug_max_mod);
     _beep_ticks_left = uint32_t(duration_ms) * (_pwm_update_rate_hz / 1000U);
+    _tone_ipk        = 0.0f;   // fresh peak window for this tone (R/L detection)
     _mode            = Mode::BEEP;
+    arm_bridge();
+}
+
+// Forced-angle current injection — VESC mc_interface_set_openloop_current().
+// The angle is advanced at the commanded eRPM and the d-axis current is
+// regulated to `amps` with iq targeted at 0, so the rotor is dragged round like
+// a stepper. Both parameter detections are built on this; see the header.
+void MotorControl::set_openloop_current(float amps, float erpm)
+{
+    _last_cmd_ms = AP_HAL::millis();
+    if (!_initialized || _fault_latched) {
+        return;   // same rule as hall detect: the host must clear a trip first
+    }
+    _ol_i_amps = clampf(amps, -_current_max, _current_max);
+    _ol_i_erpm = erpm;
+    if (_mode != Mode::OPENLOOP_I) {
+        _ol_i_angle = 0.0f;
+        _integ_d = _integ_q = 0.0f;   // this mode owns the current PI — start clean
+        _mode    = Mode::OPENLOOP_I;
+    }
     arm_bridge();
 }
 
@@ -912,6 +943,17 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
         _beep_phase = wrap_pi(_beep_phase + _beep_phase_step);
         const float m_alpha = _beep_amp * sinf(_beep_phase);
         const float m_beta  = 0.0f;
+        // Peak |i_alpha| over the tone. m_beta is 0, so the excitation is a pure
+        // fixed-axis AC vector and i_alpha is the whole response — its peak
+        // against the commanded tone voltage is |Z| at this frequency, which is
+        // what the R/L detection sweeps. (i_alpha == ia for our amplitude-
+        // invariant Clarke.)
+        {
+            const float ialpha_abs = fabsf(i_alpha);
+            if (ialpha_abs > _tone_ipk) {
+                _tone_ipk = ialpha_abs;
+            }
+        }
 
         float va, vb, vc;
         FOC::inv_clarke(m_alpha, m_beta, va, vb, vc);
@@ -925,6 +967,57 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
         _state  = State::BEEP;
         _t_duty = _beep_amp;
         _t_erpm = 0.0f;
+        return;
+    }
+
+    // ── Forced-angle current injection (parameter detection) ────────────────
+    // d-axis current regulated on an angle advancing at the commanded eRPM.
+    // Same modulation and dead-time treatment as every other driving path, so
+    // the vd/vq it reports are directly comparable with the main loop's.
+    if (mode == Mode::OPENLOOP_I) {
+        _ol_i_angle = wrap_pi(_ol_i_angle + _ol_i_erpm * _erpm_to_w * _dt);
+        const float st = sinf(_ol_i_angle);
+        const float ct = cosf(_ol_i_angle);
+
+        float id_m, iq_m;
+        FOC::park(i_alpha, i_beta, st, ct, id_m, iq_m);
+        _id_filt += (id_m - _id_filt) * CURRENT_FILT_K;
+        _iq_filt += (iq_m - _iq_filt) * CURRENT_FILT_K;
+        const float id_target = _ol_i_amps;
+        _integ_d = clampf(_integ_d + (id_target - id_m) * _cur_ki_dt, -_v_max, _v_max);
+        _integ_q = clampf(_integ_q + (0.0f      - iq_m) * _cur_ki_dt, -_v_max, _v_max);
+        float vd = clampf((id_target - id_m) * _cur_kp + _integ_d,
+                          -_v_max * 0.7071068f, _v_max * 0.7071068f);
+        float vq = (0.0f - iq_m) * _cur_kp + _integ_q;
+        const float vqr = sqrtf(_v_max * _v_max - vd * vd);
+        vq = clampf(vq, -vqr, vqr);
+
+        float v_alpha, v_beta;
+        FOC::inv_park(vd, vq, st, ct, v_alpha, v_beta);
+        const float m_alpha = v_alpha * _inv_vbus_half;
+        const float m_beta  = v_beta  * _inv_vbus_half;
+
+        float va, vb, vc, da, db, dc;
+        FOC::inv_clarke(m_alpha, m_beta, va, vb, vc);
+        FOC::svpwm(va, vb, vc, da, db, dc);
+        dt_comp_apply_duties(st, ct, da, db, dc);
+        write_duties(da, db, dc);
+        float dv_a, dv_b;
+        dt_comp_alpha_beta(st, ct, dv_a, dv_b);
+        _v_alpha_prev = v_alpha - dv_a;
+        _v_beta_prev  = v_beta  - dv_b;
+
+        _state   = State::DETECT_I;
+        _t_id    = id_m;
+        _t_iq    = iq_m;
+        _t_vd    = vd;
+        _t_vq    = vq;
+        _t_theta = _ol_i_angle;
+        // REAL modulation depth here (not the current target the hall-detect
+        // branch reports): the flux detection's ramp terminates on a duty
+        // threshold, so get_duty_vesc() has to mean what VESC means by it.
+        _t_duty  = sqrtf(m_alpha * m_alpha + m_beta * m_beta);
+        _t_erpm  = _ol_i_erpm;
         return;
     }
 
@@ -1259,8 +1352,8 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
         const float erpm_abs = fabsf(_hall_omega) * _w_to_erpm;
         const float k = mapf(erpm_abs, _hall_blend_lo, _hall_blend_hi, 0.0f, 1.0f);
         theta = (k <= 0.0f)
-                    ? _hall_theta
-                    : wrap_pi(_hall_theta + k * wrap_pi(_obs_theta - _hall_theta));
+                    ? _hall_theta_rl
+                    : wrap_pi(_hall_theta_rl + k * wrap_pi(_obs_theta - _hall_theta_rl));
         iq_set = iq_cmd;   // torque straight through; no open-loop boost needed
         // Break-away clamp: until the rotor has demonstrably moved (>= a couple
         // of hall transitions) cap torque current to a low value. A wrong/mis-
@@ -1779,6 +1872,7 @@ bool MotorControl::update_hall()
             _hall_base  = ang;
             _hall_dir   = 1.0f;
             _hall_omega = 0.0f;
+            _hall_theta_rl = ang;   // first fix: snap, nothing to slew from
         } else {
             // Direction + speed from the 60° step between sector centres.
             const float d   = wrap_pi(ang - _hall_table[_hall_state]);
@@ -1801,6 +1895,28 @@ bool MotorControl::update_hall()
     float adv = _hall_omega * (float(_hall_ticks) * _dt);
     adv = clampf(adv, -HALL_SECTOR, HALL_SECTOR);
     _hall_theta = wrap_pi(_hall_base + adv);
+
+    // Rate-limit the commutation angle — vedderb/bldc foc_correct_hall():
+    //     angle_step = max(|erpm_hall|, foc_hall_interp_erpm)/60 · 2π · dt · 1.5
+    //     slew m_ang_hall_rate_limited toward m_ang_hall by at most angle_step
+    // VESC's stated reason is to stop the 60° sector step spiking the current
+    // controllers. It matters twice as much here because the speed PLL tracks
+    // this angle: a step drives the PLL to overshoot to thousands of eRPM, the
+    // speed loop reads that as massive overspeed and brakes, and the motor
+    // never leaves standstill.
+    //
+    // The 1.5 factor is what keeps the limiter out of the way once turning: it
+    // allows 50% more slew than the rotor actually needs at the measured speed,
+    // so it only ever bites on a genuine discontinuity.
+    const float erpm_hall  = fabsf(_hall_omega) * _w_to_erpm;
+    const float step       = (fmaxf(erpm_hall, HALL_INTERP_ERPM) / 60.0f)
+                             * TWO_PI * _dt * 1.5f;
+    const float ang_diff   = wrap_pi(_hall_theta - _hall_theta_rl);
+    if (fabsf(ang_diff) < step) {
+        _hall_theta_rl = _hall_theta;
+    } else {
+        _hall_theta_rl = wrap_pi(_hall_theta_rl + ((ang_diff >= 0.0f) ? step : -step));
+    }
 
     // No transition for a while → the rotor has stopped (or is turning too
     // slowly to time); drop the speed estimate. Only the hall→observer blend

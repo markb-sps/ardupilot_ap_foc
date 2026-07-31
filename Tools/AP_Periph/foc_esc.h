@@ -54,6 +54,51 @@ private:
     // Deferred so the COMM_SET_MCCONF ack + storage flush complete first.
     uint32_t _reboot_ms = 0;
 
+    // ── Motor-parameter detection (VESC Tool "Measure R/L" / "Measure λ") ────
+    // VESC runs these as blocking commands in a worker thread; we have no spare
+    // thread and must not stall the periph main loop for the ~10 s a flux
+    // measurement takes (DroneCAN and USB would both drop), so it is a state
+    // machine ticked from update(). VESC Tool waits for the reply either way.
+    void on_detect_request(const ChibiOS::VescTelemetry::DetectReq &req);
+    static void detect_trampoline(void *ctx,
+                                  const ChibiOS::VescTelemetry::DetectReq &req) {
+        static_cast<FOC_ESC *>(ctx)->on_detect_request(req);
+    }
+    // Advance the detection. Returns true while it owns the motor, which holds
+    // the throttle arbiter off exactly like the power-on chime does.
+    bool update_detect(uint32_t now_ms);
+    void detect_finish(float r, float l, float linkage, bool ok);
+
+    enum class DetState : uint8_t {
+        IDLE,
+        RES_LOCK,      // ramp d-axis current in at zero speed, let it settle
+        RES_MEAS,   // average vd/id → phase resistance
+        IND_TONE,      // play the tone at each sweep frequency, record peak current
+        IND_GAP,    // gap between tones so the peak window is clean
+        FLUX_LOCK,      // flux: ramp current in with the rotor held
+        FLUX_STILL,     // average the standstill duty (VESC duty_still)
+        FLUX_RAMP,      // ramp commanded speed until duty reaches the target
+        FLUX_SETTLE,    // let it stabilise before averaging
+        FLUX_MEAS,   // average vd/vq/id/iq → linkage
+        DONE_STOP,   // coast, then reply
+    };
+    DetState _det_state = DetState::IDLE;
+    ChibiOS::VescTelemetry::DetectReq _det_req;
+    uint32_t _det_ms      = 0;    // millis() the current phase started
+    uint32_t _det_ticks   = 0;    // samples accumulated in an averaging phase
+    float    _det_acc_a   = 0.0f; // accumulator (vd, or duty, or |v|)
+    float    _det_acc_b   = 0.0f; // accumulator (id, or |i|)
+    float    _det_erpm    = 0.0f; // commanded speed during F_RAMP
+    float    _det_duty_max = 0.0f;// peak duty seen during F_RAMP (collapse check)
+    float    _det_duty_still = 0.0f;
+    float    _det_r       = 0.0f; // measured phase resistance [Ω]
+    float    _det_l       = 0.0f; // measured phase inductance [H]
+    float    _det_r_try   = 0.0f; // current level of the VESC resistance search [A]
+    uint8_t  _det_freq_idx = 0;   // index into the L sweep frequency table
+    // |Z|² and ω² per sweep point, for the least-squares |Z|² = R² + ω²L² fit.
+    float    _det_zz[4]   = {0};
+    float    _det_ww[4]   = {0};
+
     // Poll the J305 TIM3 capture and refresh the PWM throttle source (with the
     // boot-low arming gate + out-of-range coast).
     void read_pwm_throttle(uint32_t now_ms);
@@ -81,6 +126,9 @@ private:
     AP_Float _p_motor_rs;      // phase resistance [Ω]      → foc_motor_r
     AP_Float _p_motor_ls;      // phase inductance [H]      → foc_motor_l
     AP_Float _p_motor_flux;    // PM flux linkage λ [Wb]    → foc_motor_flux_linkage
+    AP_Float _p_obs_gain;      // Ortega observer γ        → foc_observer_gain
+    AP_Float _p_cur_kp;        // current PI Kp [V/A]      → foc_current_kp (0 = derive)
+    AP_Float _p_cur_ki;        // current PI Ki [V/(A·s)]  → foc_current_ki (0 = derive)
     AP_Int8  _p_motor_poles;   // pole PAIRS (si_motor_poles = 2×)
 
     // ── Current loop / limits (I_MAX + I_OCHARD VESC-writable) ───────────────

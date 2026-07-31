@@ -31,6 +31,14 @@ constexpr uint8_t COMM_PRINT        = 21;   // terminal text response
 // DETECT_ENCODER=27, DETECT_HALL_FOC=28). This is what VESC Tool's hall detect
 // button sends; must match exactly or the command is silently dropped.
 constexpr uint8_t COMM_DETECT_HALL_FOC = 28;
+// Parameter detection. VESC Tool's FOC tab sends R_L for "Measure R/L" and
+// FLUX_LINKAGE_OPENLOOP (57, NOT the legacy 26) for "Measure λ"; the motor
+// wizard sends APPLY_ALL_FOC. All three are "blocking commands" in VESC —
+// answered from a worker thread when the measurement completes, so the tool
+// tolerates a reply seconds later (comm/commands.c blocking-command list).
+constexpr uint8_t COMM_DETECT_MOTOR_R_L                 = 25;
+constexpr uint8_t COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP = 57;
+constexpr uint8_t COMM_DETECT_APPLY_ALL_FOC             = 58;
 constexpr uint8_t COMM_SET_MCCONF         = 13;  // VESC Tool "Write Motor Configuration"
 constexpr uint8_t COMM_GET_MCCONF         = 14;  // VESC Tool "Read Motor Configuration"
 constexpr uint8_t COMM_GET_MCCONF_DEFAULT = 15;
@@ -103,6 +111,12 @@ inline uint32_t get_u32(const uint8_t *&p) {
 }
 inline float get_f16(const uint8_t *&p, float scale) {
     return float(int16_t(get_u16(p))) / scale;
+}
+// VESC buffer_get_float32(): fixed-point int32 divided by a per-field scale.
+// Distinct from get_f32_auto() (buffer_get_float32_auto), which is a packed
+// exponent/mantissa form — the detection commands use the SCALED variant.
+inline float get_f32(const uint8_t *&p, float scale) {
+    return float(int32_t(get_u32(p))) / scale;
 }
 // Inverse of put_f32_auto (VESC buffer_get_float32_auto).
 inline float get_f32_auto(const uint8_t *&p) {
@@ -295,6 +309,11 @@ void VescTelemetry::dispatch()
     case COMM_DETECT_HALL_FOC:
         handle_detect_hall();
         break;
+    case COMM_DETECT_MOTOR_R_L:
+    case COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP:
+    case COMM_DETECT_APPLY_ALL_FOC:
+        handle_detect(_payload[0]);
+        break;
     case COMM_GET_MCCONF:
     case COMM_GET_MCCONF_DEFAULT:
         // VESC Tool reads the motor config (incl. the FOC hall table) via this.
@@ -441,6 +460,19 @@ void VescTelemetry::handle_set_current()
     // MotorControl directly, so CAN can take priority. Applied in update_motor_test().
     _usb_current_a  = float(ma) / 1000.0f;
     _usb_current_ms = AP_HAL::millis();
+    // A current command REPLACES any rpm/duty/brake bench override — both because
+    // that is VESC's semantic (a new setpoint selects the control mode) and
+    // because VESC Tool's STOP button is a COMM_SET_CURRENT of 0. While an
+    // override is active the arbiter deliberately stands off and applies nothing,
+    // so without this the stop button cannot reach the motor and a speed-mode
+    // spin cannot be commanded down from the tool at all.
+    _override_ms = 0;
+    // Belt and braces on the stop path: drive the release straight into the
+    // controller as well, so stopping never depends on the arbiter running or on
+    // which source it happens to pick this cycle.
+    if (ma == 0) {
+        _mc.set_current(0.0f);
+    }
 }
 
 // COMM_SET_CURRENT_BRAKE: payload = [cmd, int32 brake_mA] — regen brake
@@ -453,7 +485,8 @@ void VescTelemetry::handle_set_current_brake()
                        (int32_t(_payload[3]) <<  8) |
                         int32_t(_payload[4]);
     _mc.set_brake_current(float(ma) / 1000.0f);
-    _override_ms = AP_HAL::millis();   // bench override: arbiter stands off
+    // Zero release drops the override so CAN/PWM arbitration resumes.
+    _override_ms = (ma != 0) ? AP_HAL::millis() : 0;
 }
 
 // COMM_SET_DUTY: payload = [cmd, int32 duty·1e5]. Repurposed as the open-loop
@@ -468,7 +501,7 @@ void VescTelemetry::handle_set_duty()
                       (int32_t(_payload[3]) <<  8) |
                        int32_t(_payload[4]);
     _mc.set_debug_voltage(float(d) / 100000.0f);
-    _override_ms = AP_HAL::millis();   // bench override: arbiter stands off
+    _override_ms = (d != 0) ? AP_HAL::millis() : 0;
 }
 
 // COMM_SET_RPM: payload = [cmd, int32 erpm] (big-endian, electrical RPM).
@@ -480,7 +513,7 @@ void VescTelemetry::handle_set_rpm()
                          (int32_t(_payload[3]) <<  8) |
                           int32_t(_payload[4]);
     _mc.set_rpm(float(erpm));
-    _override_ms = AP_HAL::millis();   // bench override: arbiter stands off
+    _override_ms = (erpm != 0) ? AP_HAL::millis() : 0;
 }
 
 // COMM_DETECT_HALL_FOC: start a hall-table detection spin (payload current arg
@@ -574,6 +607,82 @@ void VescTelemetry::print_diag()
     send_print(line);
 }
 
+// ── Parameter detection: request parsing and replies ────────────────────────
+// Field order, types and SCALES are fixed by comm/commands.c; a mismatch is
+// silently misread rather than rejected, so they are spelled out per field.
+void VescTelemetry::handle_detect(uint8_t id)
+{
+    if (_detect_cb == nullptr) {
+        return;
+    }
+    DetectReq req{};
+    const uint8_t *p = &_payload[1];
+    const uint16_t n = (_payload_len > 1) ? uint16_t(_payload_len - 1) : 0;
+
+    if (id == COMM_DETECT_MOTOR_R_L) {
+        req.kind = DetectKind::R_L;   // no payload
+    } else if (id == COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP) {
+        if (n < 16) {
+            return;
+        }
+        req.kind         = DetectKind::FLUX_OPENLOOP;
+        req.current      = get_f32(p, 1e3f);
+        req.erpm_per_sec = get_f32(p, 1e3f);
+        req.duty         = get_f32(p, 1e3f);
+        req.resistance   = get_f32(p, 1e6f);
+        // Inductance is optional — older VESC Tool builds omit it, and
+        // conf_general_measure_flux_linkage_openloop() then falls back to the
+        // configured value. Mirror that rather than reading past the payload.
+        if (n >= 20) {
+            req.inductance = get_f32(p, 1e8f);
+        }
+    } else {   // COMM_DETECT_APPLY_ALL_FOC
+        if (n < 21) {
+            return;
+        }
+        req.kind = DetectKind::APPLY_ALL_FOC;
+        p += 1;                                  // detect_can — single-ESC build
+        req.max_power_loss = get_f32(p, 1e3f);
+        p += 4; p += 4;                          // min/max_current_in — unused here
+        req.openloop_erpm  = get_f32(p, 1e3f);
+        req.sl_erpm        = get_f32(p, 1e3f);
+    }
+    _override_ms = AP_HAL::millis();   // bench override: the throttle arbiter stands off
+    _detect_cb(_detect_ctx, req);
+}
+
+void VescTelemetry::send_detect_r_l(float r, float l, float ld_lq_diff)
+{
+    uint8_t buf[16];
+    uint8_t *p = buf;
+    *p++ = COMM_DETECT_MOTOR_R_L;
+    put_f32(p, r,           1e6f);   // [Ω]
+    put_f32(p, l,           1e3f);   // VESC reports inductance in MICROhenry here
+    put_f32(p, ld_lq_diff,  1e3f);   // [µH] — 0, we do not measure saliency
+    send_packet(buf, uint16_t(p - buf));
+}
+
+void VescTelemetry::send_detect_flux(float linkage)
+{
+    uint8_t buf[20];
+    uint8_t *p = buf;
+    *p++ = COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP;
+    put_f32(p, linkage, 1e7f);   // [Wb]; VESC also uses <0 values as error codes
+    put_f32(p, -1.0f,   1e6f);   // enc_offset — no encoder
+    put_f32(p, -1.0f,   1e6f);   // enc_ratio
+    *p++ = 0;                    // enc_inverted
+    send_packet(buf, uint16_t(p - buf));
+}
+
+void VescTelemetry::send_detect_apply_all(int16_t result)
+{
+    uint8_t buf[8];
+    uint8_t *p = buf;
+    *p++ = COMM_DETECT_APPLY_ALL_FOC;
+    put_i16(p, result);   // >0 = ok (VESC returns the number of motors detected)
+    send_packet(buf, uint16_t(p - buf));
+}
+
 // VESC-Tool terminal command (ascii payload after the id byte). Minimal set so
 // the hall table can be read/triggered from VESC Tool without MCCONF support.
 void VescTelemetry::handle_terminal()
@@ -635,7 +744,7 @@ void VescTelemetry::handle_get_mcconf(uint8_t reply_id)
     float L, R, flux;
     _mc.get_motor_lrflux(L, R, flux);
     const float kp = _mc.get_current_kp();
-    const float ki = (L > 1e-9f) ? (kp * R / L) : 0.0f;
+    const float ki = _mc.get_current_ki();
     float bl_lo, bl_hi;
     _mc.get_hall_blend_erpm(bl_lo, bl_hi);
     const bool is_hall = (_mc.get_sensor_mode() == MotorControl::SensorMode::HALL);
@@ -706,7 +815,7 @@ void VescTelemetry::handle_get_mcconf(uint8_t reply_id)
     put_f32_auto(p, 0.0f);                     // foc_motor_ld_lq_diff
     put_f32_auto(p, R);                        // foc_motor_r          ← param
     put_f32_auto(p, flux);                     // foc_motor_flux_linkage ← param
-    put_f32_auto(p, 0.001f);                   // foc_observer_gain
+    put_f32_auto(p, _conf.observer_gain);      // foc_observer_gain      ← param
     put_f32_auto(p, 0.05f);                    // foc_observer_gain_slow
     put_f16     (p, 0.0f, 1000.0f);            // foc_observer_offset
     put_f32_auto(p, 10.0f);                    // foc_duty_dowmramp_kp
@@ -891,7 +1000,8 @@ void VescTelemetry::handle_set_mcconf()
     A(); A();                               // sl_cycle_int_rpm_br, sl_bemf_coupling_k
     p += 8;                                 // hall_table[0-7] u8
     A();                                    // hall_sl_erpm
-    A(); A();                               // foc_current_kp, foc_current_ki
+    in.current_kp = get_f32_auto(p);        // foc_current_kp
+    in.current_ki = get_f32_auto(p);        // foc_current_ki
     A(); A();                               // foc_f_zv, foc_dt_us
     U8();                                   // foc_encoder_inverted
     A(); A();                               // foc_encoder_offset, foc_encoder_ratio
@@ -901,7 +1011,8 @@ void VescTelemetry::handle_set_mcconf()
     A();                                    // foc_motor_ld_lq_diff
     in.motor_r    = get_f32_auto(p);        // foc_motor_r
     in.motor_flux = get_f32_auto(p);        // foc_motor_flux_linkage
-    A(); A();                               // foc_observer_gain, _slow
+    in.observer_gain = get_f32_auto(p);      // foc_observer_gain
+    A();                                    // foc_observer_gain_slow
     H(1000);                                // foc_observer_offset
     A(); A();                               // foc_duty_dowmramp_kp, _ki
     H(10000);                               // foc_start_curr_dec

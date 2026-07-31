@@ -18,7 +18,7 @@ namespace ChibiOS {
 class MotorControl {
 public:
     enum class State : uint8_t { IDLE, ALIGN, OPENLOOP, BLEND, CLOSED, FAULT, DEBUG, BEEP,
-                                 HALL, HALL_DETECT };
+                                 HALL, HALL_DETECT, DETECT_I };
 
     // VESC fault codes (subset) reported through telemetry.
     // FAULT_STALL / FAULT_HALL_SENSOR are not VESC codes — 30+ is outside the
@@ -87,6 +87,16 @@ public:
 
         // ── Current loop / limits ──────────────────────────────────────────
         float    current_bw_rad    = 1000.0f; // current-loop bandwidth [rad/s]
+        // Direct current-PI gains, VESC foc_current_kp / foc_current_ki:
+        //   vd = vd_int + err_d·kp ,  vd_int += err_d·ki·dt   (volts per amp,
+        //   volts per amp-second). VESC keeps these as independent config
+        //   fields and its tool recomputes them as kp = L·bw, ki = R·bw from a
+        //   time constant (conf_general_calc_values). ZERO here means "derive
+        //   from current_bw_rad and the motor R/L", which is the behaviour on
+        //   a board that has never had them written — so an unwritten param can
+        //   never silently zero the current loop.
+        float    current_kp        = 0.0f;
+        float    current_ki        = 0.0f;
         // Power stage (v2 PCB): EPC2305 eGaN FETs — 150 V, 80 A pulsed, 3.2 mΩ,
         // MP1918 gate driver, 1 mΩ shunt + INA181A1. eGaN has NO avalanche rating
         // and a fragile gate (V_GS abs-max ~+6/-4 V): it fails from fast transients
@@ -317,6 +327,26 @@ public:
     // rotation and records the forced angle seen in each hall state, then stores
     // the result into the live hall table and coasts. Call only at standstill.
     void start_hall_detect();
+
+    // ── Parameter detection primitives (VESC Tool "Measure R/L" and "Measure λ")
+    // Forced-angle current injection: regulate d-axis current to `amps` on an
+    // angle advancing at `erpm` electrical RPM (iq target 0). This is VESC's
+    // mc_interface_set_openloop_current(), and it is the one primitive both
+    // detections are built on:
+    //   erpm = 0  → the rotor locks and vd/id is a clean DC resistance reading
+    //   erpm > 0  → the rotor is dragged round like a stepper, and once enough
+    //               back-EMF appears the flux linkage falls out of |v| vs ω.
+    // Drives REAL current on an angle the rotor may not be following, so every
+    // trip stays armed and the caller must keep the motor free and unloaded.
+    void set_openloop_current(float amps, float erpm);
+    // Duty in VESC's convention, for protocol/threshold compatibility:
+    // VESC mod = v·1.5/vbus and duty = |mod|·2/√3, ours is m = v·2/vbus, so
+    // VESC duty = our modulation depth × (1.5/2)·(2/√3) = ×0.8660254.
+    float get_duty_vesc() const { return _t_duty * 0.8660254f; }
+    // Peak |i_alpha| observed since the last play_tone(). The tone is a fixed-axis
+    // AC excitation, so this plus the commanded tone voltage gives |Z| at that
+    // frequency — sweeping it separates R from L (see FOC_ESC's R/L detection).
+    float get_tone_ipk() const { return _tone_ipk; }
     // True once a detection spin has completed; fills out[8] with the detected
     // sector-centre angles [deg] (NaN for unseen/invalid states).
     bool hall_detect_result(float out_deg[8]) const;
@@ -402,6 +432,10 @@ public:
     SensorMode get_sensor_mode() const { return _sensor_mode; }
     void  get_hall_blend_erpm(float &lo, float &hi) const { lo = _hall_blend_lo; hi = _hall_blend_hi; }
     float get_current_kp() const { return _cur_kp; }
+    // Effective integral gain [V/(A·s)]. Reported rather than re-derived as
+    // kp·R/L, which is only correct while the gains come from the bandwidth
+    // formula and is wrong the moment VESC Tool writes them independently.
+    float get_current_ki() const { return _cur_ki; }
     // Per-phase motor params (unscaled — the observer holds L,R pre-scaled ×1.5).
     void  get_motor_lrflux(float &L, float &R, float &flux) const {
         L    = (_obs_L > 0.0f) ? _obs_L * (1.0f / 1.5f) : 0.0f;
@@ -412,7 +446,8 @@ public:
     volatile uint32_t _adc_sample_cb_count{0};
 
 private:
-    enum class Mode : uint8_t { STOP, CURRENT, SPEED, BRAKE, DEBUG_VOLTAGE, BEEP, HALL_DETECT };
+    enum class Mode : uint8_t { STOP, CURRENT, SPEED, BRAKE, DEBUG_VOLTAGE, BEEP, HALL_DETECT,
+                                OPENLOOP_I };
 
     static void adc_sample_callback(void *ctx, uint16_t sample_u, uint16_t sample_v, uint16_t sample_w);
     void        adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t sample_w);
@@ -506,7 +541,8 @@ private:
     // ── Precomputed constants (set in init, read-only in ISR) ──────────────
     float _dt              = 0.0f;
     float _cur_kp          = 0.0f;   // L·ωbw
-    float _cur_ki_dt       = 0.0f;   // R·ωbw·dt
+    float _cur_ki          = 0.0f;   // integral gain [V/(A·s)] as configured
+    float _cur_ki_dt       = 0.0f;   // _cur_ki·dt (what the ISR accumulates with)
     float _current_max     = 15.0f;
     float _i_slew_per_tick = 0.0f;   // CURRENT-setpoint slew per ISR tick [A] (0 = instant)
     float _oc_trip         = 30.0f;
@@ -622,6 +658,13 @@ private:
     float    _hall_dir      = 1.0f; // rotation sign from the last transition
     float    _hall_base     = 0.0f; // interpolation origin (sector entry edge) [rad]
     float    _hall_theta    = 0.0f; // interpolated commutation angle [rad]
+    // Rate-limited version of the above — VESC m_ang_hall_rate_limited. THIS is
+    // what commutates and what the speed PLL tracks; _hall_theta is the raw
+    // decode. Without the limiter a sector transition applies a full 60° step in
+    // one cycle, which spikes the dq current loop and makes the PLL overshoot to
+    // thousands of eRPM at standstill (the speed loop then brakes the rotor it
+    // just started, and the motor never spins up).
+    float    _hall_theta_rl = 0.0f;
     // Electrical speed from hall transition timing [rad/s]. Quantised to 6
     // samples per electrical revolution and FORCED to zero by the HALL_STOP_S
     // timeout, so it is only fit for the hall→observer blend decision, never as
@@ -636,6 +679,12 @@ private:
     uint32_t _hd_n[8]       = {0};
     float    _hd_angle      = 0.0f; // forced electrical angle [rad]
     uint32_t _hd_ticks      = 0;    // spin duration counter
+    // Forced-angle current injection (set_openloop_current) — the shared
+    // primitive behind the R/L and flux-linkage detections.
+    volatile float _ol_i_amps  = 0.0f;   // d-axis current target [A]
+    volatile float _ol_i_erpm  = 0.0f;   // commanded electrical speed [eRPM]
+    float          _ol_i_angle = 0.0f;   // forced electrical angle [rad]
+    volatile float _tone_ipk   = 0.0f;   // peak |i_alpha| since play_tone() [A]
     float    _hd_current    = 5.0f; // detection d-axis current target [A]
     bool     _hall_detect_done = false;
     volatile bool _hall_detect_fresh = false; // set on completion, cleared by take_hall_detect_result()

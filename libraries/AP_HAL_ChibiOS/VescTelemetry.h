@@ -39,6 +39,9 @@ public:
         // Only 0 and 2 are implemented here; the sink must ignore 1 and 3 rather
         // than falling through to sensorless on a mode we cannot actually run.
         uint8_t sensor_mode = 0xFF;
+        float   observer_gain = 0.0f; // foc_observer_gain (0 = absent/invalid)
+        float   current_kp    = 0.0f; // foc_current_kp  [V/A]     (0 = absent)
+        float   current_ki    = 0.0f; // foc_current_ki  [V/(A·s)] (0 = absent)
     };
     // Param-derived values the GET_MCCONF responder needs but MotorControl does
     // not expose. Pushed once at boot (reboot-to-apply model); poles also drives
@@ -49,6 +52,7 @@ public:
         float   temp_fet_start = 85.0f;  // → l_temp_fet_start
         float   temp_fet_end   = 105.0f; // → l_temp_fet_end
         float   abs_current_max = 150.0f;// → l_abs_current_max
+        float   observer_gain  = 2.5e7f; // → foc_observer_gain
     };
     void set_conf_snapshot(const ConfSnapshot &s) {
         _conf = s;
@@ -60,6 +64,36 @@ public:
         _conf_ctx = ctx;
         _conf_cb  = cb;
     }
+
+    // ── Parameter-detection bridge (VESC Tool FOC tab / motor wizard) ────────
+    // What VESC Tool asked for. VESC treats these as "blocking commands" run in
+    // their own thread, replying only when the measurement finishes
+    // (comm/commands.c) — the tool waits, so we may answer many seconds later
+    // from a state machine instead of stalling the periph loop.
+    enum class DetectKind : uint8_t { NONE, R_L, FLUX_OPENLOOP, APPLY_ALL_FOC };
+    struct DetectReq {
+        DetectKind kind = DetectKind::NONE;
+        // FLUX_OPENLOOP / APPLY_ALL_FOC
+        float current      = 0.0f;   // injection current [A]
+        float erpm_per_sec = 0.0f;   // speed ramp rate [eRPM/s]
+        float duty         = 0.0f;   // ramp stops when duty reaches this (VESC convention)
+        float resistance   = 0.0f;   // [Ω]  (0 = use configured)
+        float inductance   = 0.0f;   // [H]  (0 = use configured)
+        // APPLY_ALL_FOC only
+        float max_power_loss = 0.0f; // [W] — sizes the detection current
+        float openloop_erpm  = 0.0f;
+        float sl_erpm        = 0.0f;
+    };
+    void set_detect_sink(void *ctx, void (*cb)(void *, const DetectReq &)) {
+        _detect_ctx = ctx;
+        _detect_cb  = cb;
+    }
+    // Replies, emitted by the detection state machine when it finishes. Formats
+    // are fixed by comm/commands.c and must match exactly or VESC Tool ignores
+    // them. A failed measurement reports zeros, which is how VESC signals it too.
+    void send_detect_r_l(float r, float l, float ld_lq_diff);
+    void send_detect_flux(float linkage);
+    void send_detect_apply_all(int16_t result);
 
     // ── Throttle-arbiter interface (see AP_Periph_FW::update_motor_test) ─────
     // USB torque source: holds the last COMM_SET_CURRENT value for as long as the
@@ -80,8 +114,21 @@ public:
     // True while a VESC Tool bench override (rpm / brake / duty-debug) is active.
     // These modes drive MotorControl directly, so the arbiter stands off rather
     // than stomping them with a current command.
+    //
+    // Keyed on LINK freshness (_host_alive_ms), not on the age of the override
+    // setpoint — exactly as usb_current() above, and for the same reason. VESC
+    // Tool sends SET_RPM / SET_DUTY / SET_CURRENT_BRAKE ONCE and then merely
+    // polls; VESC's own model is that the setpoint persists until changed or the
+    // link dies. Expiring on setpoint age instead meant the override lapsed
+    // ~200 ms after the single RPM packet, the arbiter fell through to the still
+    // -live USB current source, and set_current() switched the controller out of
+    // SPEED mode — the motor started and immediately stopped.
+    //
+    // _override_ms is cleared by an explicit zero/release command so ordinary
+    // CAN/PWM arbitration resumes rather than being locked out for the whole
+    // time VESC Tool stays connected.
     bool override_active(uint32_t now_ms, uint16_t timeout_ms) const {
-        return _override_ms != 0 && (now_ms - _override_ms) < timeout_ms;
+        return _override_ms != 0 && (now_ms - _host_alive_ms) < timeout_ms;
     }
 
 private:
@@ -145,6 +192,10 @@ private:
     ConfSnapshot _conf;
     void        *_conf_ctx = nullptr;
     void       (*_conf_cb)(void *, const McconfIn &) = nullptr;
+    // Parameter-detection bridge (see set_detect_sink).
+    void        *_detect_ctx = nullptr;
+    void       (*_detect_cb)(void *, const DetectReq &) = nullptr;
+    void         handle_detect(uint8_t id);
 
     // Throttle-arbiter state (thread context).
     float    _usb_current_a  = 0.0f;  // last COMM_SET_CURRENT value [A]

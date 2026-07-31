@@ -182,6 +182,21 @@ const AP_Param::GroupInfo FOC_ESC::var_info[] = {
     // @Units: V
     // @User: Advanced
     AP_GROUPINFO("V_UVFOLD", 28, FOC_ESC, _p_v_uvfold, 2.0f),
+    // @Param: M_OBSG
+    // @DisplayName: Ortega observer gain (gamma)
+    // @Description: Sensorless flux observer gain. VESC Tool's FOC tab shows and writes this as "Observer Gain (x1M)", and its detection wizard computes it as 1e3/lambda^2 after measuring the flux linkage. Scales as 1/lambda^2, so it must be re-derived whenever M_FLUX changes.
+    // @User: Advanced
+    AP_GROUPINFO("M_OBSG", 29, FOC_ESC, _p_obs_gain, 2.5e7f),
+    // @Param: M_CKP
+    // @DisplayName: Current-loop proportional gain
+    // @Description: Direct current-PI Kp in volts per amp (VESC foc_current_kp). 0 = derive from the internal bandwidth and M_LS, which is the behaviour if VESC Tool has never written it.
+    // @User: Advanced
+    AP_GROUPINFO("M_CKP", 30, FOC_ESC, _p_cur_kp, 0.0f),
+    // @Param: M_CKI
+    // @DisplayName: Current-loop integral gain
+    // @Description: Direct current-PI Ki in volts per amp-second (VESC foc_current_ki). 0 = derive from the internal bandwidth and M_RS.
+    // @User: Advanced
+    AP_GROUPINFO("M_CKI", 31, FOC_ESC, _p_cur_ki, 0.0f),
 
     AP_GROUPEND
 };
@@ -288,6 +303,9 @@ void FOC_ESC::init(AP_HAL::UARTDriver *vesc_uart)
     motor_cfg.vbus_min             = _p_v_min.get();
     motor_cfg.vbus_fold_band       = _p_v_fold.get();
     motor_cfg.vbus_uv_fold_band    = _p_v_uvfold.get();
+    motor_cfg.observer_gain        = _p_obs_gain.get();
+    motor_cfg.current_kp           = _p_cur_kp.get();
+    motor_cfg.current_ki           = _p_cur_ki.get();
     motor_cfg.fet_temp_start       = _p_t_start.get();
     motor_cfg.fet_temp_max         = _p_t_max.get();
     motor_cfg.stall_erpm           = _p_stall_rpm.get();
@@ -321,8 +339,10 @@ void FOC_ESC::init(AP_HAL::UARTDriver *vesc_uart)
     snap.temp_fet_start  = _p_t_start.get();
     snap.temp_fet_end    = _p_t_max.get();
     snap.abs_current_max = _p_i_oc_hard.get();
+    snap.observer_gain   = _p_obs_gain.get();
     vesc_telem.set_conf_snapshot(snap);
     vesc_telem.set_mcconf_sink(this, &FOC_ESC::mcconf_write_trampoline);
+    vesc_telem.set_detect_sink(this, &FOC_ESC::detect_trampoline);
 
     vesc_telem.init(vesc_uart);
 
@@ -354,6 +374,18 @@ void FOC_ESC::on_mcconf_write(const ChibiOS::VescTelemetry::McconfIn &in)
     // and silently reading either as SENSORLESS would drop a sensored motor onto
     // the observer path without the operator ever asking for it. Anything we do
     // not implement leaves the param untouched. 0xFF = field absent (see McconfIn).
+    // Ortega observer gain. VESC Tool's detection derives this as 1e3/λ² and it
+    // is meaningless at zero, so an absent/zero field leaves the param alone.
+    if (in.observer_gain > 0.0f) {
+        _p_obs_gain.set_and_save(in.observer_gain);
+    }
+    // Current-loop gains. Both must be positive to be believed: a zero Kp is a
+    // dead current loop, and taking one without the other would pair a new
+    // proportional term with a stale integral one.
+    if (in.current_kp > 0.0f && in.current_ki > 0.0f) {
+        _p_cur_kp.set_and_save(in.current_kp);
+        _p_cur_ki.set_and_save(in.current_ki);
+    }
     if (in.sensor_mode == 0 || in.sensor_mode == 2) {
         _p_sensor_mode.set_and_save(int8_t(in.sensor_mode == 2 ? 1 : 0));
     }
@@ -372,6 +404,390 @@ void FOC_ESC::on_mcconf_write(const ChibiOS::VescTelemetry::McconfIn &in)
     AP_Param::flush();               // blocks until saved; uses expect_delay_ms
 
     _reboot_ms = AP_HAL::millis();   // deferred reboot (see update())
+}
+
+// ── Motor-parameter detection ───────────────────────────────────────────────
+//
+// Answers VESC Tool's "Measure R/L", "Measure λ" and the motor wizard. The
+// FLUX measurement follows conf_general_measure_flux_linkage_openloop():
+// lock the rotor with d-axis current, ramp the commanded speed until the duty
+// reaches the requested value, then average and solve
+//     λ = (|v| − R·|i|)/ω_e − |i|·L
+//
+// R and L do NOT use VESC's mcpwm_foc_measure_res_ind() (voltage-step injection
+// at the PWM level). They use this firmware's own two measurements, which are
+// already validated on this hardware and reuse machinery that exists:
+//   R  — DC d-axis injection at zero speed, R = vd/id. Runs through the normal
+//        modulation path, so dead-time compensation applies and the reading is
+//        not inflated by the dead band the way an uncompensated one is.
+//   L  — the tone sweep. |Z| = V_tone/(1.5·Ipk) at each frequency (the 1.5
+//        removes the B‖C parallel path), then a least-squares fit of
+//        |Z|² = R² + ω²L². The SLOPE gives L and is insensitive to the fixed
+//        voltage offset that dead time contributes, which is why L is taken
+//        from the sweep and R is not.
+// Different method, same quantity, reported through the standard command so
+// VESC Tool is none the wiser.
+namespace {
+// Tone frequencies for the inductance sweep [Hz]. Above ~500 Hz so ωL is a
+// meaningful share of |Z| (at ~9 µH, ωL at 500 Hz is only ~28 mΩ against ~50 mΩ
+// of R), and at most 4 kHz because a 20 kHz PWM samples a 4 kHz tone just five
+// times per cycle. Matches the bench sweep in bench_debug.py.
+constexpr float    DET_L_FREQS[4]  = { 800.0f, 1500.0f, 2500.0f, 4000.0f };
+constexpr float    DET_L_AMP       = 0.06f;   // modulation, capped by debug_max_modulation
+constexpr uint32_t DET_L_TONE_MS   = 300;     // tone length per point
+constexpr uint32_t DET_L_GAP_MS    = 120;     // silence between points
+constexpr uint32_t DET_R_LOCK_MS   = 400;     // current ramp-in + settle before averaging
+constexpr uint32_t DET_R_MEAS_MS   = 400;
+// VESC's resistance search starts at 2 A and steps x1.5 until the resistive
+// drop reaches ~1 V (mcpwm_foc_measure_res_ind), capped at l_current_max/2.
+constexpr float    DET_R_START_A   = 2.0f;
+constexpr uint32_t DET_F_LOCK_MS   = 500;     // VESC ramps in over 200 ms then dwells
+constexpr uint32_t DET_F_STILL_MS  = 600;     // standstill duty average (VESC: 1000 ms)
+constexpr uint32_t DET_F_RAMP_MAX_MS = 15000; // VESC max_time
+constexpr uint32_t DET_F_SETTLE_MS = 1000;
+constexpr uint32_t DET_F_MEAS_MS   = 1000;
+constexpr float    DET_F_ERPM_MAX  = 12000.0f;// VESC stops ramping here
+}
+
+void FOC_ESC::on_detect_request(const ChibiOS::VescTelemetry::DetectReq &req)
+{
+    using DetectKind = ChibiOS::VescTelemetry::DetectKind;
+    if (_det_state != DetState::IDLE) {
+        return;   // VESC discards a blocking command while another is running
+    }
+    if (!motor_control.is_initialized() || motor_control.get_fault() != 0) {
+        // Refuse rather than clear a latched trip — detection drives real
+        // current, so the operator must release the fault first. Reply with the
+        // failure value so VESC Tool reports an error instead of hanging.
+        switch (req.kind) {
+        case DetectKind::R_L:           vesc_telem.send_detect_r_l(0, 0, 0); break;
+        case DetectKind::FLUX_OPENLOOP: vesc_telem.send_detect_flux(0);      break;
+        case DetectKind::APPLY_ALL_FOC: vesc_telem.send_detect_apply_all(0); break;
+        default: break;
+        }
+        return;
+    }
+    _det_req       = req;
+    _det_r         = 0.0f;
+    _det_l         = 0.0f;
+    _det_freq_idx  = 0;
+    _det_r_try     = DET_R_START_A;
+    _det_acc_a     = _det_acc_b = 0.0f;
+    _det_ticks     = 0;
+    _det_erpm      = 0.0f;
+    _det_duty_max  = 0.0f;
+    _det_duty_still = 0.0f;
+    _det_ms        = AP_HAL::millis();
+    // APPLY_ALL_FOC is R/L followed by flux, so both entry points start at R.
+    // A bare FLUX request skips straight to the spin and uses the R and L the
+    // host supplied (or, if it supplied none, the configured values).
+    _det_state = (req.kind == DetectKind::FLUX_OPENLOOP) ? DetState::FLUX_LOCK
+                                                         : DetState::RES_LOCK;
+    if (_det_state == DetState::FLUX_LOCK) {
+        _det_r = (req.resistance > 0.0f) ? req.resistance : _p_motor_rs.get();
+        _det_l = (req.inductance > 0.0f) ? req.inductance : _p_motor_ls.get();
+    }
+}
+
+// Send the reply for whichever command is running and stand the motor down.
+void FOC_ESC::detect_finish(float r, float l, float linkage, bool ok)
+{
+    using DetectKind = ChibiOS::VescTelemetry::DetectKind;
+    motor_control.set_current(0.0f);
+    motor_control.stop();
+    switch (_det_req.kind) {
+    case DetectKind::R_L:
+        vesc_telem.send_detect_r_l(ok ? r : 0.0f, ok ? (l * 1e6f) : 0.0f, 0.0f);
+        break;
+    case DetectKind::FLUX_OPENLOOP:
+        // VESC passes negative sentinels straight through as the linkage value;
+        // preserve that so VESC Tool can show its own diagnostic text.
+        vesc_telem.send_detect_flux(linkage);
+        break;
+    case DetectKind::APPLY_ALL_FOC:
+        if (ok && linkage > 0.0f) {
+            _p_motor_rs.set_and_save(r);
+            _p_motor_ls.set_and_save(l);
+            _p_motor_flux.set_and_save(linkage);
+            // Observer gain scales as 1/λ², so a new flux linkage invalidates the
+            // old gain. Derive it the way VESC Tool's wizard does (1e3/λ²) rather
+            // than leaving a gain tuned for a different machine in place. Note
+            // VESC's own firmware uses 0.5e3/λ² in
+            // conf_general_measure_flux_linkage_openloop() — the tool's number is
+            // 2× the firmware's, and we follow the TOOL so what the FOC tab shows
+            // after a detection is what the board actually runs.
+            _p_obs_gain.set_and_save(1.0e3f / (linkage * linkage));
+            // Re-derive the current-loop gains from the freshly measured R and L,
+            // mirroring VESC conf_general_calc_values(): kp = L·bw, ki = R·bw.
+            // Without this, gains previously written by VESC Tool would survive as
+            // explicit overrides tuned for the OLD motor parameters — the "0 =
+            // derive" fallback only protects a board that has never had them set.
+            // bw is our configured current-loop bandwidth (motor_cfg.current_bw_rad).
+            constexpr float CUR_BW_RAD = 1000.0f;
+            _p_cur_kp.set_and_save(l * CUR_BW_RAD);
+            _p_cur_ki.set_and_save(r * CUR_BW_RAD);
+            AP_Param::flush();
+            vesc_telem.send_detect_apply_all(1);
+            _reboot_ms = AP_HAL::millis();   // reboot-to-apply, same as MCCONF write
+        } else {
+            vesc_telem.send_detect_apply_all(0);
+        }
+        break;
+    default:
+        break;
+    }
+    _det_state = DetState::IDLE;
+}
+
+bool FOC_ESC::update_detect(uint32_t now_ms)
+{
+    using DetectKind = ChibiOS::VescTelemetry::DetectKind;
+    if (_det_state == DetState::IDLE) {
+        return false;
+    }
+    // Any trip during a measurement aborts it. The ISR has already gated the
+    // bridge; all we do is report the failure so the tool does not hang.
+    if (motor_control.get_fault() != 0) {
+        detect_finish(0.0f, 0.0f, 0.0f, false);
+        return false;
+    }
+    const uint32_t dt_ms = now_ms - _det_ms;
+    float vd = 0.0f, vq = 0.0f, id = 0.0f, iq = 0.0f;
+    motor_control.get_vdq(vd, vq);
+    motor_control.get_idq(id, iq);
+
+    switch (_det_state) {
+    // ── Resistance: DC d-axis injection, rotor locked ───────────────────────
+    case DetState::RES_LOCK:
+        motor_control.set_openloop_current(_det_r_try, 0.0f);
+        if (dt_ms >= DET_R_LOCK_MS) {
+            _det_acc_a = _det_acc_b = 0.0f;
+            _det_ticks = 0;
+            _det_state = DetState::RES_MEAS;
+            _det_ms    = now_ms;
+        }
+        break;
+
+    case DetState::RES_MEAS:
+        motor_control.set_openloop_current(_det_r_try, 0.0f);
+        // VESC averages the MAGNITUDES |v| and |i| (mcpwm_foc.c:4131 accumulates
+        // NORM2(vd,vq) and NORM2(id,iq)) and takes R = |v|/|i|, rather than the
+        // d-axis ratio. Same thing at DC on a locked rotor, but it does not
+        // assume the whole response landed on the axis we drove.
+        _det_acc_a += sqrtf(vd * vd + vq * vq);
+        _det_acc_b += sqrtf(id * id + iq * iq);
+        _det_ticks++;
+        if (dt_ms >= DET_R_MEAS_MS) {
+            const float i_avg = (_det_ticks > 0) ? (_det_acc_b / float(_det_ticks)) : 0.0f;
+            const float v_avg = (_det_ticks > 0) ? (_det_acc_a / float(_det_ticks)) : 0.0f;
+            if (i_avg < 0.5f) {
+                detect_finish(0.0f, 0.0f, 0.0f, false);   // no current flowed
+                return false;
+            }
+            const float r_try = v_avg / i_avg;
+            // THE point of VESC's search (mcpwm_foc_measure_res_ind): keep raising
+            // the current, ×1.5 each time from 2 A, until `i > 1/r` — i.e. until
+            // the resistive drop reaches ~1 V. Dead-time error is a roughly fixed
+            // voltage (~0.1 V here), so measuring at a drop of ~1 V pushes it down
+            // to a few percent, where at 4 A and 20 mΩ it was the same order as
+            // the entire signal. This is why the first implementation read a third
+            // of the real value.
+            const float i_cap = _p_i_max.get() * 0.5f;   // VESC: l_current_max / 2
+            if (r_try > 0.0f && _det_r_try > (1.0f / r_try)) {
+                _det_r = r_try;                 // drop is big enough — accept it
+            } else if ((_det_r_try * 1.5f) < i_cap) {
+                _det_r_try *= 1.5f;             // step up and repeat
+                _det_r      = r_try;            // keep the best so far
+                _det_state  = DetState::RES_LOCK;
+                _det_ms     = now_ms;
+                break;
+            } else {
+                // Ran out of current headroom. VESC falls back to l_current_max/2
+                // for one last measurement; we take the highest we reached, which
+                // is the same reading without another ramp.
+                _det_r = r_try;
+            }
+            motor_control.set_current(0.0f);
+            motor_control.stop();
+            _det_freq_idx = 0;
+            _det_state    = DetState::IND_GAP;
+            _det_ms       = now_ms;
+        }
+        break;
+
+    // ── Inductance: tone sweep, |Z|² = R² + ω²L² ────────────────────────────
+    case DetState::IND_GAP:
+        if (dt_ms >= DET_L_GAP_MS) {
+            motor_control.play_tone(DET_L_FREQS[_det_freq_idx], DET_L_AMP,
+                                    uint16_t(DET_L_TONE_MS));
+            _det_state = DetState::IND_TONE;
+            _det_ms    = now_ms;
+        }
+        break;
+
+    case DetState::IND_TONE:
+        if (dt_ms >= DET_L_TONE_MS) {
+            const float ipk  = motor_control.get_tone_ipk();
+            const float vbus = motor_control.get_vbus();
+            // Commanded phase-A amplitude. m_alpha = v·2/vbus, so v = m·vbus/2.
+            const float v_cmd = DET_L_AMP * vbus * 0.5f;
+            const float w     = 2.0f * float(M_PI) * DET_L_FREQS[_det_freq_idx];
+            if (ipk > 0.05f) {
+                const float z = v_cmd / (1.5f * ipk);
+                _det_zz[_det_freq_idx] = z * z;
+                _det_ww[_det_freq_idx] = w * w;
+            } else {
+                _det_zz[_det_freq_idx] = 0.0f;   // no response — excluded by the fit
+                _det_ww[_det_freq_idx] = w * w;
+            }
+            _det_freq_idx++;
+            if (_det_freq_idx >= 4) {
+                // Least squares on (ω², |Z|²): slope = L², intercept = R².
+                float sx = 0, sy = 0, sxx = 0, sxy = 0, n = 0;
+                for (uint8_t k = 0; k < 4; k++) {
+                    if (_det_zz[k] <= 0.0f) {
+                        continue;
+                    }
+                    sx += _det_ww[k];  sy += _det_zz[k];
+                    sxx += _det_ww[k] * _det_ww[k];
+                    sxy += _det_ww[k] * _det_zz[k];
+                    n += 1.0f;
+                }
+                const float den = n * sxx - sx * sx;
+                const float slope = (n >= 2.0f && fabsf(den) > 1e-12f)
+                                        ? ((n * sxy - sx * sy) / den) : 0.0f;
+                _det_l = (slope > 0.0f) ? sqrtf(slope) : 0.0f;
+                if (_det_l <= 0.0f) {
+                    detect_finish(0.0f, 0.0f, 0.0f, false);
+                    return false;
+                }
+                if (_det_req.kind == DetectKind::R_L) {
+                    detect_finish(_det_r, _det_l, 0.0f, true);
+                    return false;
+                }
+                // APPLY_ALL_FOC: carry R and L into the flux measurement.
+                _det_req.resistance = _det_r;
+                _det_req.inductance = _det_l;
+                if (_det_req.current <= 0.0f) {
+                    // Size the injection from the requested power loss budget:
+                    // P = 1.5·R·I² for a three-phase machine.
+                    const float pl = (_det_req.max_power_loss > 0.0f)
+                                         ? _det_req.max_power_loss : 20.0f;
+                    _det_req.current = sqrtf(pl / (1.5f * _det_r));
+                }
+                if (_det_req.duty <= 0.0f)         { _det_req.duty = 0.3f; }
+                if (_det_req.erpm_per_sec <= 0.0f) { _det_req.erpm_per_sec = 1500.0f; }
+                _det_state = DetState::FLUX_LOCK;
+                _det_ms    = now_ms;
+            } else {
+                _det_state = DetState::IND_GAP;
+                _det_ms    = now_ms;
+            }
+        }
+        break;
+
+    // ── Flux linkage: VESC conf_general_measure_flux_linkage_openloop() ─────
+    case DetState::FLUX_LOCK: {
+        // Ramp the current in rather than stepping it: a step into an unknown
+        // rotor angle maximally excites the swing into the I/f well, which is
+        // the backward-run-then-jerk start. VESC ramps over 200 ms.
+        const float ramp = (dt_ms < 200) ? (float(dt_ms) / 200.0f) : 1.0f;
+        motor_control.set_openloop_current(_det_req.current * ramp, 0.0f);
+        if (dt_ms >= DET_F_LOCK_MS) {
+            _det_acc_a = 0.0f;
+            _det_ticks = 0;
+            _det_state = DetState::FLUX_STILL;
+            _det_ms    = now_ms;
+        }
+        break;
+    }
+
+    case DetState::FLUX_STILL:
+        motor_control.set_openloop_current(_det_req.current, 0.0f);
+        _det_acc_a += motor_control.get_duty_vesc();
+        _det_ticks++;
+        if (dt_ms >= DET_F_STILL_MS) {
+            _det_duty_still = (_det_ticks > 0) ? (_det_acc_a / float(_det_ticks)) : 0.0f;
+            _det_erpm     = 0.0f;
+            _det_duty_max = 0.0f;
+            _det_state    = DetState::FLUX_RAMP;
+            _det_ms       = now_ms;
+        }
+        break;
+
+    case DetState::FLUX_RAMP: {
+        // Speed ramp at the requested eRPM/s. VESC accumulates a step every 1 ms;
+        // deriving it from elapsed phase time instead is exact, independent of the
+        // main-loop rate, and carries no state that could survive an aborted run
+        // into the next one.
+        _det_erpm = _det_req.erpm_per_sec * float(dt_ms) * 1e-3f;
+        motor_control.set_openloop_current(_det_req.current, _det_erpm);
+
+        const float duty_now = motor_control.get_duty_vesc();
+        if (duty_now > _det_duty_max) {
+            _det_duty_max = duty_now;
+        }
+        // VESC's three abort sentinels, reported as the linkage value so VESC
+        // Tool shows its own explanation for each.
+        if (dt_ms >= DET_F_RAMP_MAX_MS) {
+            detect_finish(0, 0, -1.0f, false);   // never reached the target duty
+            return false;
+        }
+        if (dt_ms > 4000 && duty_now < (_det_duty_max * 0.7f)) {
+            detect_finish(0, 0, -2.0f, false);   // duty collapsed → lost the rotor
+            return false;
+        }
+        if (dt_ms > 4000 && _det_req.duty < (_det_duty_still * 1.1f)) {
+            detect_finish(0, 0, -3.0f, false);   // target below the standstill duty
+            return false;
+        }
+        if (duty_now >= _det_req.duty || _det_erpm >= DET_F_ERPM_MAX) {
+            _det_state = DetState::FLUX_SETTLE;
+            _det_ms    = now_ms;
+        }
+        break;
+    }
+
+    case DetState::FLUX_SETTLE:
+        motor_control.set_openloop_current(_det_req.current, _det_erpm);
+        if (dt_ms >= DET_F_SETTLE_MS) {
+            _det_acc_a = _det_acc_b = 0.0f;
+            _det_ticks = 0;
+            _det_state = DetState::FLUX_MEAS;
+            _det_ms    = now_ms;
+        }
+        break;
+
+    case DetState::FLUX_MEAS:
+        motor_control.set_openloop_current(_det_req.current, _det_erpm);
+        _det_acc_a += sqrtf(vd * vd + vq * vq);   // |v|
+        _det_acc_b += sqrtf(id * id + iq * iq);   // |i|
+        _det_ticks++;
+        if (dt_ms >= DET_F_MEAS_MS) {
+            const float v_mag = (_det_ticks > 0) ? (_det_acc_a / float(_det_ticks)) : 0.0f;
+            const float i_mag = (_det_ticks > 0) ? (_det_acc_b / float(_det_ticks)) : 0.0f;
+            // ω from the COMMANDED speed — in forced-angle injection that is the
+            // rotor speed by construction, and it carries no estimator noise.
+            const float rad_s = _det_erpm * (2.0f * float(M_PI) / 60.0f);
+            float linkage = 0.0f;
+            if (rad_s > 1.0f) {
+                linkage = (v_mag - _det_r * i_mag) / rad_s - i_mag * _det_l;
+            }
+            if (!(linkage > 0.0f)) {
+                detect_finish(0, 0, 0.0f, false);
+                return false;
+            }
+            detect_finish(_det_r, _det_l, linkage, true);
+            return false;
+        }
+        break;
+
+    case DetState::DONE_STOP:
+    case DetState::IDLE:
+        _det_state = DetState::IDLE;
+        return false;
+    }
+    return true;   // still ours — the arbiter stands off
 }
 
 // Poll the TIM3 capture and, on a valid in-range frame, refresh the PWM source.
@@ -494,7 +910,10 @@ void FOC_ESC::update(uint32_t now_ms)
         const bool usb_fresh = vesc_telem.usb_current(now_ms, THR_SOURCE_TIMEOUT_MS, usb_amps);
         const bool override  = vesc_telem.override_active(now_ms, THR_SOURCE_TIMEOUT_MS);
 
-        if (update_startup_chime(now_ms, can_fresh || usb_fresh || pwm_fresh || override)) {
+        if (update_detect(now_ms)) {
+            // A parameter measurement owns the motor: it drives forced-angle
+            // current and any throttle input mid-run would corrupt the result.
+        } else if (update_startup_chime(now_ms, can_fresh || usb_fresh || pwm_fresh || override)) {
             // Power-on chime owns the motor until it finishes or is pre-empted.
         } else if (override) {
             // VESC bench override owns the motor — leave it be.

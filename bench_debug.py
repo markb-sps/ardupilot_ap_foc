@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 # bench_debug.py — open-loop voltage bring-up + raw ADC diagnostics
 #
-#   ./bench_debug.py [port] [duty|watch|beep|sweep|diag]
+#   ./bench_debug.py [port] [duty|watch|beep|sweep|diag|cur <amps>]
+#
+# "cur" holds a current setpoint and streams the same telemetry line as watch —
+# the combination neither watch (passive) nor foc_diag.py (terminal text only)
+# can give you. Use it whenever the question is "what is the loop doing WHILE
+# current is commanded". Releases the motor on Ctrl-C.
 #
 # "watch" is PASSIVE: polls GET_VALUES and sends NO set-point.
 #
@@ -30,7 +35,18 @@ PORT = sys.argv[1] if len(sys.argv) > 1 else "/dev/ttyACM0"
 ARG  = sys.argv[2] if len(sys.argv) > 2 else "0.02"
 SWEEP = ARG.lower() == "sweep"
 DIAG  = ARG.lower() == "diag"
-WATCH = ARG.lower() in ("watch", "beep", "diag") or SWEEP
+# "cur" holds a COMM_SET_CURRENT setpoint AND streams the full telemetry line.
+# watch is passive and foc_diag prints only the terminal text, so neither can
+# show id/iq/hall WHILE a current is commanded — which is exactly the case you
+# need when the motor is drawing current but not turning.
+CUR   = ARG.lower() == "cur"
+CUR_A = float(sys.argv[3]) if (CUR and len(sys.argv) > 3) else 2.0
+# "rpm" is the speed-mode equivalent of "cur": holds a COMM_SET_RPM setpoint
+# and streams telemetry, so erpm/iq/state/hall are visible WHILE speed control
+# runs. st=FAULT in the stream is the answer when it "starts then stops".
+RPM   = ARG.lower() == "rpm"
+RPM_E = float(sys.argv[3]) if (RPM and len(sys.argv) > 3) else 2000.0
+WATCH = ARG.lower() in ("watch", "beep", "diag", "cur", "rpm") or SWEEP
 BEEP  = ARG.lower() == "beep"
 DUTY = 0.0 if WATCH else float(ARG)
 
@@ -57,6 +73,8 @@ def crc16(d):
     return c
 def frame(p): return bytes([2, len(p)]) + p + struct.pack(">H", crc16(p)) + b"\x03"
 def set_duty(d): return frame(bytes([5]) + struct.pack(">i", int(d*100000)))
+def set_current(a): return frame(bytes([6]) + struct.pack(">i", int(a*1000)))
+def set_rpm(e):     return frame(bytes([8]) + struct.pack(">i", int(e)))
 def terminal(s): return frame(bytes([20]) + s.encode())   # COMM_TERMINAL_CMD
 GET = frame(bytes([4]))
 ser = serial.Serial(PORT, 115200, timeout=0.1)
@@ -212,6 +230,13 @@ if BEEP:
     print("BEEP mode: firing a 2 kHz tone every 600 ms and watching the phase\n"
           "currents. Peaks are cumulative; Ctrl-C to stop.\n")
     next_beep = 0.0
+elif CUR:
+    print(f"CURRENT hold: {CUR_A:+.2f} A on the USB source, streaming telemetry.\n"
+          f"MOTOR MAY SPIN. Ctrl-C releases (sends 0 A).\n")
+elif RPM:
+    print(f"SPEED hold: {RPM_E:+.0f} eRPM, streaming telemetry.\n"
+          f"NOTE: below s_pid_min_erpm (900) the firmware releases the motor by\n"
+          f"design. MOTOR WILL SPIN. Ctrl-C releases (sends 0).\n")
 elif WATCH:
     print("PASSIVE watch: sending no set-point. Peaks are cumulative; Ctrl-C to stop.\n")
 try:
@@ -219,7 +244,13 @@ try:
         if BEEP and time.time() >= next_beep:
             ser.write(terminal("beep 2000 0.06 500"))
             next_beep = time.time() + 0.6
-        if not WATCH:
+        if CUR:
+            # Re-send every poll: the firmware holds the setpoint only while the
+            # host link is fresh, so a gap would age out and coast mid-test.
+            ser.write(set_current(CUR_A))
+        elif RPM:
+            ser.write(set_rpm(RPM_E))
+        elif not WATCH:
             ser.write(set_duty(DUTY))
         ser.write(GET); time.sleep(0.05)
         p = rd()
@@ -256,6 +287,10 @@ try:
             # Short packet = firmware predating the appended bring-up fields.
             print(f"packet too short ({len(p)} B, need 104) — reflash this board")
 except KeyboardInterrupt:
+    if CUR:
+        ser.write(set_current(0.0))   # always release the motor
+    if RPM:
+        ser.write(set_rpm(0.0))
     if not WATCH:
         ser.write(set_duty(0))   # watch mode never commanded anything — stay passive
     print(f"\npeak |ia|/|ib|/|ic| = {pk[0]:.2f}/{pk[1]:.2f}/{pk[2]:.2f} A")
