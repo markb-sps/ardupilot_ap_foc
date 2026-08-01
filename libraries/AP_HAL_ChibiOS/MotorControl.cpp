@@ -279,6 +279,7 @@ bool MotorControl::init(const Config &cfg)
         _hall_table[s] = isnan(cfg.hall_table_deg[s])
                              ? NAN : wrap_pi(cfg.hall_table_deg[s] * (PI_F / 180.0f));
     }
+    _hall_interp_erpm = (cfg.hall_interp_erpm > 1.0f) ? cfg.hall_interp_erpm : 500.0f;
     _hall_breakaway_a = cfg.hall_breakaway_a;
     _hd_current       = (cfg.hall_detect_a < cfg.current_max) ? cfg.hall_detect_a : cfg.current_max;
     update_hall_table_valid();
@@ -1909,7 +1910,7 @@ bool MotorControl::update_hall()
     // allows 50% more slew than the rotor actually needs at the measured speed,
     // so it only ever bites on a genuine discontinuity.
     const float erpm_hall  = fabsf(_hall_omega) * _w_to_erpm;
-    const float step       = (fmaxf(erpm_hall, HALL_INTERP_ERPM) / 60.0f)
+    const float step       = (fmaxf(erpm_hall, _hall_interp_erpm) / 60.0f)
                              * TWO_PI * _dt * 1.5f;
     const float ang_diff   = wrap_pi(_hall_theta - _hall_theta_rl);
     if (fabsf(ang_diff) < step) {

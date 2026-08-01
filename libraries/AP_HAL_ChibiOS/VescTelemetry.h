@@ -42,6 +42,12 @@ public:
         float   observer_gain = 0.0f; // foc_observer_gain (0 = absent/invalid)
         float   current_kp    = 0.0f; // foc_current_kp  [V/A]     (0 = absent)
         float   current_ki    = 0.0f; // foc_current_ki  [V/(A·s)] (0 = absent)
+        // Hall→observer blend band. VESC blends the commutation angle from pure
+        // hall at foc_sl_erpm_start to pure observer at foc_sl_erpm
+        // (foc_math.c foc_correct_hall: weight_hall = map(rpm, start, sl, 1, 0)).
+        float   sl_erpm_start    = 0.0f;  // foc_sl_erpm_start  (0 = absent)
+        float   sl_erpm          = 0.0f;  // foc_sl_erpm        (0 = absent)
+        float   hall_interp_erpm = 0.0f;  // foc_hall_interp_erpm (0 = absent)
     };
     // Param-derived values the GET_MCCONF responder needs but MotorControl does
     // not expose. Pushed once at boot (reboot-to-apply model); poles also drives

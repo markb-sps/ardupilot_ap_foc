@@ -197,6 +197,24 @@ const AP_Param::GroupInfo FOC_ESC::var_info[] = {
     // @Description: Direct current-PI Ki in volts per amp-second (VESC foc_current_ki). 0 = derive from the internal bandwidth and M_RS.
     // @User: Advanced
     AP_GROUPINFO("M_CKI", 31, FOC_ESC, _p_cur_ki, 0.0f),
+    // @Param: HL_ERPM0
+    // @DisplayName: Hall-to-observer blend start
+    // @Description: Commutation angle is pure hall below this electrical RPM (VESC foc_sl_erpm_start). Above HL_ERPM1 it is pure observer, linear in between. Halls cannot desync; the observer can. Keep BOTH well above your working speed until the sensorless observer has been validated on this motor.
+    // @Units: rpm
+    // @User: Advanced
+    AP_GROUPINFO("HL_ERPM0", 32, FOC_ESC, _p_hall_erpm0, 3000.0f),
+    // @Param: HL_ERPM1
+    // @DisplayName: Hall-to-observer blend end
+    // @Description: Commutation angle is pure observer at and above this electrical RPM (VESC foc_sl_erpm).
+    // @Units: rpm
+    // @User: Advanced
+    AP_GROUPINFO("HL_ERPM1", 33, FOC_ESC, _p_hall_erpm1, 6000.0f),
+    // @Param: HL_INTRP
+    // @DisplayName: Hall angle rate-limiter floor speed
+    // @Description: Floor speed for the commutation-angle slew limiter (VESC foc_hall_interp_erpm). Sets how fast the angle may move across a 60 degree sector step when the measured hall speed is near zero.
+    // @Units: rpm
+    // @User: Advanced
+    AP_GROUPINFO("HL_INTRP", 34, FOC_ESC, _p_hall_intrp, 500.0f),
 
     AP_GROUPEND
 };
@@ -306,6 +324,9 @@ void FOC_ESC::init(AP_HAL::UARTDriver *vesc_uart)
     motor_cfg.observer_gain        = _p_obs_gain.get();
     motor_cfg.current_kp           = _p_cur_kp.get();
     motor_cfg.current_ki           = _p_cur_ki.get();
+    motor_cfg.hall_blend_erpm_lo   = _p_hall_erpm0.get();
+    motor_cfg.hall_blend_erpm_hi   = _p_hall_erpm1.get();
+    motor_cfg.hall_interp_erpm     = _p_hall_intrp.get();
     motor_cfg.fet_temp_start       = _p_t_start.get();
     motor_cfg.fet_temp_max         = _p_t_max.get();
     motor_cfg.stall_erpm           = _p_stall_rpm.get();
@@ -382,6 +403,16 @@ void FOC_ESC::on_mcconf_write(const ChibiOS::VescTelemetry::McconfIn &in)
     // Current-loop gains. Both must be positive to be believed: a zero Kp is a
     // dead current loop, and taking one without the other would pair a new
     // proportional term with a stale integral one.
+    // Hall→observer blend band. Reject an inverted or non-positive pair rather
+    // than storing it: lo >= hi collapses the blend to a step at an arbitrary
+    // speed, which is precisely the desync hazard these params exist to control.
+    if (in.sl_erpm_start > 0.0f && in.sl_erpm > in.sl_erpm_start) {
+        _p_hall_erpm0.set_and_save(in.sl_erpm_start);
+        _p_hall_erpm1.set_and_save(in.sl_erpm);
+    }
+    if (in.hall_interp_erpm > 1.0f) {
+        _p_hall_intrp.set_and_save(in.hall_interp_erpm);
+    }
     if (in.current_kp > 0.0f && in.current_ki > 0.0f) {
         _p_cur_kp.set_and_save(in.current_kp);
         _p_cur_ki.set_and_save(in.current_ki);

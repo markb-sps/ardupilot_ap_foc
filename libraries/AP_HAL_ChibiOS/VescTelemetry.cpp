@@ -842,7 +842,7 @@ void VescTelemetry::handle_get_mcconf(uint8_t reply_id)
             put_u8(p, uint8_t(lroundf(a * (200.0f / 360.0f)) % 200));
         }
     }
-    put_f32_auto(p, 500.0f);                   // foc_hall_interp_erpm
+    put_f32_auto(p, _mc.get_hall_interp_erpm());// foc_hall_interp_erpm ← param
     put_f32_auto(p, bl_lo);                    // foc_sl_erpm_start    ← param (hall blend lo)
     put_f32_auto(p, bl_hi);                    // foc_sl_erpm          ← param (hall blend hi)
     put_u8      (p, 0);                        // foc_control_sample_mode
@@ -1020,7 +1020,9 @@ void VescTelemetry::handle_set_mcconf()
     H(1000); H(1000); H(1000);              // foc_openloop_rpm_low, d_gain_scale_start, _max_mod
     H(100); H(100); H(100); H(100); H(100); H(100); // foc_sl_openloop_hyst, time_lock, time_ramp, time, boost_q, max_q
     p += 8;                                 // foc_hall_table[0-7] u8
-    A(); A(); A();                          // foc_hall_interp_erpm, foc_sl_erpm_start, foc_sl_erpm
+    in.hall_interp_erpm = get_f32_auto(p);  // foc_hall_interp_erpm
+    in.sl_erpm_start    = get_f32_auto(p);  // foc_sl_erpm_start
+    in.sl_erpm          = get_f32_auto(p);  // foc_sl_erpm
     U8(); U8(); U8();                       // foc_control_sample_mode, foc_current_sample_mode, foc_sat_comp_mode
     H(1000);                                // foc_sat_comp
     U8();                                   // foc_temp_comp

@@ -129,6 +129,9 @@ private:
     AP_Float _p_obs_gain;      // Ortega observer γ        → foc_observer_gain
     AP_Float _p_cur_kp;        // current PI Kp [V/A]      → foc_current_kp (0 = derive)
     AP_Float _p_cur_ki;        // current PI Ki [V/(A·s)]  → foc_current_ki (0 = derive)
+    AP_Float _p_hall_erpm0;    // blend start [eRPM]       → foc_sl_erpm_start
+    AP_Float _p_hall_erpm1;    // blend end   [eRPM]       → foc_sl_erpm
+    AP_Float _p_hall_intrp;    // rate-limiter floor [eRPM]→ foc_hall_interp_erpm
     AP_Int8  _p_motor_poles;   // pole PAIRS (si_motor_poles = 2×)
 
     // ── Current loop / limits (I_MAX + I_OCHARD VESC-writable) ───────────────

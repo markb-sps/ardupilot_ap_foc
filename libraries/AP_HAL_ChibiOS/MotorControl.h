@@ -55,6 +55,9 @@ public:
         // observer is reliable well above _lo here.
         float hall_blend_erpm_lo = 3000.0f;
         float hall_blend_erpm_hi = 6000.0f;
+        // VESC foc_hall_interp_erpm: floor speed for the commutation-angle rate
+        // limiter, i.e. how fast the angle may slew when the hall speed reads ~0.
+        float hall_interp_erpm   = 500.0f;
         // Break-away current cap [A] applied in HALL mode until the rotor has
         // demonstrably moved (>= HALL_BREAKAWAY_N hall transitions). Bounds the
         // current dumped into a stationary rotor if the table is wrong/mis-
@@ -431,6 +434,7 @@ public:
     // ── Config read-back (for the VESC-Tool COMM_GET_MCCONF responder) ──────
     SensorMode get_sensor_mode() const { return _sensor_mode; }
     void  get_hall_blend_erpm(float &lo, float &hi) const { lo = _hall_blend_lo; hi = _hall_blend_hi; }
+    float get_hall_interp_erpm() const { return _hall_interp_erpm; }
     float get_current_kp() const { return _cur_kp; }
     // Effective integral gain [V/(A·s)]. Reported rather than re-derived as
     // kp·R/L, which is only correct while the gains come from the bandwidth
@@ -649,6 +653,7 @@ private:
     volatile bool _hall_table_valid = false; // all six real states mapped → HALL may drive
     float _hall_blend_lo   = 3000.0f; // pure-hall below this [eRPM]
     float _hall_blend_hi   = 6000.0f; // pure-observer above this [eRPM]
+    float _hall_interp_erpm = 500.0f; // angle rate-limiter floor speed [eRPM]
     float _hall_breakaway_a = 4.0f;   // iq cap until motion confirmed [A]
     uint8_t _hall_move_count = 0;     // committed transitions since drive re-arm (saturating)
     // Runtime decode state (ISR-only except _t_hall_state snapshot).
