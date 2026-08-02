@@ -20,14 +20,32 @@ constexpr float phase_current_amp_gain = 20.0f;
 constexpr float phase_current_shunt_input_attenuation = 1.0f;
 
 // ── J305 RC PWM throttle calibration (single-channel servo pulse) ───────────
-constexpr uint16_t THR_PWM_MIN_US       = 1000;  // 0% throttle pulse
-constexpr uint16_t THR_PWM_MAX_US       = 2000;  // 100% throttle pulse
-constexpr uint16_t THR_PWM_DEADZONE_US  = 30;    // ignore this much above min (0% band)
+// Pistol-grip / trigger transmitter: neutral is mid-travel, push forward for
+// throttle, pull back for brake. Mirrors VESC's PPM_CTRL_TYPE_CURRENT_NOREV_BRAKE
+// (app_ppm.c:314) — brake only, never reverse.
+constexpr uint16_t THR_PWM_MIN_US       = 1000;  // full brake pulse
+constexpr uint16_t THR_PWM_CTR_US       = 1500;  // neutral (VESC's pulse_center)
+constexpr uint16_t THR_PWM_MAX_US       = 2000;  // full throttle pulse
+// Neutral deadband either side of centre (VESC's ppm_config.hyst). A trigger
+// spring does not return to the same microsecond twice; without this the motor
+// creeps or drags at rest. Adjust the transmitter's subtrim to centre the
+// trigger inside this band — that is the calibration, not a firmware change.
+constexpr uint16_t THR_PWM_DEADBAND_US  = 40;
 constexpr uint16_t THR_PWM_RANGE_TOL_US = 100;   // accept 900..2100; beyond → signal invalid
-// Arming gate: the throttle must be seen at/below this (fully closed) before it
-// may command torque, so a power-up/reconnect at a raised stick won't spin the
-// motor until it has passed through the low end at least once.
-constexpr uint16_t THR_PWM_ARM_MAX_US   = 1000;
+// Arming gate: the trigger must be seen at NEUTRAL before it may command
+// anything, so a power-up or reconnect with the trigger held neither launches
+// the motor nor slams the brake on. Deliberately not the old "≤1000 µs" gate:
+// on a pistol grip 1000 µs is full brake, a position the trigger never rests
+// in, so that test would leave the PWM source permanently disarmed.
+// ── Reverse-roll threshold [eRPM] ───────────────────────────────────────────
+// Below this the motor counts as "not rolling backwards" and a forward trigger
+// gets full motoring current. VESC tests `rpm_now > 0.0` (app_ppm.c:318), which
+// at a standstill takes the brake branch and launches at l_current_min — benign
+// there only because stock VESC configs set l_current_min = -l_current_max. Ours
+// is deliberately asymmetric (I_REGEN 5 A vs I_MAX 15 A), so copying that test
+// verbatim would cap every launch at a third of available torque. A small
+// deadband instead of `>= 0` keeps it robust to PLL noise around zero.
+constexpr float    THR_REV_ERPM         = 100.0f;
 
 // A source is "fresh" for this long after its last valid command — covers a
 // couple of dropped 50 Hz RC frames / DroneCAN commands before it ages to coast.
@@ -137,6 +155,7 @@ const AP_Param::GroupInfo FOC_ESC::var_info[] = {
     // ── Bus / thermal / stall protections ────────────────────────────────────
     // @Param: V_MAX
     // @DisplayName: Bus voltage at which regen is fully cut
+    // @Description: Braking current folds linearly to zero as the bus rises from (V_MAX - V_FOLD) to V_MAX. VESC calls the pair l_battery_regen_cut_start/_end, which is where VESC Tool shows them. Set a few volts above the bus you actually run at: too high and regen pumps the bus with nothing trimming it, too low and normal braking is derated away.
     // @Units: V
     // @User: Advanced
     AP_GROUPINFO("V_MAX", 20, FOC_ESC, _p_v_max, 40.0f),
@@ -145,6 +164,12 @@ const AP_Param::GroupInfo FOC_ESC::var_info[] = {
     // @Units: V
     // @User: Advanced
     AP_GROUPINFO("V_FOLD", 21, FOC_ESC, _p_v_fold, 3.0f),
+    // @Param: V_OV
+    // @DisplayName: Hard bus over-voltage trip
+    // @Description: Bridge off and FAULT_OVER_VOLTAGE latched above this. The backstop behind V_MAX/V_FOLD, evaluated on the raw (unfiltered) bus sample because regen into a supply that cannot sink it climbs volts per millisecond. VESC's l_max_vin, and settable from VESC Tool in that box. Held at or above V_MAX internally.
+    // @Units: V
+    // @User: Advanced
+    AP_GROUPINFO("V_OV", 35, FOC_ESC, _p_v_ov, 45.0f),
     // @Param: T_START
     // @DisplayName: FET temperature derate onset
     // @Units: degC
@@ -320,6 +345,7 @@ void FOC_ESC::init(AP_HAL::UARTDriver *vesc_uart)
     motor_cfg.vbus_max             = _p_v_max.get();
     motor_cfg.vbus_min             = _p_v_min.get();
     motor_cfg.vbus_fold_band       = _p_v_fold.get();
+    motor_cfg.vbus_ov_trip         = _p_v_ov.get();
     motor_cfg.vbus_uv_fold_band    = _p_v_uvfold.get();
     motor_cfg.observer_gain        = _p_obs_gain.get();
     motor_cfg.current_kp           = _p_cur_kp.get();
@@ -356,7 +382,9 @@ void FOC_ESC::init(AP_HAL::UARTDriver *vesc_uart)
     // sink for VESC Tool's "Write Motor Configuration".
     ChibiOS::VescTelemetry::ConfSnapshot snap;
     snap.poles           = uint8_t(_p_motor_poles.get() * 2);  // count = 2×pairs
-    snap.max_vin         = _p_v_max.get();
+    snap.max_vin          = _p_v_ov.get();                       // hard OV trip
+    snap.regen_cut_end    = _p_v_max.get();                      // foldback ceiling
+    snap.regen_cut_start  = _p_v_max.get() - _p_v_fold.get();    // foldback onset
     snap.temp_fet_start  = _p_t_start.get();
     snap.temp_fet_end    = _p_t_max.get();
     snap.abs_current_max = _p_i_oc_hard.get();
@@ -384,8 +412,26 @@ void FOC_ESC::on_mcconf_write(const ChibiOS::VescTelemetry::McconfIn &in)
         _p_motor_poles.set_and_save(int8_t(in.poles / 2));   // count → pairs
     }
     _p_i_max.set_and_save(in.current_max);
+    // l_current_min → I_REGEN. VESC stores it negative, so negate for our
+    // positive magnitude. Guarded rather than unconditional: a zero or
+    // positive-signed field is a config that never set it, and taking that at
+    // face value would either disable braking entirely or store a nonsense
+    // sign. Also refused above I_MAX — a braking cap looser than the motoring
+    // cap is not a limit, and VESC Tool will happily send one.
+    if (in.current_min < 0.0f && -in.current_min <= in.current_max) {
+        _p_i_regen.set_and_save(-in.current_min);
+    }
     _p_i_oc_hard.set_and_save(in.abs_current_max);
-    _p_v_max.set_and_save(in.max_vin);
+    _p_v_ov.set_and_save(in.max_vin);      // l_max_vin is VESC's hard OV trip
+    // Regen foldback band. Guarded: VESC Tool sends the whole config, and an
+    // inverted or non-positive pair would either invert the foldback (braking
+    // cut at LOW bus voltage) or collapse it to a step. init() additionally
+    // holds V_OV at or above V_MAX, so a config that puts the trip below the
+    // foldback ceiling cannot fire the fault inside the normal band.
+    if (in.regen_cut_start > 0.0f && in.regen_cut_end > in.regen_cut_start) {
+        _p_v_max.set_and_save(in.regen_cut_end);
+        _p_v_fold.set_and_save(in.regen_cut_end - in.regen_cut_start);
+    }
     _p_t_start.set_and_save(in.temp_fet_start);
     _p_t_max.set_and_save(in.temp_fet_end);
 
@@ -835,25 +881,59 @@ void FOC_ESC::read_pwm_throttle(uint32_t now_ms)
     if (pulse_us < THR_PWM_MIN_US - THR_PWM_RANGE_TOL_US ||
         pulse_us > THR_PWM_MAX_US + THR_PWM_RANGE_TOL_US ||
         period_us < 2000 || period_us > 25000) {
-        _pwm_armed = false;   // bad signal → require a fresh low before driving
+        _pwm_armed = false;   // bad signal → require a fresh neutral before driving
         _pwm_amps  = 0.0f;
+        _pwm_brake = false;
         return;               // and let the source go stale → coast
     }
-    // Frame is valid → the PWM source is present (prevents coast even at 0%).
+    // Frame is valid → the PWM source is present (prevents coast even at neutral).
     _pwm_ms = now_ms;
-    const uint16_t low = THR_PWM_MIN_US + THR_PWM_DEADZONE_US;
+
+    constexpr uint16_t fwd_break = THR_PWM_CTR_US + THR_PWM_DEADBAND_US;
+    constexpr uint16_t brk_break = THR_PWM_CTR_US - THR_PWM_DEADBAND_US;
+
     if (!_pwm_armed) {
-        // Must pass through the fully-closed end (≤1000 µs) before it can drive:
-        // a boot/reconnect at raised throttle stays coasted until stick is low.
-        if (pulse_us <= THR_PWM_ARM_MAX_US) {
+        // Must be seen at neutral before it can drive. A boot or reconnect with
+        // the trigger held stays coasted until it is released.
+        if (pulse_us >= brk_break && pulse_us <= fwd_break) {
             _pwm_armed = true;
         }
-        _pwm_amps = 0.0f;     // hold coast until armed through low
+        _pwm_amps  = 0.0f;    // hold coast until armed through neutral
+        _pwm_brake = false;
         return;
     }
-    const float pct = constrain_float(float(pulse_us - low) /
-                                      float(THR_PWM_MAX_US - low), 0.0f, 1.0f);
-    _pwm_amps = pct * motor_control.current_limit();
+
+    // Map about centre to VESC's servo_val ∈ [-1, +1] (app_ppm.c:155), with the
+    // deadband removed from each side so the usable travel starts at zero output.
+    float val;
+    if (pulse_us > fwd_break) {
+        val = float(pulse_us - fwd_break) / float(THR_PWM_MAX_US - fwd_break);
+    } else if (pulse_us < brk_break) {
+        val = -float(brk_break - pulse_us) / float(brk_break - THR_PWM_MIN_US);
+    } else {
+        val = 0.0f;           // neutral band
+    }
+    val = constrain_float(val, -1.0f, 1.0f);
+
+    // VESC PPM_CTRL_TYPE_CURRENT_NOREV_BRAKE (app_ppm.c:314-323):
+    //     current_mode_brake = servo_val < 0
+    //     forward trigger AND rolling forward → servo_val * l_current_max
+    //     otherwise                           → |servo_val * l_current_min|
+    // The third case is the one that is easy to miss: a FORWARD trigger while
+    // rolling backwards is not a brake command, it is forward torque against the
+    // roll — so it stays a motoring command (positive current, no reverse), just
+    // limited to the braking ceiling because that is what is decelerating the bus.
+    const float erpm = motor_control.get_erpm();
+    if (val < 0.0f) {
+        _pwm_brake = true;
+        _pwm_amps  = -val * motor_control.regen_limit();
+    } else if (erpm < -THR_REV_ERPM) {
+        _pwm_brake = false;
+        _pwm_amps  = val * motor_control.regen_limit();
+    } else {
+        _pwm_brake = false;
+        _pwm_amps  = val * motor_control.current_limit();
+    }
 }
 
 void FOC_ESC::set_can_throttle(float frac)
@@ -953,7 +1033,15 @@ void FOC_ESC::update(uint32_t now_ms)
         } else if (usb_fresh) {
             motor_control.set_current(usb_amps);
         } else if (pwm_fresh) {
-            motor_control.set_current(_pwm_amps);
+            // The trigger is the only source that can command deceleration, so it
+            // is the only one that reaches set_brake_current(). Note the brake
+            // releases to IDLE below ~100 eRPM (MotorControl.cpp:1226) — there is
+            // no standstill hold, by design.
+            if (_pwm_brake) {
+                motor_control.set_brake_current(_pwm_amps);
+            } else {
+                motor_control.set_current(_pwm_amps);
+            }
         } else {
             motor_control.set_current(0.0f);          // all sources stale → coast
         }

@@ -143,8 +143,9 @@ private:
     AP_Float _p_i_scale;       // ADC volts → amps sense scale  (DroneCAN-only)
 
     // ── Bus / thermal / stall protections ────────────────────────────────────
-    AP_Float _p_v_max;         // regen fully cut at this bus V → l_max_vin
-    AP_Float _p_v_fold;        // OV regen foldback band [V]    (DroneCAN-only)
+    AP_Float _p_v_max;         // regen fully cut at this bus V → l_battery_regen_cut_end
+    AP_Float _p_v_fold;        // OV regen foldback band [V]    → l_battery_regen_cut_start
+    AP_Float _p_v_ov;          // hard bus over-voltage trip [V] → l_max_vin
     AP_Float _p_v_min;         // bus under-voltage floor [V]   (DroneCAN-only)
     AP_Float _p_v_uvfold;      // UV foldback band [V]          (DroneCAN-only)
     AP_Float _p_t_start;       // FET derate onset [°C]         → l_temp_fet_start
@@ -156,9 +157,14 @@ private:
     // ── Throttle-source arbiter state (each stamps its latest torque + time) ──
     float    _can_amps  = 0.0f;   // last DroneCAN RawCommand torque [A]
     uint32_t _can_ms    = 0;      // millis() of that command (0 = none yet)
-    float    _pwm_amps  = 0.0f;   // last valid PWM-derived torque [A]
+    float    _pwm_amps  = 0.0f;   // last valid PWM-derived torque [A], always ≥ 0
     uint32_t _pwm_ms    = 0;      // millis() of last valid PWM frame (0 = none)
-    bool     _pwm_armed = false;  // boot-low safety gate for the PWM source
+    bool     _pwm_armed = false;  // boot-neutral safety gate for the PWM source
+    // Trigger pulled back → _pwm_amps is a BRAKE magnitude for set_brake_current()
+    // rather than a motoring command. Split from the sign of _pwm_amps because the
+    // two dispatch to different MotorControl entry points, and a forward trigger
+    // against a backwards roll is a reduced-magnitude MOTORING command, not a brake.
+    bool     _pwm_brake = false;
 };
 
 #endif  // HAL_PERIPH_ENABLE_FOC_ESC

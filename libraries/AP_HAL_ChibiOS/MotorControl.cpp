@@ -200,6 +200,11 @@ bool MotorControl::init(const Config &cfg)
     _vbus_min      = (cfg.vbus_min < cfg.vbus_max - cfg.vbus_fold_band)
                          ? cfg.vbus_min : (cfg.vbus_max - cfg.vbus_fold_band);
     _vbus_fold_inv   = (cfg.vbus_fold_band > 0.1f) ? (1.0f / cfg.vbus_fold_band) : 10.0f;
+    // Hard OV trip, held at or above vbus_max: the foldback must always get the
+    // first move. A config with the trip below the foldback ceiling would fire the
+    // fault at a bus voltage the foldback considers normal, so clamp rather than
+    // trust it — this value can arrive from a VESC-Tool config write.
+    _vbus_ov_trip  = (cfg.vbus_ov_trip > cfg.vbus_max) ? cfg.vbus_ov_trip : cfg.vbus_max;
     _vbus_uvfold_inv = (cfg.vbus_uv_fold_band > 0.1f) ? (1.0f / cfg.vbus_uv_fold_band) : 10.0f;
     _mode_switch_i = cfg.mode_switch_current;
     // vbus-dependent constants: seeded from cfg.vbus here, recomputed each ISR
@@ -814,7 +819,16 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
     }
     // Bus-OV regen foldback: scales any decelerating (bus-charging) current
     // from full at (vbus_max - band) to zero at vbus_max.
-    const float ov_scale = clampf((_vbus_max - _vbus_flt) * _vbus_fold_inv, 0.0f, 1.0f);
+    //
+    // Off the RAW sample, not _vbus_flt. The filter above is asymmetric by
+    // design — fast down, ~5 ms up — which is right for catching supply sag and
+    // exactly wrong here, since over-voltage is by definition a RISING bus.
+    // Regen with nothing to sink it charges the bulk capacitance at volts per
+    // millisecond, so a foldback lagging 5 ms behind is not a foldback. The cost
+    // is a noisier limit, which is harmless: this scales a current ceiling, not
+    // the modulation math that needs a steady vbus. Both noise directions are
+    // safe — a spuriously high sample only brakes less.
+    const float ov_scale = clampf((_vbus_max - vraw) * _vbus_fold_inv, 0.0f, 1.0f);
     // Bus-UV foldback: the mirror image, on MOTORING current — that is what
     // loads the supply. As the bus sags toward vbus_min the torque command is
     // scaled back, which unloads the supply and lets it recover: a negative
@@ -900,6 +914,34 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
         }
     } else {
         _uv_count = 0;
+    }
+
+    // ── Bus over-voltage trip ───────────────────────────────────────────────
+    // The backstop behind the regen foldback above (see ov_scale). Also on the
+    // RAW sample, and for a sharper reason than the UV trip: _vbus_flt tracks
+    // UPWARD with a ~5 ms time constant by deliberate design, while regen into a
+    // supply that cannot sink current charges the bulk capacitance at several
+    // volts per millisecond. Folding back against the filtered value alone would
+    // react long after the FETs had seen the overshoot.
+    //
+    // Unlike the UV trip this is NOT gated on _vbus_ready. A high reading is
+    // never the "divider has not settled yet" case — that failure mode reads low
+    // — so gating it would only create a window where the trip is off.
+    // Debounced the same few samples against a single noisy conversion.
+    if (_outputs_on) {
+        if (vraw > _vbus_max_seen) {
+            _vbus_max_seen = vraw;
+        }
+        if (vraw > _vbus_ov_trip) {
+            if (++_ov_count >= UV_DEBOUNCE) {
+                trip_fault(FAULT_OVER_VOLTAGE);
+                return;
+            }
+        } else {
+            _ov_count = 0;
+        }
+    } else {
+        _ov_count = 0;
     }
 
     float i_alpha, i_beta;
@@ -1330,10 +1372,20 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
         iq_cmd = clampf((omega_ctrl >= 0.0f ? -1.0f : 1.0f) * _cmd_current, -rl, rl);
     } else {
         iq_cmd = clampf(_cmd_current, -i_max, i_max);
-        // CURRENT mode has no steady regen cap by design, but a decelerating
-        // command must still fold back rather than pump the bus past vbus_max.
+        // Braking is capped by the regen ceiling, NOT by i_max — VESC's
+        // l_current_min, which is a braking limit rather than a "negative iq"
+        // limit. mcpwm_foc.c:3651 applies it direction-aware off the sign of
+        // mod_q, so the ceiling follows power flow in both directions:
+        //     mod_q > 0 : iq in [ lo_current_min,  lo_current_max]
+        //     mod_q < 0 : iq in [-lo_current_max, -lo_current_min]
+        // i.e. l_current_max is the MOTORING ceiling and l_current_min the
+        // BRAKING one whichever way the motor turns. Our omega_ctrl (PLL speed)
+        // stands in for VESC's mod_q_filter as the rotation-direction sign; at
+        // standstill the product is zero, which correctly skips the clamp since
+        // there is no regen at zero speed. Same test the SPEED branch above
+        // already used; ov_scale folds it toward zero as vbus nears vbus_max.
         if (iq_cmd * omega_ctrl < 0.0f) {
-            const float rl = i_max * ov_scale;
+            const float rl = _regen_max * ov_scale;
             iq_cmd = clampf(iq_cmd, -rl, rl);
         }
     }

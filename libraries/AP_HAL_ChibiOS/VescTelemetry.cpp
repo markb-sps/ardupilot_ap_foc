@@ -591,6 +591,14 @@ void VescTelemetry::print_diag()
                        unsigned(_mc.ol_locked_out()), unsigned(_mc.ol_attempts()),
                        unsigned(_mc.hall_table_valid()));
     send_print(line);
+    // Bus extremes as the TRIPS saw them — both are raw samples, so neither
+    // matches the filtered vbus reported in telemetry. vmax is the number that
+    // explains an over-voltage trip, which on regen can overshoot and fall back
+    // faster than any host-rate readout can catch.
+    hal.util->snprintf(line, sizeof(line), "vbus=%.1f vmin=%.1f vmax=%.1f",
+                       double(_mc.get_vbus()), double(_mc.get_vbus_min_seen()),
+                       double(_mc.get_vbus_max_seen()));
+    send_print(line);
     // Bridge hardware vs what the driver believes. `on` is MotorControl's
     // _outputs_on; `moe` is the live TIM1 BDTR bit. on=1 moe=0 means the bridge
     // is coasting while arm_bridge() short-circuits on the stale flag — no
@@ -761,8 +769,8 @@ void VescTelemetry::handle_get_mcconf(uint8_t reply_id)
     put_u8      (p, 0);                        // comm_mode
     put_u8      (p, 2);                        // motor_type = FOC
     put_u8      (p, 0);                        // sensor_mode (BLDC)
-    put_f32_auto(p, i_max);                    // l_current_max        ← param
-    put_f32_auto(p, -i_max);                   // l_current_min        ← param
+    put_f32_auto(p, i_max);                    // l_current_max        ← param (motoring)
+    put_f32_auto(p, -_mc.regen_limit());       // l_current_min        ← param (braking)
     put_f32_auto(p, 60.0f);                    // l_in_current_max
     put_f32_auto(p, -60.0f);                   // l_in_current_min
     put_f16     (p, 0.5f, 10000.0f);           // l_in_current_map_start
@@ -774,11 +782,15 @@ void VescTelemetry::handle_get_mcconf(uint8_t reply_id)
     put_f32_auto(p, 300.0f);                   // l_max_erpm_fbrake
     put_f32_auto(p, 1500.0f);                  // l_max_erpm_fbrake_cc
     put_f16     (p, 6.0f, 10.0f);              // l_min_vin
-    put_f16     (p, _conf.max_vin, 10.0f);     // l_max_vin            ← param (vbus_max)
+    put_f16     (p, _conf.max_vin, 10.0f);     // l_max_vin            ← param (V_OV, hard trip)
     put_f16     (p, 10.0f, 10.0f);             // l_battery_cut_start
     put_f16     (p, 8.0f, 10.0f);              // l_battery_cut_end
-    put_f16     (p, 100.0f, 10.0f);            // l_battery_regen_cut_start
-    put_f16     (p, 110.0f, 10.0f);            // l_battery_regen_cut_end
+    // VESC's regen over-voltage cutoff (mc_interface.c:2483) — the fields that
+    // actually mean "fold braking back as the bus rises", so V_MAX/V_FOLD live
+    // here rather than in l_max_vin. Previously hardcoded 100/110 V, which showed
+    // a nonsense band in VESC Tool while the real behaviour came from elsewhere.
+    put_f16     (p, _conf.regen_cut_start, 10.0f); // l_battery_regen_cut_start ← V_MAX - V_FOLD
+    put_f16     (p, _conf.regen_cut_end, 10.0f);   // l_battery_regen_cut_end   ← V_MAX
     put_u8      (p, 1);                        // l_slow_abs_current
     put_u8      (p, uint8_t(_conf.temp_fet_start)); // l_temp_fet_start ← param
     put_u8      (p, uint8_t(_conf.temp_fet_end));   // l_temp_fet_end   ← param
@@ -976,7 +988,7 @@ void VescTelemetry::handle_set_mcconf()
 
     U8(); U8(); U8(); U8();                 // pwm_mode, comm_mode, motor_type, sensor_mode
     in.current_max = get_f32_auto(p);       // l_current_max
-    A();                                    // l_current_min
+    in.current_min = get_f32_auto(p);       // l_current_min (negative = braking cap)
     A(); A();                               // l_in_current_max, l_in_current_min
     H(10000); H(10000);                     // l_in_current_map_start, _filter
     in.abs_current_max = get_f32_auto(p);   // l_abs_current_max
@@ -986,7 +998,8 @@ void VescTelemetry::handle_set_mcconf()
     H(10);                                  // l_min_vin
     in.max_vin = get_f16(p, 10);            // l_max_vin
     H(10); H(10);                           // l_battery_cut_start, _end
-    H(10); H(10);                           // l_battery_regen_cut_start, _end
+    in.regen_cut_start = get_f16(p, 10);    // l_battery_regen_cut_start
+    in.regen_cut_end   = get_f16(p, 10);    // l_battery_regen_cut_end
     U8();                                   // l_slow_abs_current
     in.temp_fet_start = float(*p); p += 1;  // l_temp_fet_start (u8)
     in.temp_fet_end   = float(*p); p += 1;  // l_temp_fet_end (u8)

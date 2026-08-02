@@ -25,6 +25,7 @@ public:
     // VESC enum range, so they can't be confused with a real VESC fault.
     enum Fault : uint8_t {
         FAULT_NONE            = 0,
+        FAULT_OVER_VOLTAGE    = 1,
         FAULT_UNDER_VOLTAGE   = 2,
         FAULT_ABS_OVERCURRENT = 4,
         FAULT_OVER_TEMP_FET   = 5,
@@ -130,8 +131,28 @@ public:
         // proportionally as vbus rises through the band below vbus_max,
         // reaching zero at vbus_max — keeps regen from pumping the bus past
         // vbus_max even without a brake resistor / OV clamp.
+        //
+        // This is VESC's l_battery_regen_cut_start/_end (mc_interface.c:2483),
+        // mapped as start = vbus_max - vbus_fold_band, end = vbus_max. One
+        // difference worth knowing: VESC folds back the INPUT current
+        // (l_in_current_min) and converts it to an iq ceiling at the point of use
+        // by dividing by modulation (mcpwm_foc.c:3646), because bus current ≈
+        // modulation × motor current. We fold the MOTOR current directly, with no
+        // modulation term, so at low modulation we are markedly more conservative
+        // than VESC — we cut braking that was never going to reach the bus. That
+        // is the safe direction to be wrong in, and computing it properly needs a
+        // bus-current estimate we do not have.
         float    vbus_max          = 40.0f;   // regen fully cut at this bus voltage [V]
         float    vbus_fold_band    = 3.0f;    // OVER-voltage regen foldback band [V]
+        // Hard bus OVER-voltage trip [V] — VESC's l_max_vin, the backstop behind
+        // the foldback above. Regen into a supply that cannot sink it charges the
+        // bulk capacitance alone: at ~2 A into 220 µF the bus climbs ~9 V/ms, far
+        // faster than the foldback can act on a filtered reading. So this trips on
+        // the RAW vbus sample, not _vbus_flt, whose rising-edge time constant is
+        // ~5 ms by design (see the asymmetric filter in the ISR). Set above
+        // vbus_max — the foldback should always act first, and reaching this means
+        // it was outrun.
+        float    vbus_ov_trip      = 45.0f;
         // UNDER-voltage foldback band [V]: motoring current scales from full at
         // (vbus_min + this) to zero at vbus_min. Kept separate from the OV band
         // because the two sit at opposite ends of the range and want different
@@ -412,6 +433,7 @@ public:
     // Lowest raw bus reading seen while the bridge was armed, since boot. The
     // smoking gun for an under-voltage trip: it says what the trip actually saw.
     float get_vbus_min_seen() const { return (_vbus_min_seen > 1e8f) ? 0.0f : _vbus_min_seen; }
+    float get_vbus_max_seen() const { return _vbus_max_seen; }
     float get_fet_temp()      const { return _t_fet_temp; }  // board NTC [°C]
     uint8_t get_fault()       const { return _fault_code; }
     // Fault code for HOST reporting. A trip is often cleared within ~500 ms (the
@@ -430,6 +452,8 @@ public:
     // the drive is not recovering, it is being re-armed into the same fault.
     uint8_t trip_count()      const { return _trip_count; }
     float   current_limit()   const { return _current_max; }   // iq command ceiling [A]
+    // Braking/regen ceiling [A], positive. VESC's l_current_min is this negated.
+    float   regen_limit()     const { return _regen_max; }
 
     // ── Config read-back (for the VESC-Tool COMM_GET_MCCONF responder) ──────
     SensorMode get_sensor_mode() const { return _sensor_mode; }
@@ -521,6 +545,8 @@ private:
     volatile bool  _vbus_valid          = false;  // a plausible bus reading has been seen
     volatile float _vbus_raw_v          = 0.0f;   // last unfiltered bus reading [V]
     volatile float _vbus_min_seen       = 1e9f;   // lowest raw reading while armed [V]
+    volatile float _vbus_max_seen       = 0.0f;   // highest raw reading while armed [V]
+    float _vbus_ov_trip                 = 45.0f;  // hard OV trip [V] (cfg.vbus_ov_trip)
     float    _current_scale             = 36.5f;
 
     // ── Zero-current calibration ───────────────────────────────────────────
@@ -557,6 +583,7 @@ private:
     float _vbus_fold_inv   = 1.0f/3.0f; // 1 / vbus_fold_band     (over-voltage)
     float _vbus_uvfold_inv = 1.0f/2.0f; // 1 / vbus_uv_fold_band  (under-voltage)
     volatile uint16_t _uv_count = 0; // consecutive under-voltage samples
+    volatile uint16_t _ov_count = 0; // consecutive over-voltage samples
     // One-way latch: the bus measurement has settled through its RC filter and
     // the under-voltage protection may arm. Until then a low reading means "not
     // measured yet", not "under-voltage". See VBUS_READY_SAMPLES.

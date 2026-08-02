@@ -27,9 +27,24 @@ public:
         float   motor_r;          // foc_motor_r [Ω]
         float   motor_l;          // foc_motor_l [H]
         float   motor_flux;       // foc_motor_flux_linkage [Wb]
-        float   current_max;      // l_current_max [A]
+        float   current_max;      // l_current_max [A] (motoring ceiling)
+        // l_current_min [A], VESC stores it NEGATIVE. This is the braking/regen
+        // ceiling, not a "negative iq" limit — mcpwm_foc.c:3651 flips the pair
+        // with the direction of rotation so it caps braking either way round.
+        // 0 = absent/invalid; the sink negates it to get a positive magnitude.
+        float   current_min = 0.0f;
         float   abs_current_max;  // l_abs_current_max [A] → hard OC trip
-        float   max_vin;          // l_max_vin [V] → vbus_max
+        // l_max_vin [V]. In VESC this is the HARD over-voltage trip threshold
+        // (mc_interface.c:1908 raises FAULT_CODE_OVER_VOLTAGE against it), NOT a
+        // foldback ceiling — so it maps to V_OV. The graceful regen foldback has
+        // its own pair of fields below, which is where V_MAX/V_FOLD live.
+        float   max_vin;
+        // l_battery_regen_cut_start/_end [V]: VESC's regen over-voltage cutoff
+        // (mc_interface.c:2483), scaling braking to zero between the two. Our
+        // V_MAX is the end and V_FOLD the width, so start = V_MAX - V_FOLD.
+        // 0 = absent/invalid.
+        float   regen_cut_start = 0.0f;
+        float   regen_cut_end   = 0.0f;
         float   temp_fet_start;   // l_temp_fet_start [°C]
         float   temp_fet_end;     // l_temp_fet_end [°C]
         uint8_t poles;            // si_motor_poles (pole COUNT, = 2·pole_pairs)
@@ -54,7 +69,9 @@ public:
     // the eRPM→RPM scaling and si_motor_poles field.
     struct ConfSnapshot {
         uint8_t poles          = 14;     // pole COUNT (7 pairs)
-        float   max_vin        = 57.0f;  // → l_max_vin
+        float   max_vin        = 57.0f;  // → l_max_vin (hard OV trip, V_OV)
+        float   regen_cut_start = 100.0f;// → l_battery_regen_cut_start (V_MAX - V_FOLD)
+        float   regen_cut_end   = 110.0f;// → l_battery_regen_cut_end   (V_MAX)
         float   temp_fet_start = 85.0f;  // → l_temp_fet_start
         float   temp_fet_end   = 105.0f; // → l_temp_fet_end
         float   abs_current_max = 150.0f;// → l_abs_current_max
