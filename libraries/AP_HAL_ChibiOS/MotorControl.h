@@ -456,6 +456,25 @@ public:
     float   regen_limit()     const { return _regen_max; }
 
     // ── Config read-back (for the VESC-Tool COMM_GET_MCCONF responder) ──────
+    // These report the values actually in force — post-clamp, post-derivation —
+    // rather than what was requested. A read-out that echoes the request would
+    // hide exactly the clamps worth knowing about (duty_max, vbus_min, and the
+    // TRACK/hysteresis coupling on the open-loop times).
+    float get_duty_max()      const { return _duty_max; }
+    float get_vbus_min()      const { return _vbus_min; }
+    // Under-voltage foldback band [V] — the reciprocal is what is stored.
+    float get_vbus_uv_band()  const { return 1.0f / _vbus_uvfold_inv; }
+    uint32_t get_pwm_rate_hz() const { return _pwm_update_rate_hz; }
+    // Sensorless open-loop start (VESC foc_sl_openloop_*). t_const is derived:
+    // only the lock+ramp+const total is stored.
+    void get_openloop_cfg(float &boost_q, float &max_q, float &erpm, float &rpm_low,
+                          float &hyst, float &t_lock, float &t_ramp, float &t_const) const {
+        boost_q = _ol_boost_q;   max_q  = _ol_max_q;
+        erpm    = _open_handover_erpm;
+        rpm_low = _ol_rpm_low;   hyst   = _ol_hyst;
+        t_lock  = _ol_t_lock;    t_ramp = _ol_t_ramp;
+        t_const = _ol_t_total - _ol_t_lock - _ol_t_ramp;
+    }
     SensorMode get_sensor_mode() const { return _sensor_mode; }
     void  get_hall_blend_erpm(float &lo, float &hi) const { lo = _hall_blend_lo; hi = _hall_blend_hi; }
     float get_hall_interp_erpm() const { return _hall_interp_erpm; }

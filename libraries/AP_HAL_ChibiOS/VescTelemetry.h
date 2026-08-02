@@ -48,6 +48,22 @@ public:
         float   temp_fet_start;   // l_temp_fet_start [°C]
         float   temp_fet_end;     // l_temp_fet_end [°C]
         uint8_t poles;            // si_motor_poles (pole COUNT, = 2·pole_pairs)
+        // l_max_duty → D_MAX. The per-phase duty ceiling, which on this board is
+        // a HARDWARE limit (MP1918 bootstrap refresh + the low-side window the
+        // shunt ADC samples in), not a tuning preference. 0 = absent; the sink
+        // clamps hard before storing.
+        float   max_duty = 0.0f;
+        // Sensorless open-loop start, VESC foc_sl_openloop_* / foc_openloop_rpm.
+        // All are meaningless at or below zero except rpm_low (0 is valid and is
+        // the default), so 0 doubles as "absent" for the rest.
+        float   ol_boost_q = 0.0f;  // foc_sl_openloop_boost_q [A]
+        float   ol_max_q   = 0.0f;  // foc_sl_openloop_max_q   [A]
+        float   ol_erpm    = 0.0f;  // foc_openloop_rpm    [eRPM]
+        float   ol_rpm_low = -1.0f; // foc_openloop_rpm_low fraction (-1 = absent)
+        float   ol_hyst    = -1.0f; // foc_sl_openloop_hyst      [s] (-1 = absent)
+        float   ol_t_lock  = -1.0f; // foc_sl_openloop_time_lock [s] (-1 = absent)
+        float   ol_t_ramp  = 0.0f;  // foc_sl_openloop_time_ramp [s]
+        float   ol_t_const = 0.0f;  // foc_sl_openloop_time      [s]
         // foc_sensor_mode, VESC encoding: 0 = SENSORLESS, 1 = ENCODER, 2 = HALL,
         // 3 = HFI. 0xFF = "not supplied by this packet" so the sink can tell a
         // genuine 0 (sensorless) from an absent field and leave the param alone.

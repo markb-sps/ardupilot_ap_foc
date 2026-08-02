@@ -164,6 +164,55 @@ const AP_Param::GroupInfo FOC_ESC::var_info[] = {
     // @Units: V
     // @User: Advanced
     AP_GROUPINFO("V_FOLD", 21, FOC_ESC, _p_v_fold, 3.0f),
+    // @Param: D_MAX
+    // @DisplayName: Per-phase duty ceiling
+    // @Description: HARDWARE limit, not a tuning preference. The MP1918 high-side bootstrap only recharges while the low side conducts, and the phase-shunt ADC samples in that same window (valid to ~0.93 duty at 20 kHz per stm32_foc_motor_control.cpp). Raising it raises top speed roughly linearly (it sets the modulation ceiling, 2*(D_MAX-0.5)), and at some point drops a high-side FET out of enhancement while it carries current. Clamped to 0.55..0.90 on load.
+    // @Range: 0.55 0.90
+    // @User: Advanced
+    AP_GROUPINFO("D_MAX", 36, FOC_ESC, _p_duty_max, 0.80f),
+    // ── Sensorless open-loop start (VESC foc_sl_openloop_*) ──────────────────
+    // Inactive in HALL sensor mode: the halls commutate from standstill and this
+    // state machine is never entered.
+    // @Param: OL_IBOOST
+    // @DisplayName: Open-loop start boost current
+    // @Units: A
+    // @User: Advanced
+    AP_GROUPINFO("OL_IBOOST", 37, FOC_ESC, _p_ol_boost, 4.0f),
+    // @Param: OL_IMAX
+    // @DisplayName: Open-loop iq cap
+    // @Units: A
+    // @User: Advanced
+    AP_GROUPINFO("OL_IMAX", 38, FOC_ESC, _p_ol_imax, 15.0f),
+    // @Param: OL_ERPM
+    // @DisplayName: Open-loop handover speed
+    // @Units: rpm
+    // @User: Advanced
+    AP_GROUPINFO("OL_ERPM", 39, FOC_ESC, _p_ol_erpm, 2000.0f),
+    // @Param: OL_LOW
+    // @DisplayName: Handover speed at zero current, as a fraction of OL_ERPM
+    // @User: Advanced
+    AP_GROUPINFO("OL_LOW", 40, FOC_ESC, _p_ol_low, 0.0f),
+    // @Param: OL_HYST
+    // @DisplayName: Time below threshold before the open-loop override fires
+    // @Units: s
+    // @User: Advanced
+    AP_GROUPINFO("OL_HYST", 41, FOC_ESC, _p_ol_hyst, 0.1f),
+    // @Param: OL_TLOCK
+    // @DisplayName: Open-loop start hold-angle lock time
+    // @Units: s
+    // @User: Advanced
+    AP_GROUPINFO("OL_TLOCK", 42, FOC_ESC, _p_ol_tlock, 0.4f),
+    // @Param: OL_TRAMP
+    // @DisplayName: Open-loop forced-speed ramp time
+    // @Units: s
+    // @User: Advanced
+    AP_GROUPINFO("OL_TRAMP", 43, FOC_ESC, _p_ol_tramp, 0.5f),
+    // @Param: OL_TCONST
+    // @DisplayName: Open-loop forced-speed hold time after the ramp
+    // @Description: OL_TLOCK + OL_TRAMP + OL_TCONST is the total forced-rotation dwell before handover is attempted, currently ~1.1 s.
+    // @Units: s
+    // @User: Advanced
+    AP_GROUPINFO("OL_TCONST", 44, FOC_ESC, _p_ol_tconst, 0.2f),
     // @Param: V_OV
     // @DisplayName: Hard bus over-voltage trip
     // @Description: Bridge off and FAULT_OVER_VOLTAGE latched above this. The backstop behind V_MAX/V_FOLD, evaluated on the raw (unfiltered) bus sample because regen into a supply that cannot sink it climbs volts per millisecond. VESC's l_max_vin, and settable from VESC Tool in that box. Held at or above V_MAX internally.
@@ -270,7 +319,7 @@ void FOC_ESC::init(AP_HAL::UARTDriver *vesc_uart)
     // it caps the modulation index at 2*(0.80-0.5) = 0.60, i.e. about a third
     // less top speed than the old 0.90. Raise toward 0.92 once the stage is
     // trusted and the sampling has been checked on a scope.
-    motor_cfg.duty_max         = 0.80f;
+    motor_cfg.duty_max         = 0.80f;   // overridden by D_MAX below
     // Conservative limits for first bring-up — raise once verified.
     motor_cfg.current_max      = 15.0f;
     motor_cfg.overcurrent_trip = 30.0f;
@@ -289,7 +338,7 @@ void FOC_ESC::init(AP_HAL::UARTDriver *vesc_uart)
     // 1 A command drives this much. Five gate drivers have died on this bench;
     // start conservative and only raise it if the rotor demonstrably fails to
     // spin up (watch `lag` shrinking as back-EMF appears). Was 10 A.
-    motor_cfg.openloop_current = 4.0f;
+    motor_cfg.openloop_current = 4.0f;   // overridden by OL_IBOOST below
     // Max braking/regen motor current [A]. Deliberately low: braking energy
     // returns to the bus, a bench PSU can't sink it, and there is no bus-OV
     // clamp yet. Raise once OV handling / a brake resistor exists.
@@ -301,11 +350,12 @@ void FOC_ESC::init(AP_HAL::UARTDriver *vesc_uart)
     // so it slips and the observer never sees coherent back-EMF. Give it real
     // torque and a gentle, long ramp/hold so we can confirm it actually spins
     // (watch `lag`→small as back-EMF appears) before worrying about handover.
-    motor_cfg.openloop_max_q  = 15.0f;  // = current_max: full budget for startup torque
+    motor_cfg.openloop_max_q  = 15.0f;  // = current_max; overridden by OL_IMAX below
     // Capture phase: hold the vector static (current ramped in over the
     // first ~75 ms) until the rotor's settle oscillation dies, THEN
     // accelerate — otherwise capture happens mid-ramp and a bad draw
     // slips poles backward before catching (backward-run-then-jerk start).
+    // All three overridden by OL_TLOCK / OL_TRAMP / OL_TCONST below.
     motor_cfg.openloop_lock_s = 0.4f;
     motor_cfg.openloop_ramp_s = 0.5f;   // was 0.1 s — gentler so the rotor can keep up
     motor_cfg.openloop_const_s = 0.2f;  // hold forced rotation long enough to observe
@@ -315,7 +365,7 @@ void FOC_ESC::init(AP_HAL::UARTDriver *vesc_uart)
     //   map(|iq|+boost, 0, current_max, rpm_low_frac*openloop_erpm, openloop_erpm)
     // At boost_q=10 A of 15 A, a zero-throttle start hands over near 0.8·this;
     // full throttle at this ceiling — both well above the observer's speed floor.
-    motor_cfg.openloop_erpm = 2000.0f;
+    motor_cfg.openloop_erpm = 2000.0f;   // overridden by OL_ERPM below
     // Outer speed PI — strong enough to reject load (tune: ↑ if sluggish, ↓ if hunting).
     motor_cfg.speed_kp = 0.005f;   // [A per eRPM]
     motor_cfg.speed_ki = 0.05f;    // [A per eRPM·s]
@@ -358,6 +408,21 @@ void FOC_ESC::init(AP_HAL::UARTDriver *vesc_uart)
     motor_cfg.stall_erpm           = _p_stall_rpm.get();
     motor_cfg.stall_current        = _p_stall_i.get();
     motor_cfg.stall_time_s         = _p_stall_t.get();
+    // Duty ceiling. Clamped here rather than trusting the param: it also arrives
+    // from VESC Tool's l_max_duty box, and this one bounds a HARDWARE window
+    // (bootstrap refresh + shunt sample aperture), not a preference. The upper
+    // bound sits below the ~0.93 the ADC timing is documented good for, so the
+    // margin left over is the bootstrap's — the side that has never been measured
+    // on this board and the side whose failure kills FETs.
+    motor_cfg.duty_max             = constrain_float(_p_duty_max.get(), 0.55f, 0.90f);
+    motor_cfg.openloop_current     = _p_ol_boost.get();
+    motor_cfg.openloop_max_q       = _p_ol_imax.get();
+    motor_cfg.openloop_erpm        = _p_ol_erpm.get();
+    motor_cfg.openloop_rpm_low_frac = _p_ol_low.get();
+    motor_cfg.openloop_hyst_s      = _p_ol_hyst.get();
+    motor_cfg.openloop_lock_s      = _p_ol_tlock.get();
+    motor_cfg.openloop_ramp_s      = _p_ol_tramp.get();
+    motor_cfg.openloop_const_s     = _p_ol_tconst.get();
 
     motor_cfg.sensor_mode = (_p_sensor_mode.get() == 0)
                                 ? ChibiOS::MotorControl::SensorMode::SENSORLESS
@@ -465,6 +530,45 @@ void FOC_ESC::on_mcconf_write(const ChibiOS::VescTelemetry::McconfIn &in)
     }
     if (in.sensor_mode == 0 || in.sensor_mode == 2) {
         _p_sensor_mode.set_and_save(int8_t(in.sensor_mode == 2 ? 1 : 0));
+    }
+    // Duty ceiling. Range-checked here as well as at load, so a config carrying
+    // a stock VESC 0.95 is REFUSED outright rather than silently clamped to 0.90
+    // — a stored value that does not match what is running is how a limit stops
+    // meaning anything. Anything inside the window is taken as intended.
+    if (in.max_duty >= 0.55f && in.max_duty <= 0.90f) {
+        _p_duty_max.set_and_save(in.max_duty);
+    }
+    // Sensorless open-loop start. Each guarded on its own: VESC Tool sends the
+    // whole config, and a field the operator never touched must not overwrite a
+    // value tuned here. The times are the ones that matter — lock+ramp+const is
+    // how long full boost current sits on a FORCED angle, which is the highest-
+    // stress routine in the firmware (five gate drivers have died on this bench).
+    if (in.ol_boost_q > 0.0f && in.ol_boost_q <= _p_i_max.get()) {
+        _p_ol_boost.set_and_save(in.ol_boost_q);
+    }
+    if (in.ol_max_q > 0.0f && in.ol_max_q <= _p_i_max.get()) {
+        _p_ol_imax.set_and_save(in.ol_max_q);
+    }
+    if (in.ol_erpm > 0.0f) {
+        _p_ol_erpm.set_and_save(in.ol_erpm);
+    }
+    if (in.ol_rpm_low >= 0.0f && in.ol_rpm_low <= 1.0f) {
+        _p_ol_low.set_and_save(in.ol_rpm_low);
+    }
+    if (in.ol_hyst >= 0.0f) {
+        _p_ol_hyst.set_and_save(in.ol_hyst);
+    }
+    // Cap the forced-rotation phases: a config asking to hold boost current on a
+    // stationary forced angle for tens of seconds is a motor-cooking command,
+    // and there is no motor temperature sensor to catch it.
+    if (in.ol_t_lock >= 0.0f && in.ol_t_lock <= 5.0f) {
+        _p_ol_tlock.set_and_save(in.ol_t_lock);
+    }
+    if (in.ol_t_ramp > 0.0f && in.ol_t_ramp <= 5.0f) {
+        _p_ol_tramp.set_and_save(in.ol_t_ramp);
+    }
+    if (in.ol_t_const > 0.0f && in.ol_t_const <= 5.0f) {
+        _p_ol_tconst.set_and_save(in.ol_t_const);
     }
 
     // set_and_save() only QUEUES the write for the background IO thread

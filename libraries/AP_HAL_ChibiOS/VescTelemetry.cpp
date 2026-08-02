@@ -758,6 +758,11 @@ void VescTelemetry::handle_get_mcconf(uint8_t reply_id)
     const bool is_hall = (_mc.get_sensor_mode() == MotorControl::SensorMode::HALL);
     float hd[8];
     _mc.get_hall_table_deg(hd);   // [0..360) per state, NaN = unmapped
+    float ol_boost, ol_maxq, ol_erpm, ol_rpmlow, ol_hyst, ol_tlock, ol_tramp, ol_tconst;
+    _mc.get_openloop_cfg(ol_boost, ol_maxq, ol_erpm, ol_rpmlow, ol_hyst,
+                         ol_tlock, ol_tramp, ol_tconst);
+    const float v_min  = _mc.get_vbus_min();
+    const float uv_band = _mc.get_vbus_uv_band();
 
     uint8_t buf[512];
     uint8_t *p = buf;
@@ -781,10 +786,14 @@ void VescTelemetry::handle_get_mcconf(uint8_t reply_id)
     put_f16     (p, 0.8f, 10000.0f);           // l_erpm_start
     put_f32_auto(p, 300.0f);                   // l_max_erpm_fbrake
     put_f32_auto(p, 1500.0f);                  // l_max_erpm_fbrake_cc
-    put_f16     (p, 6.0f, 10.0f);              // l_min_vin
+    put_f16     (p, v_min, 10.0f);             // l_min_vin            ← param (V_MIN)
     put_f16     (p, _conf.max_vin, 10.0f);     // l_max_vin            ← param (V_OV, hard trip)
-    put_f16     (p, 10.0f, 10.0f);             // l_battery_cut_start
-    put_f16     (p, 8.0f, 10.0f);              // l_battery_cut_end
+    // VESC's under-voltage foldback band, the mirror of the regen pair below:
+    // motoring current scales to zero between start and end. Ours is V_MIN plus
+    // the V_UVFOLD band, so end = V_MIN (where the hard UV trip also sits, which
+    // is exactly how VESC configures it — see MotorControl.h vbus_uv_fold_band).
+    put_f16     (p, v_min + uv_band, 10.0f);   // l_battery_cut_start  ← V_MIN + V_UVFOLD
+    put_f16     (p, v_min, 10.0f);             // l_battery_cut_end    ← V_MIN
     // VESC's regen over-voltage cutoff (mc_interface.c:2483) — the fields that
     // actually mean "fold braking back as the bus rises", so V_MAX/V_FOLD live
     // here rather than in l_max_vin. Previously hardcoded 100/110 V, which showed
@@ -798,7 +807,7 @@ void VescTelemetry::handle_get_mcconf(uint8_t reply_id)
     put_u8      (p, 105);                      // l_temp_motor_end
     put_f16     (p, 0.15f, 10000.0f);          // l_temp_accel_dec
     put_f16     (p, 0.005f, 10000.0f);         // l_min_duty
-    put_f16     (p, 0.95f, 10000.0f);          // l_max_duty
+    put_f16     (p, _mc.get_duty_max(), 10000.0f); // l_max_duty       ← param (D_MAX)
     put_f32_auto(p, 500000.0f);                // l_watt_max
     put_f32_auto(p, -500000.0f);               // l_watt_min
     put_f16     (p, 1.0f, 10000.0f);           // l_current_max_scale
@@ -815,8 +824,8 @@ void VescTelemetry::handle_get_mcconf(uint8_t reply_id)
     put_f32_auto(p, 2000.0f);                  // hall_sl_erpm
     put_f32_auto(p, kp);                       // foc_current_kp       ← live
     put_f32_auto(p, ki);                       // foc_current_ki       ← live
-    put_f32_auto(p, 20000.0f);                 // foc_f_zv
-    put_f32_auto(p, 0.36f);                    // foc_dt_us
+    put_f32_auto(p, float(_mc.get_pwm_rate_hz()));   // foc_f_zv       ← live PWM rate
+    put_f32_auto(p, float(_mc.deadtime_ns()) * 1e-3f); // foc_dt_us    ← achieved dead time
     put_u8      (p, 0);                        // foc_encoder_inverted
     put_f32_auto(p, 0.0f);                     // foc_encoder_offset
     put_f32_auto(p, 7.0f);                     // foc_encoder_ratio
@@ -834,16 +843,16 @@ void VescTelemetry::handle_get_mcconf(uint8_t reply_id)
     put_f32_auto(p, 200.0f);                   // foc_duty_dowmramp_ki
     put_f16     (p, 1.0f, 10000.0f);           // foc_start_curr_dec
     put_f32_auto(p, 2500.0f);                  // foc_start_curr_dec_rpm
-    put_f32_auto(p, 400.0f);                   // foc_openloop_rpm
-    put_f16     (p, 0.0f, 1000.0f);            // foc_openloop_rpm_low
+    put_f32_auto(p, ol_erpm);                  // foc_openloop_rpm     ← param (OL_ERPM)
+    put_f16     (p, ol_rpmlow, 1000.0f);       // foc_openloop_rpm_low ← param (OL_LOW)
     put_f16     (p, 1.0f, 1000.0f);            // foc_d_gain_scale_start
     put_f16     (p, 0.2f, 1000.0f);            // foc_d_gain_scale_max_mod
-    put_f16     (p, 0.1f, 100.0f);             // foc_sl_openloop_hyst
-    put_f16     (p, 0.0f, 100.0f);             // foc_sl_openloop_time_lock
-    put_f16     (p, 0.1f, 100.0f);             // foc_sl_openloop_time_ramp
-    put_f16     (p, 0.05f, 100.0f);            // foc_sl_openloop_time
-    put_f16     (p, 5.0f, 100.0f);             // foc_sl_openloop_boost_q
-    put_f16     (p, -1.0f, 100.0f);            // foc_sl_openloop_max_q
+    put_f16     (p, ol_hyst, 100.0f);          // foc_sl_openloop_hyst      ← param (OL_HYST)
+    put_f16     (p, ol_tlock, 100.0f);         // foc_sl_openloop_time_lock ← param (OL_TLOCK)
+    put_f16     (p, ol_tramp, 100.0f);         // foc_sl_openloop_time_ramp ← param (OL_TRAMP)
+    put_f16     (p, ol_tconst, 100.0f);        // foc_sl_openloop_time      ← param (OL_TCONST)
+    put_f16     (p, ol_boost, 100.0f);         // foc_sl_openloop_boost_q   ← param (OL_IBOOST)
+    put_f16     (p, ol_maxq, 100.0f);          // foc_sl_openloop_max_q     ← param (OL_IMAX)
     for (uint8_t k = 0; k < 8; k++) {          // foc_hall_table[0-7]  ← param
         if (isnan(hd[k])) {
             put_u8(p, 255);                    // unmapped state
@@ -1004,7 +1013,8 @@ void VescTelemetry::handle_set_mcconf()
     in.temp_fet_start = float(*p); p += 1;  // l_temp_fet_start (u8)
     in.temp_fet_end   = float(*p); p += 1;  // l_temp_fet_end (u8)
     U8(); U8();                             // l_temp_motor_start, _end
-    H(10000); H(10000); H(10000);           // l_temp_accel_dec, l_min_duty, l_max_duty
+    H(10000); H(10000);                     // l_temp_accel_dec, l_min_duty
+    in.max_duty = get_f16(p, 10000);        // l_max_duty
     A(); A();                               // l_watt_max, l_watt_min
     H(10000); H(10000); H(10000);           // l_current_max_scale, min_scale, l_duty_start
     A(); A(); A();                          // sl_min_erpm, sl_min_erpm_cycle_int_limit, sl_max_fullbreak_..
@@ -1029,9 +1039,16 @@ void VescTelemetry::handle_set_mcconf()
     H(1000);                                // foc_observer_offset
     A(); A();                               // foc_duty_dowmramp_kp, _ki
     H(10000);                               // foc_start_curr_dec
-    A(); A();                               // foc_start_curr_dec_rpm, foc_openloop_rpm
-    H(1000); H(1000); H(1000);              // foc_openloop_rpm_low, d_gain_scale_start, _max_mod
-    H(100); H(100); H(100); H(100); H(100); H(100); // foc_sl_openloop_hyst, time_lock, time_ramp, time, boost_q, max_q
+    A();                                    // foc_start_curr_dec_rpm
+    in.ol_erpm    = get_f32_auto(p);        // foc_openloop_rpm
+    in.ol_rpm_low = get_f16(p, 1000);       // foc_openloop_rpm_low
+    H(1000); H(1000);                       // foc_d_gain_scale_start, _max_mod
+    in.ol_hyst    = get_f16(p, 100);        // foc_sl_openloop_hyst
+    in.ol_t_lock  = get_f16(p, 100);        // foc_sl_openloop_time_lock
+    in.ol_t_ramp  = get_f16(p, 100);        // foc_sl_openloop_time_ramp
+    in.ol_t_const = get_f16(p, 100);        // foc_sl_openloop_time
+    in.ol_boost_q = get_f16(p, 100);        // foc_sl_openloop_boost_q
+    in.ol_max_q   = get_f16(p, 100);        // foc_sl_openloop_max_q
     p += 8;                                 // foc_hall_table[0-7] u8
     in.hall_interp_erpm = get_f32_auto(p);  // foc_hall_interp_erpm
     in.sl_erpm_start    = get_f32_auto(p);  // foc_sl_erpm_start

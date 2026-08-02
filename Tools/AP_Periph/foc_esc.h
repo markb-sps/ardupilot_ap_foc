@@ -146,6 +146,16 @@ private:
     AP_Float _p_v_max;         // regen fully cut at this bus V → l_battery_regen_cut_end
     AP_Float _p_v_fold;        // OV regen foldback band [V]    → l_battery_regen_cut_start
     AP_Float _p_v_ov;          // hard bus over-voltage trip [V] → l_max_vin
+    AP_Float _p_duty_max;      // per-phase duty ceiling        → l_max_duty
+    // Sensorless open-loop start → VESC foc_openloop_rpm / foc_sl_openloop_*
+    AP_Float _p_ol_boost;      // start boost current [A]
+    AP_Float _p_ol_imax;       // open-loop iq cap [A]
+    AP_Float _p_ol_erpm;       // handover speed [eRPM]
+    AP_Float _p_ol_low;        // handover speed at zero current, fraction
+    AP_Float _p_ol_hyst;       // dwell below threshold before override [s]
+    AP_Float _p_ol_tlock;      // hold-angle lock time [s]
+    AP_Float _p_ol_tramp;      // forced-speed ramp time [s]
+    AP_Float _p_ol_tconst;     // forced-speed hold time [s]
     AP_Float _p_v_min;         // bus under-voltage floor [V]   (DroneCAN-only)
     AP_Float _p_v_uvfold;      // UV foldback band [V]          (DroneCAN-only)
     AP_Float _p_t_start;       // FET derate onset [°C]         → l_temp_fet_start
