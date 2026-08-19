@@ -835,7 +835,7 @@ void VescTelemetry::handle_get_mcconf(uint8_t reply_id)
     put_f32_auto(p, -500000.0f);               // l_watt_min
     put_f16     (p, 1.0f, 10000.0f);           // l_current_max_scale
     put_f16     (p, 1.0f, 10000.0f);           // l_current_min_scale
-    put_f16     (p, 1.0f, 10000.0f);           // l_duty_start
+    put_f16     (p, _mc.get_duty_start(), 10000.0f); // l_duty_start    ← param (D_START)
     put_f32_auto(p, 150.0f);                   // sl_min_erpm
     put_f32_auto(p, 1100.0f);                  // sl_min_erpm_cycle_int_limit
     put_f32_auto(p, 10.0f);                    // sl_max_fullbreak_current_dir_change
@@ -1041,7 +1041,8 @@ void VescTelemetry::handle_set_mcconf()
     // D_MAX so the sink's range check and the param are in the same units.
     in.max_duty = vesc_to_duty_max(get_f16(p, 10000));  // l_max_duty
     A(); A();                               // l_watt_max, l_watt_min
-    H(10000); H(10000); H(10000);           // l_current_max_scale, min_scale, l_duty_start
+    H(10000); H(10000);                     // l_current_max_scale, l_current_min_scale
+    in.duty_start = get_f16(p, 10000);      // l_duty_start
     A(); A(); A();                          // sl_min_erpm, sl_min_erpm_cycle_int_limit, sl_max_fullbreak_..
     H(10);                                  // sl_cycle_int_limit
     H(10000);                               // sl_phase_advance_at_br

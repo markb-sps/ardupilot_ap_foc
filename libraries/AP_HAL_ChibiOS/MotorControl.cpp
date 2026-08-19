@@ -30,6 +30,9 @@ constexpr uint16_t OC_BLANK_SAMPLES = 16;   // trip-blank window after the bridg
 // filter has demonstrably settled. Arming against an unsettled node was what
 // produced spurious trips, not the lack of a debounce.
 constexpr uint16_t UV_DEBOUNCE = 1;
+// VESC mcconf_default.h:197 MCCONF_CC_MIN_CURRENT — the floor every current
+// limit is held at, and (×5) the floor the duty foldback tapers down to.
+constexpr float CC_MIN_CURRENT = 0.05f;
 // Consecutive healthy bus samples required before the under-voltage protection
 // arms at all (~50 ms at 20 kHz).
 //
@@ -219,7 +222,12 @@ bool MotorControl::init(const Config &cfg)
     _duty_max = clampf(cfg.duty_max, 0.55f, 0.98f);
     const float mod_ceiling = 2.0f * (_duty_max - 0.5f);
     const float eff_max_mod = (cfg.max_modulation < mod_ceiling) ? cfg.max_modulation : mod_ceiling;
+    _max_mod_eff   = eff_max_mod;                  // VESC l_max_duty equivalent
     _mod_to_vmax   = eff_max_mod * 0.57735026919f; // /√3
+    // Duty foldback knee (VESC l_duty_start). Clamped to a sane fraction: a knee
+    // at or below zero would fold the limit away at every duty, and VESC's own
+    // "> 0.99 disables" sentinel is preserved by leaving anything above 0.99 be.
+    _duty_start    = (cfg.duty_start > 0.99f) ? 1.0f : clampf(cfg.duty_start, 0.30f, 0.99f);
     _dt_comp_volts   = cfg.deadtime_comp_volts;
     _dt_comp_on_duty = cfg.deadtime_comp_on_duty;
     _v_max         = _mod_to_vmax * cfg.vbus;
@@ -843,7 +851,47 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
                                ? clampf((_vbus_flt - _vbus_min) * _vbus_uvfold_inv, 0.0f, 1.0f)
                                : 1.0f;
     // Thermal derate of the iq limit (thread-computed from the board NTC).
-    const float i_max = _current_max * _i_derate * uv_scale;
+    float i_max = _current_max * _i_derate * uv_scale;
+
+    // ── Duty-based current foldback (VESC mc_interface.c:2460, "Duty max") ───
+    // The drive must run out of TORQUE before it runs out of VOLTS. Without this
+    // the motor accelerates until back-EMF exceeds what the inverter can supply,
+    // and past that point the loop has no authority left: the phase impedance is
+    // a few tens of mΩ, so ~1 V of overshoot is tens of amps of (braking)
+    // current, straight into the ABS overcurrent trip and the bus.
+    //
+    // VESC's remedy is to taper the current ceiling as duty approaches the
+    // modulation limit, so the machine settles at its base speed instead of
+    // slamming into it. Same map, same disable sentinel (l_duty_start > 0.99):
+    //     lo_max_duty = map(duty, duty_start·duty_max, duty_max,
+    //                       current_max, cc_min_current·5)
+    // then folded in with utils_min_abs and floored at cc_min_current.
+    //
+    // _t_duty is last cycle's modulation depth (it is written at the end of the
+    // ISR). VESC's equivalent is far staler — computed in a 1 kHz thread — so one
+    // 50 µs cycle of lag is not a fidelity concern. get_duty_vesc()'s √3/2 factor
+    // is applied here too, so `duty` means what VESC means by duty_cycle_now, and
+    // _max_mod_eff is its l_max_duty: both are the modulation ceiling.
+    if (_duty_start <= 0.99f) {
+        const float duty_now_abs = fabsf(_t_duty) * 0.8660254f;
+        const float duty_knee    = _duty_start * _max_mod_eff;
+        if (duty_now_abs >= duty_knee) {
+            const float span = _max_mod_eff - duty_knee;
+            const float lo_max_duty =
+                (span > 1e-6f)
+                    ? (duty_now_abs - duty_knee) * (CC_MIN_CURRENT * 5.0f - _current_max) / span
+                          + _current_max
+                    : CC_MIN_CURRENT * 5.0f;
+            if (lo_max_duty < i_max) {
+                i_max = lo_max_duty;
+            }
+        }
+    }
+    // VESC floors the limit at cc_min_current so a fully folded-back drive still
+    // holds the loop alive rather than commanding exactly zero.
+    if (i_max < CC_MIN_CURRENT) {
+        i_max = CC_MIN_CURRENT;
+    }
 
     // ── Phase currents ──────────────────────────────────────────────────────
     // Low-side shunt polarity: positive phase current pulls the amplified ADC

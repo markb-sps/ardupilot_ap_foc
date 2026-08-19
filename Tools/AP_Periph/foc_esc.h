@@ -154,6 +154,7 @@ private:
     AP_Float _p_v_fold;        // OV regen foldback band [V]    → l_battery_regen_cut_start
     AP_Float _p_v_ov;          // hard bus over-voltage trip [V] → l_max_vin
     AP_Float _p_duty_max;      // per-phase duty ceiling        → l_max_duty
+    AP_Float _p_duty_start;    // duty foldback knee (fraction) → l_duty_start
     // Sensorless open-loop start → VESC foc_openloop_rpm / foc_sl_openloop_*
     AP_Float _p_ol_boost;      // start boost current [A]
     AP_Float _p_ol_imax;       // open-loop iq cap [A]

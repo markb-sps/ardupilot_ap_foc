@@ -170,6 +170,12 @@ const AP_Param::GroupInfo FOC_ESC::var_info[] = {
     // @Range: 0.55 0.90
     // @User: Advanced
     AP_GROUPINFO("D_MAX", 36, FOC_ESC, _p_duty_max, 0.80f),
+    // @Param: D_START
+    // @DisplayName: Duty at which current foldback starts
+    // @Description: Fraction of the modulation ceiling at which the current limit begins tapering, reaching near-zero at the ceiling (VESC l_duty_start, "Duty Cycle Current Limit Start"). This is what makes the motor settle at base speed instead of accelerating into voltage saturation, where the loop loses authority and back-EMF overshoot becomes tens of amps of braking current. Above 0.99 disables it, which is VESC's default; ours is on because this board's duty ceiling puts base speed inside the usable throttle range.
+    // @Range: 0.30 1.0
+    // @User: Advanced
+    AP_GROUPINFO("D_START", 45, FOC_ESC, _p_duty_start, 0.85f),
     // ── Sensorless open-loop start (VESC foc_sl_openloop_*) ──────────────────
     // Inactive in HALL sensor mode: the halls commutate from standstill and this
     // state machine is never entered.
@@ -415,6 +421,7 @@ void FOC_ESC::init(AP_HAL::UARTDriver *vesc_uart)
     // margin left over is the bootstrap's — the side that has never been measured
     // on this board and the side whose failure kills FETs.
     motor_cfg.duty_max             = constrain_float(_p_duty_max.get(), 0.55f, 0.90f);
+    motor_cfg.duty_start           = _p_duty_start.get();
     motor_cfg.openloop_current     = _p_ol_boost.get();
     motor_cfg.openloop_max_q       = _p_ol_imax.get();
     motor_cfg.openloop_erpm        = _p_ol_erpm.get();
@@ -543,6 +550,13 @@ void FOC_ESC::on_mcconf_write(const ChibiOS::VescTelemetry::McconfIn &in)
     // inside is taken as intended.
     if (in.max_duty >= 0.55f && in.max_duty <= 0.90f) {
         _p_duty_max.set_and_save(in.max_duty);
+    }
+    // Duty foldback knee. VESC's own ">0.99 = disabled" sentinel is a legitimate
+    // value, so the accepted window runs to 1.0 — but 0 (an absent field) and
+    // anything under 0.30 are refused: a knee that low folds the current ceiling
+    // away across the whole usable duty range, which reads as "no torque".
+    if (in.duty_start >= 0.30f && in.duty_start <= 1.0f) {
+        _p_duty_start.set_and_save(in.duty_start);
     }
     // Sensorless open-loop start. Each guarded on its own: VESC Tool sends the
     // whole config, and a field the operator never touched must not overwrite a

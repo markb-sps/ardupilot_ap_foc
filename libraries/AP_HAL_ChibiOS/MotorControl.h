@@ -122,6 +122,23 @@ public:
         //   2·(duty_max - 0.5) and the two can never drift apart.
         float    duty_max          = 0.80f;   // per-phase duty ceiling [0.55..0.98]
         float    max_modulation    = 0.90f;   // SVPWM vector ceiling (capped by duty_max)
+        // Duty at which the current ceiling starts folding back, as a FRACTION of
+        // the modulation ceiling (VESC l_duty_start; > 0.99 disables, which is
+        // VESC's own default). Below the knee the full limit applies; from the
+        // knee to the ceiling it tapers linearly to cc_min_current·5.
+        //
+        // This is what stops the drive from accelerating into voltage saturation.
+        // Above base speed (_v_max/λ) the applied voltage can no longer contain
+        // the back-EMF, and with a few tens of mΩ of phase impedance the residual
+        // drives tens of amps of braking current — an ABS overcurrent trip and a
+        // bus-pumping event in one. Folding torque off before the ceiling makes
+        // the machine settle at base speed instead.
+        //
+        // Default differs from VESC's 1.0 (disabled) deliberately: the ceiling on
+        // this board is low (duty_max also serves the bootstrap and the shunt
+        // sampling window), so base speed sits inside the usable throttle range
+        // rather than far above it.
+        float    duty_start        = 0.85f;
         // Max braking/regen MOTOR current [A]. Caps the negative (decelerating)
         // iq in SPEED mode and the magnitude in BRAKE mode. Keep conservative:
         // braking energy returns to the bus, a bench PSU can't sink it, and
@@ -470,6 +487,7 @@ public:
     // hide exactly the clamps worth knowing about (duty_max, vbus_min, and the
     // TRACK/hysteresis coupling on the open-loop times).
     float get_duty_max()      const { return _duty_max; }
+    float get_duty_start()    const { return _duty_start; }
     float get_vbus_min()      const { return _vbus_min; }
     // Under-voltage foldback band [V] — the reciprocal is what is stored.
     float get_vbus_uv_band()  const { return 1.0f / _vbus_uvfold_inv; }
@@ -645,6 +663,10 @@ private:
     float _vbus_flt        = 18.0f;  // ISR-side filtered bus volts
     float _mod_to_vmax     = 0.0f;   // effective max_modulation/√3
     float _duty_max        = 0.80f;  // hard per-phase duty ceiling (bootstrap + ADC window)
+    // Effective modulation ceiling = min(max_modulation, 2·(duty_max−0.5)). This
+    // is VESC's l_max_duty: the value get_duty_vesc() saturates at.
+    float _max_mod_eff     = 0.60f;
+    float _duty_start      = 0.85f;  // duty foldback knee, fraction of _max_mod_eff
     float _dt_comp_volts   = 0.0f;   // cfg.deadtime_comp_volts
     bool  _dt_comp_on_duty = true;   // cfg.deadtime_comp_on_duty
     // VESC-style open-loop override constants

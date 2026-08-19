@@ -73,6 +73,10 @@ public:
         // above for why the two are not the same number. 0 = absent; the sink
         // range-checks against the hardware window before storing.
         float   max_duty = 0.0f;
+        // l_duty_start → D_START. Fraction of the duty ceiling at which the
+        // current limit starts folding back; VESC treats > 0.99 as disabled.
+        // 0 = absent.
+        float   duty_start = 0.0f;
         // Sensorless open-loop start, VESC foc_sl_openloop_* / foc_openloop_rpm.
         // All are meaningless at or below zero except rpm_low (0 is valid and is
         // the default), so 0 doubles as "absent" for the rest.
