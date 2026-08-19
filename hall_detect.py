@@ -2,8 +2,11 @@
 # hall_detect.py — trigger the firmware's hall-sensor table detection spin and
 # print the resulting per-state electrical angles.
 #
-# The motor MUST be free to spin and unloaded; the spin is open-loop at low
-# modulation (~2 s). Uses the same VESC command VESC Tool's hall detect sends
+# The motor MUST be free to spin and unloaded; the spin is current-controlled at
+# low modulation and takes ~12 s (firmware HD_RAMP_S + 2*HD_REVS/HD_HZ — it is a
+# slow forward sweep then an equally slow reverse one, so be patient: a rotor
+# creeping round at well under 1 Hz electrical is what a healthy run looks like).
+# Uses the same VESC command VESC Tool's hall detect sends
 # (COMM_DETECT_HALL_FOC = 28), so this and VESC Tool are interchangeable.
 #
 #   ./hall_detect.py [port] [detect_current_A]
@@ -45,10 +48,14 @@ def rd(deadline):
     return None
 
 print("Starting hall detect — keep the motor FREE TO SPIN and unloaded...")
+print("the spin takes ~12 s; waiting for the result...")
 ser.write(detect(CURRENT))
 
 p = None
-end = time.time() + 6.0
+# Must comfortably exceed the firmware's spin length (~12 s) — the reply is only
+# emitted once the sweep completes. A 6 s window here timed out on every healthy
+# run and looked exactly like a board that never started.
+end = time.time() + 25.0
 while time.time() < end:
     q = rd(end)
     if q and len(q) >= 10 and q[0] == COMM_DETECT_HALL_FOC:

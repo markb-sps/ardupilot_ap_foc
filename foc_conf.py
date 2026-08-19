@@ -188,7 +188,9 @@ SHOW = [
     ("l_max_vin",              "V",   "FOC_V_MAX",    40.0),
     ("l_temp_fet_start",       "C",   "FOC_T_START",  None),
     ("l_temp_fet_end",         "C",   "FOC_T_MAX",    None),
-    ("l_max_duty",             "",    "duty_max",     None),
+    # Wire value is VESC's MODULATION ceiling, not the firmware's per-phase
+    # D_MAX; the link converts (D_MAX = 0.5 + mod/2). 0.80 here = D_MAX 0.90.
+    ("l_max_duty",             "",    "modulation ceiling", None),
     ("foc_motor_l",            "H",   "FOC_M_LS",     80e-6),
     ("foc_motor_r",            "ohm", "FOC_M_RS",     0.055),
     ("foc_motor_flux_linkage", "Wb",  "FOC_M_FLUX",   4.6e-3),

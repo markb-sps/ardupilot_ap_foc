@@ -166,7 +166,7 @@ const AP_Param::GroupInfo FOC_ESC::var_info[] = {
     AP_GROUPINFO("V_FOLD", 21, FOC_ESC, _p_v_fold, 3.0f),
     // @Param: D_MAX
     // @DisplayName: Per-phase duty ceiling
-    // @Description: HARDWARE limit, not a tuning preference. The MP1918 high-side bootstrap only recharges while the low side conducts, and the phase-shunt ADC samples in that same window (valid to ~0.93 duty at 20 kHz per stm32_foc_motor_control.cpp). Raising it raises top speed roughly linearly (it sets the modulation ceiling, 2*(D_MAX-0.5)), and at some point drops a high-side FET out of enhancement while it carries current. Clamped to 0.55..0.90 on load.
+    // @Description: HARDWARE limit, not a tuning preference. The MP1918 high-side bootstrap only recharges while the low side conducts, and the phase-shunt ADC samples in that same window (valid to ~0.93 duty at 20 kHz per stm32_foc_motor_control.cpp). Raising it raises top speed roughly linearly (it sets the modulation ceiling, 2*(D_MAX-0.5)), and at some point drops a high-side FET out of enhancement while it carries current. Clamped to 0.55..0.90 on load, i.e. a modulation ceiling of 0.10..0.80. NOTE VESC Tool's "Maximum Duty Cycle" box is the MODULATION figure, not this one: the link converts both ways, so 80% there stores D_MAX 0.90 here.
     // @Range: 0.55 0.90
     // @User: Advanced
     AP_GROUPINFO("D_MAX", 36, FOC_ESC, _p_duty_max, 0.80f),
@@ -531,10 +531,16 @@ void FOC_ESC::on_mcconf_write(const ChibiOS::VescTelemetry::McconfIn &in)
     if (in.sensor_mode == 0 || in.sensor_mode == 2) {
         _p_sensor_mode.set_and_save(int8_t(in.sensor_mode == 2 ? 1 : 0));
     }
-    // Duty ceiling. Range-checked here as well as at load, so a config carrying
-    // a stock VESC 0.95 is REFUSED outright rather than silently clamped to 0.90
-    // — a stored value that does not match what is running is how a limit stops
-    // meaning anything. Anything inside the window is taken as intended.
+    // Duty ceiling. in.max_duty is already in D_MAX (per-phase) units — the wire
+    // value is a MODULATION ceiling and VescTelemetry converts on parse, so the
+    // window below is the hardware one and needs no scaling here.
+    //
+    // Range-checked here as well as at load, so a config carrying a stock VESC
+    // l_max_duty of 0.95 (→ D_MAX 0.975) is REFUSED outright rather than
+    // silently clamped to 0.90 — a stored value that does not match what is
+    // running is how a limit stops meaning anything. An absent field (0 on the
+    // wire → 0.5) falls below the window and is refused for free. Anything
+    // inside is taken as intended.
     if (in.max_duty >= 0.55f && in.max_duty <= 0.90f) {
         _p_duty_max.set_and_save(in.max_duty);
     }
@@ -720,6 +726,25 @@ void FOC_ESC::detect_finish(float r, float l, float linkage, bool ok)
     _det_state = DetState::IDLE;
 }
 
+// Report the reason on the terminal, then finish as a failure. Every abort path
+// goes through here so a failed detection always leaves a trace.
+void FOC_ESC::detect_abort(const char *why, float linkage)
+{
+    char line[96];
+    hal.util->snprintf(line, sizeof(line), "detect FAILED: %s", why);
+    vesc_telem.send_print(line);
+    // The numbers behind every decision, in one line — which stage it died in
+    // and what the ramp had reached. Without these the reason string alone can't
+    // separate "never got moving" from "got moving then lost it".
+    hal.util->snprintf(line, sizeof(line),
+                       "  stage=%u erpm=%.0f duty=%.3f dmax=%.3f dstill=%.3f R=%.4f L=%.2fuH",
+                       unsigned(_det_state), double(_det_erpm),
+                       double(motor_control.get_duty_vesc()), double(_det_duty_max),
+                       double(_det_duty_still), double(_det_r), double(_det_l * 1e6f));
+    vesc_telem.send_print(line);
+    detect_finish(0.0f, 0.0f, linkage, false);
+}
+
 bool FOC_ESC::update_detect(uint32_t now_ms)
 {
     using DetectKind = ChibiOS::VescTelemetry::DetectKind;
@@ -729,7 +754,10 @@ bool FOC_ESC::update_detect(uint32_t now_ms)
     // Any trip during a measurement aborts it. The ISR has already gated the
     // bridge; all we do is report the failure so the tool does not hang.
     if (motor_control.get_fault() != 0) {
-        detect_finish(0.0f, 0.0f, 0.0f, false);
+        char line[64];
+        hal.util->snprintf(line, sizeof(line), "fault %u tripped mid-detect",
+                           unsigned(motor_control.get_fault()));
+        detect_abort(line);
         return false;
     }
     const uint32_t dt_ms = now_ms - _det_ms;
@@ -762,7 +790,7 @@ bool FOC_ESC::update_detect(uint32_t now_ms)
             const float i_avg = (_det_ticks > 0) ? (_det_acc_b / float(_det_ticks)) : 0.0f;
             const float v_avg = (_det_ticks > 0) ? (_det_acc_a / float(_det_ticks)) : 0.0f;
             if (i_avg < 0.5f) {
-                detect_finish(0.0f, 0.0f, 0.0f, false);   // no current flowed
+                detect_abort("no current flowed during R injection");
                 return false;
             }
             const float r_try = v_avg / i_avg;
@@ -839,7 +867,7 @@ bool FOC_ESC::update_detect(uint32_t now_ms)
                                         ? ((n * sxy - sx * sy) / den) : 0.0f;
                 _det_l = (slope > 0.0f) ? sqrtf(slope) : 0.0f;
                 if (_det_l <= 0.0f) {
-                    detect_finish(0.0f, 0.0f, 0.0f, false);
+                    detect_abort("inductance fit gave no positive slope");
                     return false;
                 }
                 if (_det_req.kind == DetectKind::R_L) {
@@ -911,15 +939,15 @@ bool FOC_ESC::update_detect(uint32_t now_ms)
         // VESC's three abort sentinels, reported as the linkage value so VESC
         // Tool shows its own explanation for each.
         if (dt_ms >= DET_F_RAMP_MAX_MS) {
-            detect_finish(0, 0, -1.0f, false);   // never reached the target duty
+            detect_abort("ramp timed out before reaching target duty", -1.0f);
             return false;
         }
         if (dt_ms > 4000 && duty_now < (_det_duty_max * 0.7f)) {
-            detect_finish(0, 0, -2.0f, false);   // duty collapsed → lost the rotor
+            detect_abort("duty collapsed - rotor lost sync with the forced angle", -2.0f);
             return false;
         }
         if (dt_ms > 4000 && _det_req.duty < (_det_duty_still * 1.1f)) {
-            detect_finish(0, 0, -3.0f, false);   // target below the standstill duty
+            detect_abort("target duty is below the standstill duty", -3.0f);
             return false;
         }
         if (duty_now >= _det_req.duty || _det_erpm >= DET_F_ERPM_MAX) {
@@ -955,7 +983,13 @@ bool FOC_ESC::update_detect(uint32_t now_ms)
                 linkage = (v_mag - _det_r * i_mag) / rad_s - i_mag * _det_l;
             }
             if (!(linkage > 0.0f)) {
-                detect_finish(0, 0, 0.0f, false);
+                // Worth the extra line: this one fails on the ARITHMETIC, not on
+                // the spin, so the ramp diagnostics above look perfectly healthy.
+                char line[96];
+                hal.util->snprintf(line, sizeof(line),
+                                   "linkage <= 0 (|v|=%.3f |i|=%.2f rad/s=%.0f)",
+                                   double(v_mag), double(i_mag), double(rad_s));
+                detect_abort(line);
                 return false;
             }
             detect_finish(_det_r, _det_l, linkage, true);
@@ -1125,7 +1159,16 @@ void FOC_ESC::update(uint32_t now_ms)
         const bool usb_fresh = vesc_telem.usb_current(now_ms, THR_SOURCE_TIMEOUT_MS, usb_amps);
         const bool override  = vesc_telem.override_active(now_ms, THR_SOURCE_TIMEOUT_MS);
 
-        if (update_detect(now_ms)) {
+        if (motor_control.is_hall_detecting()) {
+            // A hall-table detection spin owns the motor. It is self-terminating
+            // (~12 s) and coasts itself when done, so there is nothing to drive
+            // and nothing to time out here. This branch must come FIRST and must
+            // not depend on the VESC override flag: override_active() is keyed on
+            // host-link freshness, and a host that sends the one detect command
+            // then waits silently for the result goes "stale" after 200 ms — the
+            // arbiter would fall through to the coast branch below and stop the
+            // spin a fifth of a second in, long before any hall state is recorded.
+        } else if (update_detect(now_ms)) {
             // A parameter measurement owns the motor: it drives forced-angle
             // current and any throttle input mid-run would corrupt the result.
         } else if (update_startup_chime(now_ms, can_fresh || usb_fresh || pwm_fresh || override)) {

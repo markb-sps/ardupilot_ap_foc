@@ -68,6 +68,13 @@ private:
     // the throttle arbiter off exactly like the power-on chime does.
     bool update_detect(uint32_t now_ms);
     void detect_finish(float r, float l, float linkage, bool ok);
+    // Abort a detection AND say why on the VESC terminal. The wizard
+    // (APPLY_ALL_FOC) collapses every failure to send_detect_apply_all(0), and
+    // the FLUX_OPENLOOP sentinels only survive as a bare number, so without this
+    // all five distinct failure paths look identical from the host — "detection
+    // failed" with nothing to act on. `linkage` is the sentinel to report
+    // (0 = generic, -1/-2/-3 = VESC's ramp diagnostics).
+    void detect_abort(const char *why, float linkage = 0.0f);
 
     enum class DetState : uint8_t {
         IDLE,

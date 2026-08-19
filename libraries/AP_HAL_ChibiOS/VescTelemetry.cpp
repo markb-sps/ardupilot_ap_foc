@@ -31,6 +31,11 @@ constexpr uint8_t COMM_PRINT        = 21;   // terminal text response
 // DETECT_ENCODER=27, DETECT_HALL_FOC=28). This is what VESC Tool's hall detect
 // button sends; must match exactly or the command is silently dropped.
 constexpr uint8_t COMM_DETECT_HALL_FOC = 28;
+// Give-up window for a hall-detect spin that never reports a result. The spin
+// itself is HD_RAMP_S + 2·HD_REVS/HD_HZ ≈ 12 s (MotorControl.cpp), so this is
+// ~2.5× the healthy duration: long enough that it can only fire on a run that
+// genuinely died, short enough that the flag does not latch for the session.
+constexpr uint32_t HALL_DETECT_TIMEOUT_MS = 30000;
 // Parameter detection. VESC Tool's FOC tab sends R_L for "Measure R/L" and
 // FLUX_LINKAGE_OPENLOOP (57, NOT the legacy 26) for "Measure λ"; the motor
 // wizard sends APPLY_ALL_FOC. All three are "blocking commands" in VESC —
@@ -165,15 +170,29 @@ void VescTelemetry::update()
     if (_uart == nullptr) {
         return;
     }
-    // Hall-table detection runs asynchronously (~2 s current-controlled spin in the ISR).
-    // While it is in progress keep the bench-override flag fresh so the throttle
-    // arbiter stands off (its own timeout is only ~200 ms), and emit the result
-    // once in VESC Tool's native COMM_DETECT_HALL_FOC reply format:
+    // Hall-table detection runs asynchronously (a ~12 s current-controlled spin in
+    // the ISR — HD_RAMP_S + 2·HD_REVS/HD_HZ). The arbiter stands off for the whole
+    // spin on MotorControl::is_hall_detecting(); the _override_ms refresh here is
+    // belt-and-braces for the same purpose. Emit the result once it lands, in VESC
+    // Tool's native COMM_DETECT_HALL_FOC reply format:
     //   [id, hall_tab[0..7] uint8 (angle·200/360; 255 = invalid), res (0 = ok)].
     if (_hall_detect_pending) {
         _override_ms = AP_HAL::millis();
         float deg[8];
-        if (_mc.hall_detect_result(deg)) {
+        // Give up if the result never arrives — start_hall_detect() refuses outright
+        // while a trip is latched, and a fault mid-spin coasts it without ever
+        // setting done. Without this the flag latches true for the rest of the
+        // session: no reply is ever sent, the next detect looks identical from the
+        // host, and diag reports a hall_pending that no longer means anything is
+        // running. Timed generously against the spin length so a healthy run can
+        // never trip it.
+        if (_hall_detect_ms != 0 &&
+            (AP_HAL::millis() - _hall_detect_ms) > HALL_DETECT_TIMEOUT_MS) {
+            _hall_detect_pending = false;
+            _hall_detect_ms      = 0;
+            _override_ms         = 0;   // stop holding the arbiter off
+            send_print("hall detect: timed out with no result (bridge faulted or never started)");
+        } else if (_mc.hall_detect_result(deg)) {
             uint8_t buf[1 + 8 + 1];
             uint8_t *p = buf;
             put_u8(p, COMM_DETECT_HALL_FOC);
@@ -192,6 +211,7 @@ void VescTelemetry::update()
             put_u8(p, valid >= 6 ? 0 : 1);   // res: 0 = all six states seen
             send_packet(buf, uint16_t(p - buf));
             _hall_detect_pending = false;
+            _hall_detect_ms      = 0;
         }
     }
 
@@ -523,7 +543,8 @@ void VescTelemetry::handle_detect_hall()
 {
     _mc.start_hall_detect();
     _hall_detect_pending = true;
-    _override_ms = AP_HAL::millis();   // hold the arbiter off during the spin
+    _hall_detect_ms      = AP_HAL::millis();
+    _override_ms         = AP_HAL::millis();   // hold the arbiter off during the spin
 }
 
 // Emit one line of text to the VESC-Tool terminal (COMM_PRINT).
@@ -708,8 +729,9 @@ void VescTelemetry::handle_terminal()
     if (strncmp(cmd, "hall_detect", 11) == 0) {
         _mc.start_hall_detect();
         _hall_detect_pending = true;
-        _override_ms = AP_HAL::millis();
-        send_print("hall detect started (~2 s); keep the motor free to spin, then run 'hall'");
+        _hall_detect_ms      = AP_HAL::millis();
+        _override_ms         = AP_HAL::millis();
+        send_print("hall detect started (~12 s); keep the motor free to spin, then run 'hall'");
     } else if (strncmp(cmd, "hall", 4) == 0) {
         print_hall_table();
     } else if (strncmp(cmd, "diag", 4) == 0) {
@@ -807,7 +829,8 @@ void VescTelemetry::handle_get_mcconf(uint8_t reply_id)
     put_u8      (p, 105);                      // l_temp_motor_end
     put_f16     (p, 0.15f, 10000.0f);          // l_temp_accel_dec
     put_f16     (p, 0.005f, 10000.0f);         // l_min_duty
-    put_f16     (p, _mc.get_duty_max(), 10000.0f); // l_max_duty       ← param (D_MAX)
+    // Converted to VESC's modulation semantic — see duty_max_to_vesc().
+    put_f16     (p, duty_max_to_vesc(_mc.get_duty_max()), 10000.0f); // l_max_duty ← param (D_MAX)
     put_f32_auto(p, 500000.0f);                // l_watt_max
     put_f32_auto(p, -500000.0f);               // l_watt_min
     put_f16     (p, 1.0f, 10000.0f);           // l_current_max_scale
@@ -1014,7 +1037,9 @@ void VescTelemetry::handle_set_mcconf()
     in.temp_fet_end   = float(*p); p += 1;  // l_temp_fet_end (u8)
     U8(); U8();                             // l_temp_motor_start, _end
     H(10000); H(10000);                     // l_temp_accel_dec, l_min_duty
-    in.max_duty = get_f16(p, 10000);        // l_max_duty
+    // l_max_duty arrives as a MODULATION ceiling; store the equivalent per-phase
+    // D_MAX so the sink's range check and the param are in the same units.
+    in.max_duty = vesc_to_duty_max(get_f16(p, 10000));  // l_max_duty
     A(); A();                               // l_watt_max, l_watt_min
     H(10000); H(10000); H(10000);           // l_current_max_scale, min_scale, l_duty_start
     A(); A(); A();                          // sl_min_erpm, sl_min_erpm_cycle_int_limit, sl_max_fullbreak_..

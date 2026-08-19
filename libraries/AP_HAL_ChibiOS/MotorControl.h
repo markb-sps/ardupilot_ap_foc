@@ -351,6 +351,15 @@ public:
     // rotation and records the forced angle seen in each hall state, then stores
     // the result into the live hall table and coasts. Call only at standstill.
     void start_hall_detect();
+    // True while a detection spin owns the motor. The throttle arbiter MUST
+    // stand off on this: the spin is self-terminating and takes several seconds,
+    // and any set_current() reaching the controller meanwhile lands on the
+    // release path (state is HALL_DETECT, so neither CLOSED nor OPENLOOP) which
+    // drops _mode to STOP and coasts the spin part-way through. Keyed on the
+    // controller's own mode, deliberately NOT on host-link freshness — a host
+    // that fires the detect command and then waits silently for the result is
+    // the normal case, not a dead link.
+    bool is_hall_detecting() const { return _mode == Mode::HALL_DETECT; }
 
     // ── Parameter detection primitives (VESC Tool "Measure R/L" and "Measure λ")
     // Forced-angle current injection: regulate d-axis current to `amps` on an

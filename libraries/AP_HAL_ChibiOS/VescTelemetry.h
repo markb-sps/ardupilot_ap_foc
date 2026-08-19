@@ -18,6 +18,25 @@ public:
     void init(AP_HAL::UARTDriver *uart);
     void update();
 
+    // ── l_max_duty unit conversion ──────────────────────────────────────────
+    // VESC's l_max_duty caps `duty_now`, which is MODULATION DEPTH — roughly the
+    // fraction of the available bus voltage, and what every VESC tuning guide
+    // means by "max duty". This firmware's D_MAX is a PER-PHASE PWM on-time
+    // ceiling (a hardware limit: MP1918 bootstrap refresh + the low-side window
+    // the shunt ADC samples in). Because SVPWM sits centred at 0.5 duty and
+    // swings symmetrically either side, the two differ by
+    //     modulation = 2·(D_MAX − 0.5)          (MotorControl.cpp init)
+    // so the numbers are NOT interchangeable: D_MAX 0.55 is 10% modulation, not
+    // 55%. Passing the raw value both ways made VESC Tool's box mean something
+    // ~9x smaller than it said, and a write from a stock VESC profile silently
+    // crushed the voltage ceiling to ~1 V — the motor then spun but could not
+    // accelerate, and flux-linkage detection could never reach its duty target.
+    // Convert at the wire boundary so the box means what it claims.
+    //
+    // The hardware range D_MAX ∈ [0.55, 0.90] is modulation ∈ [0.10, 0.80].
+    static constexpr float duty_max_to_vesc(float d_max) { return 2.0f * (d_max - 0.5f); }
+    static constexpr float vesc_to_duty_max(float mod)   { return 0.5f + mod * 0.5f; }
+
     // ── Config bridge to the owning FOC_ESC (params) ─────────────────────────
     // Values that VESC Tool's "Write Motor Configuration" (COMM_SET_MCCONF) can
     // push. Only the fields that have a standard VESC mc_configuration slot are
@@ -48,10 +67,11 @@ public:
         float   temp_fet_start;   // l_temp_fet_start [°C]
         float   temp_fet_end;     // l_temp_fet_end [°C]
         uint8_t poles;            // si_motor_poles (pole COUNT, = 2·pole_pairs)
-        // l_max_duty → D_MAX. The per-phase duty ceiling, which on this board is
-        // a HARDWARE limit (MP1918 bootstrap refresh + the low-side window the
-        // shunt ADC samples in), not a tuning preference. 0 = absent; the sink
-        // clamps hard before storing.
+        // l_max_duty as VESC means it: a MODULATION ceiling, already converted
+        // out of the wire value by vesc_to_duty_max() — so this field carries a
+        // D_MAX (per-phase) value ready to store. See the conversion helpers
+        // above for why the two are not the same number. 0 = absent; the sink
+        // range-checks against the hardware window before storing.
         float   max_duty = 0.0f;
         // Sensorless open-loop start, VESC foc_sl_openloop_* / foc_openloop_rpm.
         // All are meaningless at or below zero except rpm_low (0 is valid and is
@@ -133,6 +153,10 @@ public:
     void send_detect_r_l(float r, float l, float ld_lq_diff);
     void send_detect_flux(float linkage);
     void send_detect_apply_all(int16_t result);
+    // Emit one COMM_PRINT line (VESC Tool's terminal). Public so the detection
+    // state machine, which lives in FOC_ESC, can explain its own failures —
+    // the reply formats above carry a result but no reason.
+    void send_print(const char *s);
 
     // ── Throttle-arbiter interface (see AP_Periph_FW::update_motor_test) ─────
     // USB torque source: holds the last COMM_SET_CURRENT value for as long as the
@@ -207,7 +231,6 @@ private:
     void print_hall_table();
     // 'diag' terminal command: dump the throttle-arbiter decision inputs.
     void print_diag();
-    void send_print(const char *s);   // emit one COMM_PRINT line
 
     static uint16_t crc16(const uint8_t *data, uint16_t len);
 
@@ -242,6 +265,7 @@ private:
     uint32_t _host_alive_ms  = 0;     // millis() of the last valid packet (link keepalive)
     uint32_t _override_ms    = 0;     // millis() of last rpm/brake/duty override (0 = none)
     bool     _hall_detect_pending = false; // a hall-detect spin is running; emit table when done
+    uint32_t _hall_detect_ms      = 0;     // millis() the spin was started (for the give-up timeout)
 };
 
 } // namespace ChibiOS
