@@ -115,6 +115,22 @@ public:
         float   sl_erpm          = 0.0f;  // foc_sl_erpm        (0 = absent)
         float   hall_interp_erpm = 0.0f;  // foc_hall_interp_erpm (0 = absent)
     };
+    // What VESC Tool's App Settings → PPM page wrote (COMM_SET_APPCONF). Only the
+    // fields the PWM throttle decode actually consumes are lifted out of the blob;
+    // everything else is skipped. VESC sends the WHOLE appconf on every write, so
+    // an untouched field must not overwrite something tuned here — hence the
+    // absent sentinels, same convention as McconfIn.
+    struct AppconfIn {
+        // app_ppm_conf.ctrl_type, VESC's ppm_control_type enum. 0xFF = absent so
+        // a genuine 0 (PPM_CTRL_TYPE_NONE) stays distinguishable from "not sent".
+        uint8_t ppm_ctrl_type    = 0xFF;
+        // app_ppm_conf.max_erpm_for_dir — speed above which the brake-to-reverse
+        // gesture is refused. Only meaningful to CURRENT_BRAKE_REV_HYST.
+        // 0 = absent (a zero ceiling would forbid reverse entirely, which is what
+        // the NOREV modes are for).
+        float   max_erpm_for_dir = 0.0f;
+    };
+
     // Param-derived values the GET_MCCONF responder needs but MotorControl does
     // not expose. Pushed once at boot (reboot-to-apply model); poles also drives
     // the eRPM→RPM scaling and si_motor_poles field.
@@ -127,6 +143,10 @@ public:
         float   temp_fet_end   = 105.0f; // → l_temp_fet_end
         float   abs_current_max = 150.0f;// → l_abs_current_max
         float   observer_gain  = 2.5e7f; // → foc_observer_gain
+        // PPM decode settings, echoed by the GET_APPCONF responder so VESC Tool's
+        // App Settings → PPM page reads back what is actually running.
+        uint8_t ppm_ctrl_type   = 3;      // → app_ppm_conf.ctrl_type (NOREV_BRAKE)
+        float   max_erpm_for_dir = 4000.0f; // → app_ppm_conf.max_erpm_for_dir
     };
     void set_conf_snapshot(const ConfSnapshot &s) {
         _conf = s;
@@ -137,6 +157,30 @@ public:
     void set_mcconf_sink(void *ctx, void (*cb)(void *, const McconfIn &)) {
         _conf_ctx = ctx;
         _conf_cb  = cb;
+    }
+    // Sink for VESC Tool's "Write App Configuration". Shares _conf_ctx with the
+    // mcconf sink — both trampoline into the same FOC_ESC.
+    void set_appconf_sink(void *ctx, void (*cb)(void *, const AppconfIn &)) {
+        _conf_ctx = ctx;
+        _appconf_cb = cb;
+    }
+    // Refresh just the PPM half of the snapshot, without a reboot. The rest of
+    // ConfSnapshot is boot-time by nature (reboot-to-apply), but these two are
+    // read back by VESC Tool the moment a write completes — the tool re-reads to
+    // confirm, and that read lands BEFORE the deferred reboot. Serving the boot
+    // snapshot there reports the old value milliseconds after a successful
+    // write, which is indistinguishable from the write having been rejected.
+    // Param storage exhausted (AP_Param::get_eeprom_full). Pushed in from the
+    // owner rather than read here, to keep AP_Param out of the HAL layer. When
+    // this is set, every set_and_save() is a silent no-op — which is the one
+    // failure that makes a correct config path look broken.
+    void set_storage_full(bool full) { _storage_full = full; }
+    // The sink accepted a ctrl_type and called set_and_save(). Separates "the
+    // wire delivered a value we refused" from "we saved it and it did not stick".
+    void note_appconf_accepted() { _appconf_ok++; }
+    void set_ppm_conf(uint8_t ctrl_type, float max_erpm_for_dir) {
+        _conf.ppm_ctrl_type    = ctrl_type;
+        _conf.max_erpm_for_dir = max_erpm_for_dir;
     }
 
     // ── Parameter-detection bridge (VESC Tool FOC tab / motor wizard) ────────
@@ -240,6 +284,14 @@ private:
     // layout), extract the standard fields we back with params, and hand them to
     // the registered sink (which persists them and reboots to apply).
     void handle_set_mcconf();
+    // COMM_GET_APPCONF / _DEFAULT: emit a complete, layout-valid app_configuration
+    // so VESC Tool's App Settings pages open. Almost every field is a fixed
+    // stand-in — only the PPM block reflects anything real here, because the PPM
+    // page is the one that configures something this firmware implements.
+    void handle_get_appconf(uint8_t reply_id);
+    // COMM_SET_APPCONF: lift app_ppm_conf.ctrl_type and max_erpm_for_dir out of
+    // VESC Tool's "Write App Configuration" blob and hand them to the sink.
+    void handle_set_appconf();
     // VESC-Tool terminal (COMM_TERMINAL_CMD): a tiny command set to read/trigger
     // the hall table (works even if a VESC Tool version can't read MCCONF).
     void handle_terminal();
@@ -269,6 +321,19 @@ private:
     ConfSnapshot _conf;
     void        *_conf_ctx = nullptr;
     void       (*_conf_cb)(void *, const McconfIn &) = nullptr;
+    void       (*_appconf_cb)(void *, const AppconfIn &) = nullptr;
+    // ── COMM_SET_APPCONF forensics, printed by the 'diag' terminal command ──
+    // An app-config write that does not take is otherwise completely invisible:
+    // the tool reports success off the ack and the value just reads back
+    // unchanged, which looks identical whether the frame never arrived, failed
+    // the signature, or was parsed and then refused. These separate those cases.
+    uint16_t _appconf_rx     = 0;     // SET_APPCONF frames that reached the handler
+    uint16_t _appconf_badsig = 0;     // ...of those, rejected on the signature
+    uint16_t _appconf_short  = 0;     // ...rejected as truncated
+    uint8_t  _appconf_ctrl   = 0xFF;  // ctrl_type parsed from the last good frame
+    float    _appconf_dir    = 0.0f;  // max_erpm_for_dir likewise
+    bool     _storage_full   = false; // AP_Param storage exhausted (see set_storage_full)
+    uint16_t _appconf_ok     = 0;     // ctrl_type values passed to set_and_save()
     // Parameter-detection bridge (see set_detect_sink).
     void        *_detect_ctx = nullptr;
     void       (*_detect_cb)(void *, const DetectReq &) = nullptr;

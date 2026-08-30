@@ -47,6 +47,9 @@ constexpr uint8_t COMM_DETECT_APPLY_ALL_FOC             = 58;
 constexpr uint8_t COMM_SET_MCCONF         = 13;  // VESC Tool "Write Motor Configuration"
 constexpr uint8_t COMM_GET_MCCONF         = 14;  // VESC Tool "Read Motor Configuration"
 constexpr uint8_t COMM_GET_MCCONF_DEFAULT = 15;
+constexpr uint8_t COMM_SET_APPCONF         = 16;  // VESC Tool "Write App Configuration"
+constexpr uint8_t COMM_GET_APPCONF         = 17;  // VESC Tool "Read App Configuration"
+constexpr uint8_t COMM_GET_APPCONF_DEFAULT = 18;
 
 constexpr uint8_t FW_MAJOR = 6;
 constexpr uint8_t FW_MINOR = 6;
@@ -56,6 +59,14 @@ constexpr uint8_t FW_MINOR = 6;
 // AND the config layout emitted by handle_get_mcconf()/handle_set_mcconf() below,
 // field-for-field (order + type/scale) against release_6_06/confgenerator.c.
 constexpr uint32_t MCCONF_SIGNATURE = 788332866u;
+// app_configuration signature, same version lock as MCCONF_SIGNATURE above and
+// the same consequence if it drifts: VESC Tool refuses the blob outright. Both
+// are CRC32C over VESC Tool's own parameter definition for the version — for
+// 6.06 that is res/config/6.06/parameters_appconf.xml in the vesc_tool tree,
+// hashed as name+type+vTx+enum-names across the <SerOrder> list
+// (ConfigParams::getSignature). Recomputing the mcconf one the same way returns
+// 788332866, which is how this value was checked rather than guessed.
+constexpr uint32_t APPCONF_SIGNATURE = 2099347128u;
 constexpr const char HW_NAME[] = "AP_FOC";
 
 // STM32G4 unique device ID: 96 bits at 0x1FFF7590
@@ -345,6 +356,15 @@ void VescTelemetry::dispatch()
         // back with params, then the sink reboots to apply.
         handle_set_mcconf();
         break;
+    case COMM_GET_APPCONF:
+    case COMM_GET_APPCONF_DEFAULT:
+        // App Settings → PPM. Without a reply here the tool reports a read
+        // failure and never opens the page the control type lives on.
+        handle_get_appconf(_payload[0]);
+        break;
+    case COMM_SET_APPCONF:
+        handle_set_appconf();
+        break;
     case COMM_TERMINAL_CMD:
         handle_terminal();
         break;
@@ -612,6 +632,21 @@ void VescTelemetry::print_diag()
                        unsigned(_mc.ol_locked_out()), unsigned(_mc.ol_attempts()),
                        unsigned(_mc.hall_table_valid()));
     send_print(line);
+    // App-config write forensics. rx=0 means no SET_APPCONF frame ever reached
+    // this handler; badsig means the blob was for a different FW layout; ctrl is
+    // what came out of the parse (255 = nothing parsed yet). run_ctrl is what the
+    // decode is actually using, read from the param at boot — if ctrl matches the
+    // value written and run_ctrl still does not, the refusal is downstream, in
+    // the param store rather than the wire.
+    hal.util->snprintf(line, sizeof(line),
+                       "appconf rx=%u sig_bad=%u short=%u ctrl=%u saved=%u live=%u",
+                       unsigned(_appconf_rx), unsigned(_appconf_badsig),
+                       unsigned(_appconf_short), unsigned(_appconf_ctrl),
+                       unsigned(_appconf_ok), unsigned(_conf.ppm_ctrl_type));
+    send_print(line);
+    if (_storage_full) {
+        send_print("PARAM STORAGE FULL - set_and_save() is a no-op, nothing persists");
+    }
     // Bus extremes as the TRIPS saw them — both are raw samples, so neither
     // matches the filtered vbus reported in telemetry. vmax is the number that
     // explains an over-voltage trip, which on regen can overshoot and fall back
@@ -1145,6 +1180,213 @@ void VescTelemetry::handle_set_mcconf()
     // Ack with the bare command id (VESC commands.c convention) so VESC Tool
     // reports the write succeeded before we reboot.
     uint8_t ack = COMM_SET_MCCONF;
+    send_packet(&ack, 1);
+}
+
+// Serialize a full VESC FW 6.06 app_configuration. VESC Tool will not open its
+// App Settings pages at all without a complete, signature-valid blob, so every
+// one of the 119 fields is emitted in order even though this firmware implements
+// almost none of them — the rest are fixed stand-ins chosen to look like a stock
+// VESC so the pages render sanely rather than showing zeros everywhere.
+//
+// Only the PPM block means anything here. app_to_use reports APP_PPM (1) so the
+// tool opens on the page whose Control Type this ESC actually obeys.
+void VescTelemetry::handle_get_appconf(uint8_t reply_id)
+{
+    uint8_t buf[512];
+    uint8_t *p = buf;
+
+    put_u8      (p, reply_id);                 // packet id (echoes request)
+    put_u32     (p, APPCONF_SIGNATURE);
+
+    put_u8      (p, 0);                        // controller_id
+    put_u32     (p, 1000);                     // timeout_msec
+    put_f32_auto(p, 0.0f);                     // timeout_brake_current
+    put_u16     (p, 50);                       // can_status_rate_1
+    put_u16     (p, 5);                        // can_status_rate_2
+    put_u8      (p, 0);                        // can_status_msgs_r1
+    put_u8      (p, 0);                        // can_status_msgs_r2
+    put_u8      (p, 2);                        // can_baud_rate = 500K
+    put_u8      (p, 0);                        // pairing_done
+    put_u8      (p, 1);                        // permanent_uart_enabled
+    put_u8      (p, 0);                        // shutdown_mode
+    put_u8      (p, 0);                        // can_mode = CAN_MODE_VESC
+    put_u8      (p, 0);                        // uavcan_esc_index
+    put_u8      (p, 0);                        // uavcan_raw_mode
+    put_f32_auto(p, 50000.0f);                 // uavcan_raw_rpm_max
+    put_u8      (p, 0);                        // uavcan_status_current_mode
+    put_u8      (p, 0);                        // servo_out_enable
+    put_u8      (p, 0);                        // kill_sw_mode
+    put_u8      (p, 1);                        // app_to_use = APP_PPM
+
+    // ── PPM. The two live fields, plus honest values for the pulse geometry the
+    // decode actually uses so the page does not misdescribe the hardware. Those
+    // three are still compile-time constants here (THR_PWM_* in foc_esc.cpp);
+    // they are reported, not accepted back.
+    put_u8      (p, _conf.ppm_ctrl_type);      // ctrl_type       ← param (PPM_CTRL)
+    put_f32_auto(p, 15000.0f);                 // pid_max_erpm
+    put_f32_auto(p, 0.08f);                    // hyst  = 40 us / 500 us
+    put_f32_auto(p, 1.0f);                     // pulse_start  [ms]
+    put_f32_auto(p, 2.0f);                     // pulse_end    [ms]
+    put_f32_auto(p, 1.5f);                     // pulse_center [ms]
+    put_u8      (p, 0);                        // median_filter
+    put_u8      (p, 1);                        // safe_start = REGULAR (we do arm through neutral)
+    put_f32_auto(p, 0.0f);                     // throttle_exp
+    put_f32_auto(p, 0.0f);                     // throttle_exp_brake
+    put_u8      (p, 2);                        // throttle_exp_mode = THR_EXP_POLY
+    put_f32_auto(p, 0.0f);                     // ramp_time_pos — no PPM-side ramp
+    put_f32_auto(p, 0.0f);                     // ramp_time_neg   (see I_SLEW instead)
+    put_u8      (p, 0);                        // multi_esc
+    put_u8      (p, 0);                        // tc
+    put_f32_auto(p, 3000.0f);                  // tc_max_diff
+    put_f16     (p, _conf.max_erpm_for_dir, 1.0f); // max_erpm_for_dir ← param (DIR_ERPM)
+    put_f32_auto(p, 0.07f);                    // smart_rev_max_duty
+    put_f32_auto(p, 3.0f);                     // smart_rev_ramp_time
+
+    // ── ADC app: not implemented. Stock-looking values, ctrl_type = off.
+    put_u8      (p, 0);                        // adc ctrl_type
+    put_f32_auto(p, 0.15f);                    // adc hyst
+    put_f16     (p, 0.8f,  1000.0f);           // voltage_start
+    put_f16     (p, 3.1f,  1000.0f);           // voltage_end
+    put_f16     (p, 0.0f,  1000.0f);           // voltage_min
+    put_f16     (p, 3.3f,  1000.0f);           // voltage_max
+    put_f16     (p, 1.55f, 1000.0f);           // voltage_center
+    put_f16     (p, 0.8f,  1000.0f);           // voltage2_start
+    put_f16     (p, 3.1f,  1000.0f);           // voltage2_end
+    put_u8      (p, 1);                        // use_filter
+    put_u8      (p, 1);                        // safe_start
+    put_u8      (p, 0);                        // buttons
+    put_u8      (p, 0);                        // voltage_inverted
+    put_u8      (p, 0);                        // voltage2_inverted
+    put_f32_auto(p, 0.0f);                     // throttle_exp
+    put_f32_auto(p, 0.0f);                     // throttle_exp_brake
+    put_u8      (p, 2);                        // throttle_exp_mode
+    put_f32_auto(p, 0.4f);                     // ramp_time_pos
+    put_f32_auto(p, 0.2f);                     // ramp_time_neg
+    put_u8      (p, 0);                        // multi_esc
+    put_u8      (p, 0);                        // tc
+    put_f32_auto(p, 3000.0f);                  // tc_max_diff
+    put_u16     (p, 500);                      // update_rate_hz
+
+    put_u32     (p, 115200);                   // app_uart_baudrate
+
+    // ── Nunchuk app: not implemented.
+    put_u8      (p, 0);                        // chuk ctrl_type
+    put_f32_auto(p, 0.15f);                    // hyst
+    put_f32_auto(p, 0.4f);                     // ramp_time_pos
+    put_f32_auto(p, 0.2f);                     // ramp_time_neg
+    put_f32_auto(p, 3000.0f);                  // stick_erpm_per_s_in_cc
+    put_f32_auto(p, 0.0f);                     // throttle_exp
+    put_f32_auto(p, 0.0f);                     // throttle_exp_brake
+    put_u8      (p, 2);                        // throttle_exp_mode
+    put_u8      (p, 0);                        // multi_esc
+    put_u8      (p, 0);                        // tc
+    put_f32_auto(p, 3000.0f);                  // tc_max_diff
+    put_u8      (p, 0);                        // use_smart_rev
+    put_f32_auto(p, 0.07f);                    // smart_rev_max_duty
+    put_f32_auto(p, 3.0f);                     // smart_rev_ramp_time
+
+    // ── NRF pairing: no radio on this board.
+    put_u8(p, 0); put_u8(p, 0); put_u8(p, 0); put_u8(p, 0);  // speed, power, crc_type, retry_delay
+    put_u8(p, 0); put_u8(p, 0);                              // retries, channel
+    put_u8(p, 0); put_u8(p, 0); put_u8(p, 0);                // address[0..2]
+    put_u8(p, 0);                                            // send_crc_ack
+
+    // ── PAS (pedal assist): not implemented.
+    put_u8      (p, 0);                        // pas ctrl_type
+    put_u8      (p, 0);                        // sensor_type
+    put_f16     (p, 0.5f, 1000.0f);            // current_scaling
+    put_f16     (p, 10.0f, 10.0f);             // pedal_rpm_start
+    put_f16     (p, 50.0f, 10.0f);             // pedal_rpm_end
+    put_u8      (p, 0);                        // invert_pedal_direction
+    put_u16     (p, 24);                       // magnets
+    put_u8      (p, 1);                        // use_filter
+    put_f16     (p, 0.4f, 100.0f);             // ramp_time_pos
+    put_f16     (p, 0.2f, 100.0f);             // ramp_time_neg
+    put_u16     (p, 500);                      // update_rate_hz
+
+    // ── IMU: type = OFF. AP owns any IMU on this vehicle, not the ESC.
+    put_u8      (p, 0);                        // imu type = IMU_TYPE_OFF
+    put_u8      (p, 0);                        // mode
+    put_u8      (p, 0);                        // filter
+    put_f16     (p, 15.0f, 1.0f);              // accel_lowpass_filter_x
+    put_f16     (p, 15.0f, 1.0f);              // accel_lowpass_filter_y
+    put_f16     (p, 15.0f, 1.0f);              // accel_lowpass_filter_z
+    put_f16     (p, 15.0f, 1.0f);              // gyro_lowpass_filter
+    put_u16     (p, 200);                      // sample_rate_hz
+    put_u8      (p, 0);                        // use_magnetometer
+    put_f32_auto(p, 1.0f);                     // accel_confidence_decay
+    put_f32_auto(p, 0.3f);                     // mahony_kp
+    put_f32_auto(p, 0.0f);                     // mahony_ki
+    put_f32_auto(p, 0.1f);                     // madgwick_beta
+    put_f32_auto(p, 0.0f);                     // rot_roll
+    put_f32_auto(p, 0.0f);                     // rot_pitch
+    put_f32_auto(p, 0.0f);                     // rot_yaw
+    put_f32_auto(p, 0.0f); put_f32_auto(p, 0.0f); put_f32_auto(p, 0.0f); // accel_offsets[0..2]
+    put_f32_auto(p, 0.0f); put_f32_auto(p, 0.0f); put_f32_auto(p, 0.0f); // gyro_offsets[0..2]
+
+    send_packet(buf, uint16_t(p - buf));
+}
+
+// Parse VESC Tool's "Write App Configuration" (COMM_SET_APPCONF). Same shape as
+// handle_set_mcconf: walk the 6.06 field order with typed skips so the cursor
+// stays aligned, and lift out only what the PWM decode consumes. The skips are
+// not decoration — a field consumed at the wrong width silently shifts every
+// field after it, and the two we want sit 30 and 75 bytes into the blob.
+void VescTelemetry::handle_set_appconf()
+{
+    _appconf_rx++;
+    const uint8_t *p = &_payload[1];
+    if (_payload_len < 1 + 4) {
+        _appconf_short++;
+        return;
+    }
+    if (get_u32(p) != APPCONF_SIGNATURE) {
+        _appconf_badsig++;
+        return;   // wrong FW/version layout — ignore (VESC Tool shows an error)
+    }
+
+    // No f16 skip helper here: nothing before max_erpm_for_dir is a float16.
+    auto A  = [&]()          { (void)get_f32_auto(p); };
+    auto U8 = [&]()          { p += 1; };
+    auto U16= [&]()          { p += 2; };
+    auto U32= [&]()          { p += 4; };
+
+    AppconfIn in{};
+
+    U8();                                   // controller_id
+    U32();                                  // timeout_msec
+    A();                                    // timeout_brake_current
+    U16(); U16();                           // can_status_rate_1, _2
+    U8(); U8(); U8();                       // can_status_msgs_r1, _r2, can_baud_rate
+    U8(); U8(); U8(); U8();                 // pairing_done, permanent_uart_enabled, shutdown_mode, can_mode
+    U8(); U8();                             // uavcan_esc_index, uavcan_raw_mode
+    A();                                    // uavcan_raw_rpm_max
+    U8(); U8(); U8();                       // uavcan_status_current_mode, servo_out_enable, kill_sw_mode
+    U8();                                   // app_to_use
+    in.ppm_ctrl_type = *p; p += 1;          // app_ppm_conf.ctrl_type
+    A(); A(); A(); A(); A();                // pid_max_erpm, hyst, pulse_start, _end, _center
+    U8(); U8();                             // median_filter, safe_start
+    A(); A();                               // throttle_exp, throttle_exp_brake
+    U8();                                   // throttle_exp_mode
+    A(); A();                               // ramp_time_pos, _neg
+    U8(); U8();                             // multi_esc, tc
+    A();                                    // tc_max_diff
+    in.max_erpm_for_dir = get_f16(p, 1);    // max_erpm_for_dir — last field we need
+
+    // Guard against a short/truncated frame walking past the payload.
+    if (uintptr_t(p - &_payload[0]) > _payload_len) {
+        _appconf_short++;
+        return;
+    }
+
+    _appconf_ctrl = in.ppm_ctrl_type;
+    _appconf_dir  = in.max_erpm_for_dir;
+
+    if (_appconf_cb != nullptr) {
+        _appconf_cb(_conf_ctx, in);   // persist + schedule reboot to apply
+    }
+    uint8_t ack = COMM_SET_APPCONF;
     send_packet(&ack, 1);
 }
 

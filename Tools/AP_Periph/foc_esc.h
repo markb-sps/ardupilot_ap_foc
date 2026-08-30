@@ -50,6 +50,13 @@ private:
                                         const ChibiOS::VescTelemetry::McconfIn &in) {
         static_cast<FOC_ESC *>(ctx)->on_mcconf_write(in);
     }
+    // Sink for VESC Tool "Write App Configuration" — the PPM control type and the
+    // direction-switch speed ceiling. Same reboot-to-apply model.
+    void on_appconf_write(const ChibiOS::VescTelemetry::AppconfIn &in);
+    static void appconf_write_trampoline(void *ctx,
+                                         const ChibiOS::VescTelemetry::AppconfIn &in) {
+        static_cast<FOC_ESC *>(ctx)->on_appconf_write(in);
+    }
     // millis() at which a VESC-Tool config write asked for a reboot (0 = none).
     // Deferred so the COMM_SET_MCCONF ack + storage flush complete first.
     uint32_t _reboot_ms = 0;
@@ -158,6 +165,8 @@ private:
     AP_Float _p_max_erpm;      // forward speed ceiling [eRPM]  → l_max_erpm
     AP_Float _p_min_erpm;      // reverse speed ceiling [eRPM]  → l_min_erpm
     AP_Float _p_erpm_start;    // ERPM foldback knee (fraction) → l_erpm_start
+    AP_Float _p_ppm_ctrl;      // PWM throttle control type → app_ppm_conf.ctrl_type
+    AP_Float _p_dir_erpm;      // brake-to-reverse speed ceiling → max_erpm_for_dir
     // Sensorless open-loop start → VESC foc_openloop_rpm / foc_sl_openloop_*
     AP_Float _p_ol_boost;      // start boost current [A]
     AP_Float _p_ol_imax;       // open-loop iq cap [A]
@@ -186,6 +195,14 @@ private:
     // two dispatch to different MotorControl entry points, and a forward trigger
     // against a backwards roll is a reduced-magnitude MOTORING command, not a brake.
     bool     _pwm_brake = false;
+    // ── CURRENT_BRAKE_REV_HYST gesture state (VESC app_ppm.c statics) ────────
+    // force_brake: speed is above the direction-switch ceiling, so back-stick is
+    // pure brake whatever the operator does. Starts true, exactly as VESC's
+    // static does — the first decode with a plausible speed clears it.
+    bool    _ppm_force_brake = true;
+    // did_idle_once: 0 = no brake seen, 1 = braked (awaiting a return to idle),
+    // 2 = gesture complete, reverse permitted. VESC's int8_t of the same name.
+    uint8_t _ppm_did_idle    = 0;
 };
 
 #endif  // HAL_PERIPH_ENABLE_FOC_ESC

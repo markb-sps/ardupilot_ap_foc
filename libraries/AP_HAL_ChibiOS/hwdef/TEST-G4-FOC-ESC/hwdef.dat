@@ -12,7 +12,15 @@ FLASH_RESERVE_START_KB 26
 # Flash page where storage starts (should be the end of the physical flash).
 # G474 = 512 KB in 2 KB pages -> 256 pages (0..255); use the second-to-last.
 STORAGE_FLASH_PAGE 254
-define HAL_STORAGE_SIZE 400
+# 800 bytes, matching every other G4 AP_Periph board with a 2 KB page
+# (G4-ESC, HolybroG4_*, Hitec-Airspeed, Nucleo-G491, Sierra-TrueNavPro-G4).
+# This was 400, which is ~49 saved parameters: a 4-byte Param_header plus a
+# 4-byte float each, less the EEPROM header and sentinel. FOC_ESC alone defines
+# 50, so the last-registered params silently stopped persisting once the earlier
+# ones had all been written away from their defaults — AP_Param::save_sync sets
+# eeprom_full and returns, and set_and_save() reports nothing (it queues), so a
+# write looked successful and read back as the default. See 'diag'.
+define HAL_STORAGE_SIZE 800
 
 # board ID. See Tools/AP_Bootloader/board_types.txt
 APJ_BOARD_ID AP_HW_FlywooF745

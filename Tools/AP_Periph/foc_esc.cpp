@@ -51,6 +51,13 @@ constexpr float    THR_REV_ERPM         = 100.0f;
 // couple of dropped 50 Hz RC frames / DroneCAN commands before it ages to coast.
 constexpr uint32_t THR_SOURCE_TIMEOUT_MS = 200;
 
+// VESC ppm_control_type values (bldc datatypes.h). Only these two are
+// implemented; the NUMBERING is VESC's so a value stored here is the same
+// integer as the index of VESC Tool's Control Type dropdown, and a config
+// exchanged with the tool needs no translation in either direction.
+constexpr uint8_t PPM_CTRL_CURRENT_NOREV_BRAKE  = 3;  // "Current No Reverse With Brake"
+constexpr uint8_t PPM_CTRL_CURRENT_BRAKE_REV_HYST = 8;  // "Current Hyst Reverse With Brake"
+
 // ── Power-on chime (played through the motor windings) ──────────────────────
 struct ChimeNote { uint16_t freq_hz; uint16_t ms; };
 constexpr ChimeNote CHIME[] = { {1047, 120}, {1319, 120}, {1568, 200} };  // C6–E6–G6
@@ -194,6 +201,18 @@ const AP_Param::GroupInfo FOC_ESC::var_info[] = {
     // @Range: 0.05 0.99
     // @User: Advanced
     AP_GROUPINFO("ERPM_START", 48, FOC_ESC, _p_erpm_start, 0.8f),
+    // @Param: PPM_CTRL
+    // @DisplayName: PWM throttle control type
+    // @Description: How the RC PWM throttle input is interpreted (VESC app_ppm_conf.ctrl_type, "Control Type" on VESC Tool's App Settings PPM page). Values are VESC's enum, so this matches that dropdown's index. Only two are implemented: 3 = Current No Reverse With Brake (centre is off, back-stick brakes to a stop and no further), 8 = Current Hyst Reverse With Brake (as 3, but braking to a stop, releasing to centre, then braking again enters reverse — gated by DIR_ERPM). Writing any other value from VESC Tool is refused rather than silently substituted.
+    // @Values: 3:Current No Reverse With Brake,8:Current Hyst Reverse With Brake
+    // @User: Advanced
+    AP_GROUPINFO("PPM_CTRL", 49, FOC_ESC, _p_ppm_ctrl, float(PPM_CTRL_CURRENT_NOREV_BRAKE)),
+    // @Param: DIR_ERPM
+    // @DisplayName: Max ERPM for direction switch
+    // @Description: Above this electrical RPM the brake-to-reverse gesture is refused and back-stick stays a pure brake (VESC app_ppm_conf.max_erpm_for_dir, "Max ERPM for direction switch"; the param name is shortened to fit the ArduPilot 16-character limit). A 20 percent band around it provides hysteresis, so the gesture re-enables at 0.8x and disables again at 1.2x. Only used when PPM_CTRL is 8.
+    // @Units: rpm
+    // @User: Advanced
+    AP_GROUPINFO("DIR_ERPM", 50, FOC_ESC, _p_dir_erpm, 4000.0f),
     // ── Sensorless open-loop start (VESC foc_sl_openloop_*) ──────────────────
     // Inactive in HALL sensor mode: the halls commutate from standstill and this
     // state machine is never entered.
@@ -482,8 +501,11 @@ void FOC_ESC::init(AP_HAL::UARTDriver *vesc_uart)
     snap.temp_fet_end    = _p_t_max.get();
     snap.abs_current_max = _p_i_oc_hard.get();
     snap.observer_gain   = _p_obs_gain.get();
+    snap.ppm_ctrl_type   = uint8_t(_p_ppm_ctrl.get());
+    snap.max_erpm_for_dir = _p_dir_erpm.get();
     vesc_telem.set_conf_snapshot(snap);
     vesc_telem.set_mcconf_sink(this, &FOC_ESC::mcconf_write_trampoline);
+    vesc_telem.set_appconf_sink(this, &FOC_ESC::appconf_write_trampoline);
     vesc_telem.set_detect_sink(this, &FOC_ESC::detect_trampoline);
 
     vesc_telem.init(vesc_uart);
@@ -646,6 +668,45 @@ void FOC_ESC::on_mcconf_write(const ChibiOS::VescTelemetry::McconfIn &in)
     // while the loop that feeds the throttle arbiter is stalled.
     motor_control.set_current(0.0f);
     AP_Param::flush();               // blocks until saved; uses expect_delay_ms
+
+    _reboot_ms = AP_HAL::millis();   // deferred reboot (see update())
+}
+
+// Sink for VESC Tool's "Write App Configuration". Only the PPM control type and
+// the direction-switch ceiling are backed by params here; the rest of the blob
+// describes apps this firmware does not implement and is discarded upstream.
+void FOC_ESC::on_appconf_write(const ChibiOS::VescTelemetry::AppconfIn &in)
+{
+    // An unimplemented control type is REFUSED, not clamped to the nearest thing
+    // we do support. Accepting it would leave VESC Tool reporting a successful
+    // write of, say, "Current Smart Reverse" while the ESC quietly kept braking
+    // like NOREV_BRAKE — a throttle that does not do what the box says is worse
+    // than a write that visibly did not take. The read-back after the reboot
+    // shows the unchanged value, which is the honest signal.
+    bool accepted = false;
+    if (in.ppm_ctrl_type == PPM_CTRL_CURRENT_NOREV_BRAKE ||
+        in.ppm_ctrl_type == PPM_CTRL_CURRENT_BRAKE_REV_HYST) {
+        _p_ppm_ctrl.set_and_save(float(in.ppm_ctrl_type));
+        accepted = true;
+        vesc_telem.note_appconf_accepted();
+    }
+    // Zero would forbid the gesture at every speed, which is what control type 3
+    // is for — treat it as an absent field rather than a setting.
+    if (in.max_erpm_for_dir > 0.0f) {
+        _p_dir_erpm.set_and_save(in.max_erpm_for_dir);
+        accepted = true;
+    }
+
+    // Only reboot if something actually changed. A write that was refused in
+    // full has nothing to apply, and rebooting anyway drops the link for no
+    // reason — which also destroys the evidence, since the 'diag' counters that
+    // say WHY it was refused live in RAM. Staying up leaves them readable.
+    if (!accepted) {
+        return;
+    }
+
+    motor_control.set_current(0.0f);
+    AP_Param::flush();
 
     _reboot_ms = AP_HAL::millis();   // deferred reboot (see update())
 }
@@ -1095,6 +1156,12 @@ void FOC_ESC::read_pwm_throttle(uint32_t now_ms)
         }
         _pwm_amps  = 0.0f;    // hold coast until armed through neutral
         _pwm_brake = false;
+        // Drop any half-finished reverse gesture. VESC keeps its statics across
+        // a signal loss; we do not, deliberately — coming back from a dropout or
+        // a boot with the gesture already half-complete would let the first
+        // back-stick go straight to reverse, and re-doing it costs one brake.
+        _ppm_force_brake = true;
+        _ppm_did_idle    = 0;
         return;
     }
 
@@ -1110,7 +1177,80 @@ void FOC_ESC::read_pwm_throttle(uint32_t now_ms)
     }
     val = constrain_float(val, -1.0f, 1.0f);
 
-    // VESC PPM_CTRL_TYPE_CURRENT_NOREV_BRAKE (app_ppm.c:314-323):
+    const float erpm  = motor_control.get_erpm();
+    const float i_mot = motor_control.current_limit();
+    const float i_brk = motor_control.regen_limit();
+
+    if (uint8_t(_p_ppm_ctrl.get()) == PPM_CTRL_CURRENT_BRAKE_REV_HYST) {
+        // VESC PPM_CTRL_TYPE_CURRENT_BRAKE_REV_HYST (app_ppm.c:227-294).
+        //
+        // Reverse is deliberately NOT seamless here. Pulling back brakes; to
+        // actually reverse you must brake to a stop, return the stick to centre,
+        // and pull back a second time. That is the whole point of the mode: a
+        // panic brake grab, which is one continuous back-stick, can never turn
+        // into reverse acceleration at the moment the vehicle stops.
+        //
+        // Two pieces of state carry the gesture, both mirroring VESC's statics:
+        // _ppm_did_idle tracks how far through it you are, and _ppm_force_brake
+        // locks out the whole thing above the speed ceiling.
+        const float dir_erpm = _p_dir_erpm.get();
+        const float dir_hyst = dir_erpm * 0.20f;   // VESC: 20% band, app_ppm.c:68
+
+        // Speed gate, with hysteresis so a speed sitting on the threshold cannot
+        // chatter the lockout on and off.
+        if (_ppm_force_brake) {
+            if (erpm < dir_erpm - dir_hyst) {
+                _ppm_force_brake = false;
+                _ppm_did_idle    = 0;
+            }
+        } else if (erpm > dir_erpm + dir_hyst) {
+            _ppm_force_brake = true;
+            _ppm_did_idle    = 0;
+        }
+
+        bool brake = false;
+        float amps;
+
+        if (val >= 0.0f) {
+            // Exact compare against zero is intentional, not a float slip: the
+            // deadband above assigns literal 0.0f inside the neutral band, so
+            // this is "stick is in the neutral band", not "stick is near zero".
+            if (val == 0.0f) {
+                // Returned to idle after a brake — the second half of the gesture.
+                if (_ppm_did_idle == 1 && !_ppm_force_brake) {
+                    _ppm_did_idle = 2;
+                }
+            } else if (erpm > -dir_erpm) {
+                // Forward command while not already reversing fast: whatever
+                // gesture was in progress is abandoned.
+                _ppm_did_idle = 0;
+            }
+            amps = val * ((erpm >= 0.0f) ? i_mot : i_brk);
+        } else {
+            if (_ppm_force_brake) {
+                brake = true;                       // too fast to switch direction
+            } else if (erpm > -dir_erpm) {
+                if (_ppm_did_idle != 2) {           // gesture not complete → brake
+                    _ppm_did_idle = 1;
+                    brake = true;
+                }
+            } else if (_ppm_did_idle == 1) {
+                brake = true;
+            } else {
+                _ppm_did_idle = 2;                  // already reversing; let it run
+            }
+            // Reverse acceleration is bounded by the BRAKING ceiling, not the
+            // motoring one — VESC's choice (app_ppm.c:286-292), and it keeps
+            // reverse gentle without needing a second limit.
+            amps = val * i_brk;
+        }
+
+        _pwm_brake = brake;
+        _pwm_amps  = brake ? fabsf(amps) : amps;
+        return;
+    }
+
+    // VESC PPM_CTRL_TYPE_CURRENT_NOREV_BRAKE (app_ppm.c:314-323), the default:
     //     current_mode_brake = servo_val < 0
     //     forward trigger AND rolling forward → servo_val * l_current_max
     //     otherwise                           → |servo_val * l_current_min|
@@ -1118,16 +1258,15 @@ void FOC_ESC::read_pwm_throttle(uint32_t now_ms)
     // rolling backwards is not a brake command, it is forward torque against the
     // roll — so it stays a motoring command (positive current, no reverse), just
     // limited to the braking ceiling because that is what is decelerating the bus.
-    const float erpm = motor_control.get_erpm();
     if (val < 0.0f) {
         _pwm_brake = true;
-        _pwm_amps  = -val * motor_control.regen_limit();
+        _pwm_amps  = -val * i_brk;
     } else if (erpm < -THR_REV_ERPM) {
         _pwm_brake = false;
-        _pwm_amps  = val * motor_control.regen_limit();
+        _pwm_amps  = val * i_brk;
     } else {
         _pwm_brake = false;
-        _pwm_amps  = val * motor_control.current_limit();
+        _pwm_amps  = val * i_mot;
     }
 }
 
@@ -1251,6 +1390,13 @@ void FOC_ESC::update(uint32_t now_ms)
         }
     }
 
+    // Keep the PPM half of the snapshot LIVE rather than boot-time. Two reasons:
+    // VESC Tool re-reads to confirm a write and that read lands before the
+    // deferred reboot, and 'diag' reports this value — so it must be what the
+    // param actually holds right now, not what it held at boot. Anything that
+    // fails to persist then shows up as a run_ctrl that reverts after a reset.
+    vesc_telem.set_ppm_conf(uint8_t(_p_ppm_ctrl.get()), _p_dir_erpm.get());
+    vesc_telem.set_storage_full(AP_Param::get_eeprom_full());
     vesc_telem.update();
 
     // Persist a freshly detected hall table so it survives reboot (triggered via
