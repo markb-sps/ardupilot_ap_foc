@@ -228,6 +228,24 @@ bool MotorControl::init(const Config &cfg)
     // at or below zero would fold the limit away at every duty, and VESC's own
     // "> 0.99 disables" sentinel is preserved by leaving anything above 0.99 be.
     _duty_start    = (cfg.duty_start > 0.99f) ? 1.0f : clampf(cfg.duty_start, 0.30f, 0.99f);
+    // ERPM foldback knees (VESC l_max_erpm/l_min_erpm scaled by l_erpm_start).
+    // Signs and magnitudes are enforced rather than trusted: a positive min_erpm
+    // or a negative max_erpm would put the knee on the wrong side of the map and
+    // fold the ceiling away at standstill, which is a silently dead drive.
+    //
+    // erpm_start is capped at 0.99 rather than 1.0 — the two must not coincide.
+    // VESC tolerates start == limit because its maps carry ±0.1 eRPM guard bands
+    // that turn the zero-width span into a hard step; our mapf() instead returns
+    // out_lo for any span below 1e-9, which for this map is FULL current, i.e.
+    // the limit would quietly disable itself at exactly the setting that looks
+    // like the hardest limit. Capping the knee keeps the span finite and the
+    // clamping inside mapf() then reproduces VESC's guard bands for free.
+    const float erpm_start_frac = clampf(cfg.erpm_start, 0.05f, 0.99f);
+    _erpm_start    = erpm_start_frac;
+    _erpm_max      = (cfg.max_erpm >  1.0f) ? cfg.max_erpm :  1.0f;
+    _erpm_min      = (cfg.min_erpm < -1.0f) ? cfg.min_erpm : -1.0f;
+    _erpm_max_knee = _erpm_max * erpm_start_frac;
+    _erpm_min_knee = _erpm_min * erpm_start_frac;
     _dt_comp_volts   = cfg.deadtime_comp_volts;
     _dt_comp_on_duty = cfg.deadtime_comp_on_duty;
     _v_max         = _mod_to_vmax * cfg.vbus;
@@ -887,6 +905,47 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
             }
         }
     }
+    // ── ERPM-based current foldback (VESC mc_interface.c:2417, "RPM max/min") ─
+    // Two symmetric linear maps on the PLL speed, folded into the MOTORING
+    // ceiling. Neither touches _regen_max, and that is not an omission: in VESC
+    // both maps land on lo_max only (mc_interface.c:2527-2528), because
+    // l_current_max is the motoring limit in BOTH directions of rotation — the
+    // direction-aware clamp in the CURRENT branch below (see the mod_q note
+    // there) is what routes it. One ceiling therefore covers overspeed forward
+    // AND overspeed reverse, while braking is never restricted by speed. It also
+    // means no DIR_MULT equivalent is needed here: i_max is a magnitude, and
+    // VESC's DIR_MULT exists only to put its signed rpm in the same frame as its
+    // signed limits.
+    //
+    // Speed source is _spd_pll_omega, the PLL output. VESC deliberately reads the
+    // FAST rpm here (mcpwm_foc_get_rpm_fast(), i.e. m_pll_speed) rather than the
+    // filtered estimate — "Low latency is important for avoiding oscillations" —
+    // so the noisier, quicker signal is the correct match, not an accident. Ours
+    // is last cycle's value (written near the end of this ISR); VESC's whole
+    // block runs in a 1 kHz thread, so we are the fresher of the two.
+    //
+    // mapf() clamps its interpolation factor, which reproduces VESC's ±0.1 eRPM
+    // guard bands: below the knee the full limit stands, above the limit the
+    // ceiling is zero. init() guarantees a non-degenerate span (see erpm_start).
+    //
+    // The high endpoint is _current_max, NOT the running i_max, matching VESC's
+    // use of l_current_max_tmp — each limit is computed against the configured
+    // ceiling and they are combined by taking the smallest, so the derates above
+    // and this one cannot compound into a double reduction.
+    {
+        const float erpm_now = _spd_pll_omega * _w_to_erpm;
+        const float lo_max_rpm =
+            mapf(erpm_now, _erpm_max_knee, _erpm_max, _current_max, 0.0f);
+        const float lo_min_rpm =
+            mapf(erpm_now, _erpm_min_knee, _erpm_min, _current_max, 0.0f);
+        if (lo_max_rpm < i_max) {
+            i_max = lo_max_rpm;
+        }
+        if (lo_min_rpm < i_max) {
+            i_max = lo_min_rpm;
+        }
+    }
+
     // VESC floors the limit at cc_min_current so a fully folded-back drive still
     // holds the loop alive rather than commanding exactly zero.
     if (i_max < CC_MIN_CURRENT) {

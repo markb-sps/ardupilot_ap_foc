@@ -803,9 +803,9 @@ void VescTelemetry::handle_get_mcconf(uint8_t reply_id)
     put_f16     (p, 0.5f, 10000.0f);           // l_in_current_map_start
     put_f16     (p, 0.02f, 10000.0f);          // l_in_current_map_filter
     put_f32_auto(p, _conf.abs_current_max);    // l_abs_current_max    ← param (hard OC)
-    put_f32_auto(p, -100000.0f);               // l_min_erpm
-    put_f32_auto(p, 100000.0f);                // l_max_erpm
-    put_f16     (p, 0.8f, 10000.0f);           // l_erpm_start
+    put_f32_auto(p, _mc.get_min_erpm());       // l_min_erpm      ← param (MIN_ERPM)
+    put_f32_auto(p, _mc.get_max_erpm());       // l_max_erpm      ← param (MAX_ERPM)
+    put_f16     (p, _mc.get_erpm_start(), 10000.0f); // l_erpm_start ← param (ERPM_START)
     put_f32_auto(p, 300.0f);                   // l_max_erpm_fbrake
     put_f32_auto(p, 1500.0f);                  // l_max_erpm_fbrake_cc
     put_f16     (p, v_min, 10.0f);             // l_min_vin            ← param (V_MIN)
@@ -1024,8 +1024,9 @@ void VescTelemetry::handle_set_mcconf()
     A(); A();                               // l_in_current_max, l_in_current_min
     H(10000); H(10000);                     // l_in_current_map_start, _filter
     in.abs_current_max = get_f32_auto(p);   // l_abs_current_max
-    A(); A();                               // l_min_erpm, l_max_erpm
-    H(10000);                               // l_erpm_start
+    in.min_erpm   = get_f32_auto(p);        // l_min_erpm
+    in.max_erpm   = get_f32_auto(p);        // l_max_erpm
+    in.erpm_start = get_f16(p, 10000);      // l_erpm_start
     A(); A();                               // l_max_erpm_fbrake, _cc
     H(10);                                  // l_min_vin
     in.max_vin = get_f16(p, 10);            // l_max_vin

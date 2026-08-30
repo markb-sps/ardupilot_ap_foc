@@ -77,6 +77,17 @@ public:
         // current limit starts folding back; VESC treats > 0.99 as disabled.
         // 0 = absent.
         float   duty_start = 0.0f;
+        // l_max_erpm / l_min_erpm / l_erpm_start → MAX_ERPM / MIN_ERPM /
+        // ERPM_START — the param names drop VESC's "l_" limits-group prefix
+        // and are otherwise identical, so one name follows a value from the
+        // VESC Tool box through the wire to Config and the ISR.
+        // Motoring-current foldback against speed. Sign carries meaning: max is
+        // the forward ceiling and min the reverse one, so 0 means absent for
+        // both — a zero ceiling would be a drive that never turns, which is not
+        // a configuration anyone is asking for over the wire.
+        float   max_erpm   = 0.0f;
+        float   min_erpm   = 0.0f;
+        float   erpm_start = 0.0f;  // knee as a fraction of the limit (0 = absent)
         // Sensorless open-loop start, VESC foc_sl_openloop_* / foc_openloop_rpm.
         // All are meaningless at or below zero except rpm_low (0 is valid and is
         // the default), so 0 doubles as "absent" for the rest.

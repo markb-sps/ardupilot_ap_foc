@@ -139,6 +139,29 @@ public:
         // sampling window), so base speed sits inside the usable throttle range
         // rather than far above it.
         float    duty_start        = 0.85f;
+        // ── ERPM foldback (VESC mc_interface.c:2417, "RPM max" / "RPM min") ─
+        // Speed ceiling in ELECTRICAL rpm. The motoring current limit tapers
+        // linearly from full at erpm_start·max_erpm down to zero at max_erpm,
+        // and symmetrically toward min_erpm in reverse.
+        //
+        // This is a torque CUTBACK, not a speed controller — same as VESC. Above
+        // the limit the drive simply stops pushing; it never commands braking, so
+        // inertia or a back-driving load carries the speed past the ceiling with
+        // nothing pulling it back. If the speed must actually be REGULATED, that
+        // is what SPEED mode is for. Worth knowing before tuning these: a limit
+        // that "does not limit" on a free-spinning bench motor is this working as
+        // designed, not a fault.
+        //
+        // Defaults are VESC's own (MCCONF_L_RPM_MAX/MIN = ±100000), i.e. off in
+        // practice. Deliberately NOT tightened the way duty_start was: on this
+        // board the duty foldback already settles the machine at base speed, so
+        // the ERPM limit is an application ceiling rather than a protection, and
+        // a protection default would only mask the duty knee's behaviour.
+        float    max_erpm          =  100000.0f;
+        float    min_erpm          = -100000.0f;
+        // Fraction of the limit at which the taper starts (VESC l_erpm_start,
+        // MCCONF_L_RPM_START = 0.8). Lower = softer, earlier cutback.
+        float    erpm_start        = 0.8f;
         // Max braking/regen MOTOR current [A]. Caps the negative (decelerating)
         // iq in SPEED mode and the magnitude in BRAKE mode. Keep conservative:
         // braking energy returns to the bus, a bench PSU can't sink it, and
@@ -488,6 +511,14 @@ public:
     // TRACK/hysteresis coupling on the open-loop times).
     float get_duty_max()      const { return _duty_max; }
     float get_duty_start()    const { return _duty_start; }
+    // ERPM foldback, as ACTUALLY running: init() clamps signs, magnitudes and the
+    // knee fraction, so these report the effective values rather than whatever
+    // was configured. The mcconf responder echoes them straight back to VESC
+    // Tool, and a box that reads back something other than what is enforced is
+    // how a limit stops meaning anything.
+    float get_max_erpm()      const { return _erpm_max; }
+    float get_min_erpm()      const { return _erpm_min; }
+    float get_erpm_start()    const { return _erpm_start; }
     float get_vbus_min()      const { return _vbus_min; }
     // Under-voltage foldback band [V] — the reciprocal is what is stored.
     float get_vbus_uv_band()  const { return 1.0f / _vbus_uvfold_inv; }
@@ -667,6 +698,13 @@ private:
     // is VESC's l_max_duty: the value get_duty_vesc() saturates at.
     float _max_mod_eff     = 0.60f;
     float _duty_start      = 0.85f;  // duty foldback knee, fraction of _max_mod_eff
+    // ERPM foldback, precomputed (VESC l_max_erpm / l_min_erpm / l_erpm_start).
+    // Knees are the taper onset; the limit itself is where the ceiling hits zero.
+    float _erpm_max        =  100000.0f;
+    float _erpm_min        = -100000.0f;
+    float _erpm_max_knee   =   80000.0f;
+    float _erpm_min_knee   =  -80000.0f;
+    float _erpm_start      = 0.8f;   // clamped knee fraction, for read-back
     float _dt_comp_volts   = 0.0f;   // cfg.deadtime_comp_volts
     bool  _dt_comp_on_duty = true;   // cfg.deadtime_comp_on_duty
     // VESC-style open-loop override constants

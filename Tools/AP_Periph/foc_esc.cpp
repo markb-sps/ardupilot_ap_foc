@@ -176,6 +176,24 @@ const AP_Param::GroupInfo FOC_ESC::var_info[] = {
     // @Range: 0.30 1.0
     // @User: Advanced
     AP_GROUPINFO("D_START", 45, FOC_ESC, _p_duty_start, 0.85f),
+    // @Param: MAX_ERPM
+    // @DisplayName: Forward speed ceiling
+    // @Description: Motoring current tapers from full at ERPM_START*MAX_ERPM to zero at MAX_ERPM electrical RPM (VESC l_max_erpm, "Max ERPM"). Understand what this is before relying on it: a torque CUTBACK, not a speed controller. Above the ceiling the drive stops pushing but never brakes, so momentum or a load driving the motor carries the speed straight past it. It bounds what the drive will ACCELERATE to, nothing more. For a speed that is actually held, use SPEED mode. Default 100000 is VESC's, i.e. effectively off.
+    // @Units: rpm
+    // @User: Advanced
+    AP_GROUPINFO("MAX_ERPM", 46, FOC_ESC, _p_max_erpm, 100000.0f),
+    // @Param: MIN_ERPM
+    // @DisplayName: Reverse speed ceiling
+    // @Description: The mirror of MAX_ERPM for reverse rotation, and NEGATIVE (VESC l_min_erpm, "Min ERPM"). Both ceilings act on the MOTORING current only, never on braking, so this limits how fast the drive will drive itself backwards; it does not limit how fast it may be pushed backwards. Default -100000 is VESC's, i.e. effectively off.
+    // @Units: rpm
+    // @User: Advanced
+    AP_GROUPINFO("MIN_ERPM", 47, FOC_ESC, _p_min_erpm, -100000.0f),
+    // @Param: ERPM_START
+    // @DisplayName: ERPM at which current foldback starts
+    // @Description: Fraction of MAX_ERPM/MIN_ERPM at which the current ceiling begins tapering (VESC l_erpm_start, "ERPM Limit Start"). Lower makes the limit softer and engage earlier. Clamped to 0.05..0.99 on load: unlike VESC, 1.0 is NOT accepted, because a zero-width taper here would disable the limit rather than harden it.
+    // @Range: 0.05 0.99
+    // @User: Advanced
+    AP_GROUPINFO("ERPM_START", 48, FOC_ESC, _p_erpm_start, 0.8f),
     // ── Sensorless open-loop start (VESC foc_sl_openloop_*) ──────────────────
     // Inactive in HALL sensor mode: the halls commutate from standstill and this
     // state machine is never entered.
@@ -422,6 +440,9 @@ void FOC_ESC::init(AP_HAL::UARTDriver *vesc_uart)
     // on this board and the side whose failure kills FETs.
     motor_cfg.duty_max             = constrain_float(_p_duty_max.get(), 0.55f, 0.90f);
     motor_cfg.duty_start           = _p_duty_start.get();
+    motor_cfg.max_erpm             = _p_max_erpm.get();
+    motor_cfg.min_erpm             = _p_min_erpm.get();
+    motor_cfg.erpm_start           = _p_erpm_start.get();
     motor_cfg.openloop_current     = _p_ol_boost.get();
     motor_cfg.openloop_max_q       = _p_ol_imax.get();
     motor_cfg.openloop_erpm        = _p_ol_erpm.get();
@@ -557,6 +578,28 @@ void FOC_ESC::on_mcconf_write(const ChibiOS::VescTelemetry::McconfIn &in)
     // away across the whole usable duty range, which reads as "no torque".
     if (in.duty_start >= 0.30f && in.duty_start <= 1.0f) {
         _p_duty_start.set_and_save(in.duty_start);
+    }
+    // Speed ceilings. Guarded on sign, which is what distinguishes a real setting
+    // from an absent field here: a zero or negative MAX_ERPM (or a zero/positive
+    // MIN_ERPM) would place the foldback knee at or through standstill and
+    // hold the current ceiling at the floor forever — a drive that silently
+    // refuses to turn. init() enforces the same invariant, so this guard is
+    // about not STORING a value that would have to be corrected on the way in.
+    if (in.max_erpm > 0.0f) {
+        _p_max_erpm.set_and_save(in.max_erpm);
+    }
+    if (in.min_erpm < 0.0f) {
+        _p_min_erpm.set_and_save(in.min_erpm);
+    }
+    // The knee. VESC's usable range is (0, 1]; ours stops at 0.99 (see ERPM_START),
+    // so a config carrying exactly 1.0 — "hard limit, no taper" in VESC terms —
+    // is REFUSED rather than quietly stored as 0.99. Same reasoning as D_MAX
+    // above: a stored value that does not match what is running is worse than a
+    // rejected write, and here the two differ in the direction that matters
+    // (VESC's 1.0 steps the current off AT the limit; a silently-clamped 0.99
+    // starts folding back 1% early, which on a 100000 default is 1000 eRPM).
+    if (in.erpm_start >= 0.05f && in.erpm_start <= 0.99f) {
+        _p_erpm_start.set_and_save(in.erpm_start);
     }
     // Sensorless open-loop start. Each guarded on its own: VESC Tool sends the
     // whole config, and a field the operator never touched must not overwrite a
