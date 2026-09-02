@@ -51,10 +51,11 @@ constexpr float    THR_REV_ERPM         = 100.0f;
 // couple of dropped 50 Hz RC frames / DroneCAN commands before it ages to coast.
 constexpr uint32_t THR_SOURCE_TIMEOUT_MS = 200;
 
-// VESC ppm_control_type values (bldc datatypes.h). Only these two are
+// VESC ppm_control_type values (bldc datatypes.h). Only these three are
 // implemented; the NUMBERING is VESC's so a value stored here is the same
 // integer as the index of VESC Tool's Control Type dropdown, and a config
 // exchanged with the tool needs no translation in either direction.
+constexpr uint8_t PPM_CTRL_CURRENT              = 1;  // "Current"
 constexpr uint8_t PPM_CTRL_CURRENT_NOREV_BRAKE  = 3;  // "Current No Reverse With Brake"
 constexpr uint8_t PPM_CTRL_CURRENT_BRAKE_REV_HYST = 8;  // "Current Hyst Reverse With Brake"
 
@@ -203,8 +204,8 @@ const AP_Param::GroupInfo FOC_ESC::var_info[] = {
     AP_GROUPINFO("ERPM_START", 48, FOC_ESC, _p_erpm_start, 0.8f),
     // @Param: PPM_CTRL
     // @DisplayName: PWM throttle control type
-    // @Description: How the RC PWM throttle input is interpreted (VESC app_ppm_conf.ctrl_type, "Control Type" on VESC Tool's App Settings PPM page). Values are VESC's enum, so this matches that dropdown's index. Only two are implemented: 3 = Current No Reverse With Brake (centre is off, back-stick brakes to a stop and no further), 8 = Current Hyst Reverse With Brake (as 3, but braking to a stop, releasing to centre, then braking again enters reverse — gated by DIR_ERPM). Writing any other value from VESC Tool is refused rather than silently substituted.
-    // @Values: 3:Current No Reverse With Brake,8:Current Hyst Reverse With Brake
+    // @Description: How the RC PWM throttle input is interpreted (VESC app_ppm_conf.ctrl_type, "Control Type" on VESC Tool's App Settings PPM page). Values are VESC's enum, so this matches that dropdown's index. Only three are implemented: 1 = Current (seamless bidirectional — back-stick brakes and then accelerates in reverse through zero with no neutral visit, so a held back-stick WILL launch backwards once the motor stops), 3 = Current No Reverse With Brake (centre is off, back-stick brakes to a stop and no further), 8 = Current Hyst Reverse With Brake (as 3, but braking to a stop, releasing to centre, then braking again enters reverse — gated by DIR_ERPM). Writing any other value from VESC Tool is refused rather than silently substituted.
+    // @Values: 1:Current,3:Current No Reverse With Brake,8:Current Hyst Reverse With Brake
     // @User: Advanced
     AP_GROUPINFO("PPM_CTRL", 49, FOC_ESC, _p_ppm_ctrl, float(PPM_CTRL_CURRENT_NOREV_BRAKE)),
     // @Param: DIR_ERPM
@@ -684,7 +685,8 @@ void FOC_ESC::on_appconf_write(const ChibiOS::VescTelemetry::AppconfIn &in)
     // than a write that visibly did not take. The read-back after the reboot
     // shows the unchanged value, which is the honest signal.
     bool accepted = false;
-    if (in.ppm_ctrl_type == PPM_CTRL_CURRENT_NOREV_BRAKE ||
+    if (in.ppm_ctrl_type == PPM_CTRL_CURRENT ||
+        in.ppm_ctrl_type == PPM_CTRL_CURRENT_NOREV_BRAKE ||
         in.ppm_ctrl_type == PPM_CTRL_CURRENT_BRAKE_REV_HYST) {
         _p_ppm_ctrl.set_and_save(float(in.ppm_ctrl_type));
         accepted = true;
@@ -1180,6 +1182,36 @@ void FOC_ESC::read_pwm_throttle(uint32_t now_ms)
     const float erpm  = motor_control.get_erpm();
     const float i_mot = motor_control.current_limit();
     const float i_brk = motor_control.regen_limit();
+
+    if (uint8_t(_p_ppm_ctrl.get()) == PPM_CTRL_CURRENT) {
+        // VESC PPM_CTRL_TYPE_CURRENT (app_ppm.c:300-307). Seamless bidirectional
+        // torque: one SIGNED current command, never a brake command. Back-stick
+        // while rolling forward is negative current, which already is regenerative
+        // braking; when the eRPM crosses zero that same unchanged command simply
+        // becomes reverse acceleration. No gesture, no state, no neutral visit —
+        // which is precisely the property CURRENT_BRAKE_REV_HYST exists to deny,
+        // so a back-stick held through the stop WILL launch backwards here.
+        //
+        // Which ceiling applies is decided by which way the energy is flowing, not
+        // by the sign of the stick: torque that agrees with the direction of travel
+        // is motoring and draws on I_MAX, torque that opposes it is pushing charge
+        // back into the bus and draws on I_REGEN.
+        //
+        // VESC tests the raw sign (`rpm_now >= 0.0`), which is safe there only
+        // because stock configs set l_current_min = -l_current_max: both branches
+        // then yield the same ceiling, so the flip is invisible. Ours are
+        // deliberately asymmetric, so a bare sign compare would let PLL noise at a
+        // standstill chatter the ceiling by that whole ratio. Reusing the
+        // THR_REV_ERPM deadband treats "stopped" as agreeing with whatever was
+        // asked, which is also the physically honest answer — with no rotation
+        // there is nothing to regenerate from, so a standstill command is always
+        // pure motoring.
+        const bool opposing = (val > 0.0f && erpm < -THR_REV_ERPM) ||
+                              (val < 0.0f && erpm >  THR_REV_ERPM);
+        _pwm_brake = false;
+        _pwm_amps  = val * (opposing ? i_brk : i_mot);
+        return;
+    }
 
     if (uint8_t(_p_ppm_ctrl.get()) == PPM_CTRL_CURRENT_BRAKE_REV_HYST) {
         // VESC PPM_CTRL_TYPE_CURRENT_BRAKE_REV_HYST (app_ppm.c:227-294).

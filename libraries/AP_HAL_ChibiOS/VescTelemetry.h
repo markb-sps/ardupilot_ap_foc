@@ -298,6 +298,22 @@ private:
     void print_hall_table();
     // 'diag' terminal command: dump the throttle-arbiter decision inputs.
     void print_diag();
+    // Dump MotorControl's latched trip snapshot — what the ISR saw at the tick a
+    // fault fired. The one readout that can tell a real overcurrent from a sense
+    // artifact, and say whether the commutation angle had come apart first.
+    void print_trip();
+
+// ─── FOC_WATCH ─── temporary diagnostic, remove as a unit (see MotorControl.h)
+// Not #if-guarded: this header only forward-declares MotorControl, so the
+// FOC_WATCH define isn't visible here and adding the include just to see it
+// would be a coupling change to undo later. The switch guards the CODE (in the
+// .cpp and in MotorControl.h); with it off these three declarations are inert.
+    // `watch [seconds]` — stream the angle sources and dq currents as COMM_PRINT
+    // lines at WATCH_HZ so they can be read while the motor turns. 0 stops it.
+    void     print_watch();
+    uint32_t _watch_until_ms = 0;   // streaming while millis() < this
+    uint32_t _watch_next_ms  = 0;   // next line due
+// ─── end FOC_WATCH ───────────────────────────────────────────────────────────
 
     static uint16_t crc16(const uint8_t *data, uint16_t len);
 

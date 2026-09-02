@@ -76,13 +76,14 @@ constexpr float PI_F            = 3.14159265359f;
 // dq-current low-pass coefficient, used only to pick the dead-time correction
 // sign. Matches VESC's MCCONF_FOC_CURRENT_FILTER_CONST.
 constexpr float CURRENT_FILT_K  = 0.1f;
+// Observer angle advance, in switching cycles — VESC's (0.5 + foc_observer_offset)
+// with its default foc_observer_offset of -1.0, i.e. a half-cycle RETARD.
+constexpr float OBS_LAG_TICKS = -0.5f;
 constexpr float OL_IQ_RAMP_S    = 0.2f;   // capture soft-start: OL current ramp-in time
 
 // ── Hall sensors ────────────────────────────────────────────────────────────
 constexpr uint8_t  HALL_NONE          = 0xFF; // "no committed state yet" sentinel (0 is a valid state)
-constexpr uint8_t  HALL_DEBOUNCE      = 2;    // identical raw reads before a state commit
 constexpr uint16_t HALL_FAULT_SAMPLES = 200;  // consecutive invalid reads → FAULT (~10 ms @20 kHz)
-constexpr float    HALL_STOP_S        = 0.05f;// no transition for this long → treat speed as 0
 // Floor speed for the commutation-angle rate limiter, VESC foc_hall_interp_erpm.
 // Sets how fast the angle may slew when the measured hall speed is ~0, so a 60°
 // sector step is still crossed promptly at standstill without being applied as
@@ -110,6 +111,16 @@ constexpr float    HD_HZ              = 0.556f;  // was 3.0 — matched to VESC
 // was five times shorter with no reason behind it. Matched to VESC.
 constexpr float    HD_RAMP_S          = 1.0f;
 constexpr float    HD_REVS            = 3.0f;  // electrical revolutions per direction to average over
+// Current-loop gains used FOR THE DURATION of a detection spin, then restored.
+// vedderb/bldc commands.c:2247 overrides the running config the same way before
+// calling mcpwm_foc_hall_detect() and puts the old one back afterwards:
+//     mcconf->foc_current_kp = 0.01;  mcconf->foc_current_ki = 10.0;
+// Detection holds the rotor at a FORCED angle, so a regulator tuned for tracking
+// a live command fights every bit of rotor motion on the way into each detent —
+// which is what makes the sweep jerky. Ki is the one that matters: VESC's 10 is
+// an order of magnitude under a normal running value.
+constexpr float    HD_CUR_KP          = 0.01f;
+constexpr float    HD_CUR_KI          = 10.0f;
 
 inline float wrap_pi(float a)
 {
@@ -281,8 +292,19 @@ bool MotorControl::init(const Config &cfg)
     // cycle down to ~500 eRPM) can't stay in band that long by accident.
     _lock_need          = uint16_t(0.5f * _resync_t / _dt);
 
-    _obs_L          = 1.5f * cfg.motor_Ls;
-    _obs_R          = 1.5f * cfg.motor_Rs;
+    // No 3/2 scaling. Our Clarke is amplitude-invariant (foc_transforms.h:
+    // i_alpha = ia), so the alpha-beta model IS the per-phase model and takes the
+    // per-phase R and L unscaled. VESC, on the same convention, feeds
+    // foc_motor_r / foc_motor_l straight in (foc_math.c foc_observer_update:
+    // `float R = conf_now->foc_motor_r;`) and never scales them anywhere.
+    //
+    // It is a double-count here specifically: our own R/L detection measures
+    // R = |v_dq| / |i_dq| (foc_esc.cpp RES_MEAS, mirroring mcpwm_foc.c:4131), i.e.
+    // in the very frame the observer works in — so the number the param holds is
+    // already the coefficient `v - R*i` wants. Multiplying it again fed the
+    // observer 48.9 mohm against a measured 32.6, and 9.6 uH against 6.4.
+    _obs_L          = cfg.motor_Ls;
+    _obs_R          = cfg.motor_Rs;
     _obs_lambda     = cfg.motor_flux;
     _obs_lambda2    = cfg.motor_flux * cfg.motor_flux;
     _obs_gamma_half = 0.5f * cfg.observer_gain;
@@ -330,6 +352,13 @@ bool MotorControl::init(const Config &cfg)
 
 void MotorControl::reset_control()
 {
+    // Put the running current-loop gains back if a detection spin borrowed them.
+    if (_hd_gains_saved) {
+        _cur_kp    = _hd_kp_save;
+        _cur_ki    = _hd_ki_save;
+        _cur_ki_dt = _cur_ki * _dt;
+        _hd_gains_saved = false;
+    }
     _integ_d = _integ_q = _integ_spd = 0.0f;
     _override_ang = 0.0f;
     _hyst_timer = 0.0f;
@@ -344,11 +373,41 @@ void MotorControl::reset_control()
     _stall_timer = 0.0f;
     // Hall decode re-fixes from scratch on the next valid read.
     _hall_state = HALL_NONE;
-    _hall_raw_prev = _hall_deb = 0;
-    _hall_omega = 0.0f;
+    _hall_glitch = 0;
+    // _hall_omega is deliberately NOT cleared. It is the duration of the last
+    // observed sector, and VESC keeps its equivalent (m_hall_dt_diff_last) for
+    // the life of the driver — initialised once in mcpwm_foc_init() and touched
+    // only at a transition. Zeroing it here made "rate unknown" indistinguishable
+    // from "rotor stopped", and the angle then STOPS ADVANCING on the first
+    // re-arm: a static frame against a spinning rotor, which the current loop
+    // cannot regulate (back-EMF appears as a rotating disturbance it has no
+    // authority over) and which shows up as tens of amps at a near-zero
+    // reference. The re-fix below re-establishes the ANGLE; the rate carries over.
+    // _hall_theta is now an integrator (VESC's m_ang_hall), but zeroing it here
+    // is harmless: _hall_state = HALL_NONE above guarantees the next
+    // update_hall() takes the re-fix branch, which re-seeds both from the live
+    // sector centre before either is read.
     _hall_theta = _hall_theta_rl = 0.0f;
-    _spd_pll_theta = _spd_pll_omega = 0.0f;
-    _hall_ticks = 0;
+    // The speed PLL is NOT reset here at all — not its speed, not its phase, and
+    // not the _spd_phase_prev / _speed_est_fast pair behind the wind-up clamp.
+    // VESC writes none of m_pll_speed, m_pll_phase or m_phase_before_speed_est
+    // outside mcpwm_foc_init(). Same reasoning as _hall_omega above: zero here
+    // would mean "stopped" when the truth is "unknown", and the blend now reads
+    // this speed, so a re-arm at speed would force pure-hall commutation however
+    // fast the rotor is really turning. They also have to persist TOGETHER —
+    // resetting the phase while _spd_phase_prev carried over would hand the
+    // finite difference a fabricated jump, and zeroing _speed_est_fast alone
+    // would pin the PLL at zero for the filter's whole settling time. The loop
+    // re-locks on its own within a few ms; there is nothing to re-acquire.
+    // _hall_ticks is NOT restarted either — it is the hall interval clock, and
+    // this reset fires wherever the rotor happens to be inside a sector. Zeroing
+    // it here times the first real edge over only the REMAINDER of that sector
+    // and reads the rate as however many times too fast the remainder is short:
+    // a RANDOM factor, seen as 2.8x on one run and 1.9x on the next. Same reason
+    // the re-fix branch in update_hall() leaves it alone, and the same single
+    // rule VESC follows — m_hall_dt_diff_now is zeroed at foc_math.c:634 and
+    // nowhere else, not on re-init and not on a stop. Left running it can only
+    // read too SLOW after an idle, which lags harmlessly inside the sector.
     _hall_fault = 0;
     // Motion must be re-confirmed after any stop/hold-off before full current is
     // released again (break-away clamp re-arms). reset_control() runs from
@@ -439,6 +498,7 @@ bool MotorControl::fault_gate(bool release, uint32_t now_ms)
     _mode               = Mode::STOP;
     _cmd_current        = 0.0f;
     _cmd_current_target = 0.0f;
+    _iq_bounds_seeded   = false;
     return false;   // released on this call; the next command may arm
 }
 
@@ -447,6 +507,39 @@ void MotorControl::trip_fault(uint8_t code)
     // ISR context: cut the output stage immediately via a bare MOE clear. The
     // latch keeps it off until the host releases (see fault_gate).
     gate_off();
+    // Latch the evidence BEFORE reset_control() wipes the control state. The
+    // phase currents are this tick's (the OC test read the same values); the
+    // control-loop terms are the previous cycle's, 50 us old, because the OC
+    // check runs before the angle and dq currents are recomputed.
+    _trip.valid      = true;
+    _trip.code       = code;
+    _trip.state      = uint8_t(_state);
+    _trip.mode       = uint8_t(_mode);
+    _trip.hall_state = _hall_state;
+    _trip.hall_ticks = _hall_ticks;
+    _trip.hall_glitch = _hall_glitch;
+    _trip.ia         = _t_ia;
+    _trip.ib         = _t_ib;
+    _trip.ic         = _t_ic;
+    _trip.i_resid    = _t_i_resid;
+    _trip.theta      = _t_theta;
+    _trip.hall_theta = _hall_theta_rl;
+    _trip.obs_theta  = _obs_theta;
+    _trip.pll_erpm   = _spd_pll_omega * _w_to_erpm;
+    _trip.hall_erpm  = _hall_omega * _w_to_erpm;   // last observed sector rate
+    _trip.hall_eff   = _hall_erpm_eff;             // decayed estimate the logic uses
+    _trip.iq_cmd     = _t_iq_cmd;
+    _trip.id         = _t_id;
+    _trip.iq         = _t_iq;
+    _trip.iq_lo      = _iq_lo;
+    _trip.iq_hi      = _iq_hi;
+    _trip.vd         = _t_vd;
+    _trip.vq         = _t_vq;
+    _trip.integ_d    = _integ_d;
+    _trip.integ_q    = _integ_q;
+    _trip.duty       = _t_duty;
+    _trip.v_max      = _v_max;
+    _trip.vbus       = _vbus_flt;
     _fault_code    = code;
     _fault_latched = true;
     _fault_last    = code;                 // sticky, for host reporting
@@ -601,6 +694,7 @@ void MotorControl::set_current(float amps)
         _mode = (_state == State::CLOSED || _state == State::OPENLOOP) ? Mode::CURRENT : Mode::STOP;
         if (_mode == Mode::STOP) {
             _cmd_current = 0.0f;
+            _iq_bounds_seeded = false;
         }
         return;
     }
@@ -611,6 +705,7 @@ void MotorControl::set_current(float amps)
     }
     if (_mode != Mode::CURRENT) {
         _cmd_current = 0.0f;                     // (re)entry: slew up from zero, not from a stale value
+        _iq_bounds_seeded = false;               // and snap the bounds, don't ramp them open
     }
     _cmd_current_target = clampf(amps, -_current_max, _current_max);
     _mode = Mode::CURRENT;                      // set mode first so a racing ISR sees CURRENT not STOP
@@ -682,6 +777,7 @@ void MotorControl::stop()
     _mode = Mode::STOP;
     _cmd_current        = 0.0f;
     _cmd_current_target = 0.0f;
+    _iq_bounds_seeded   = false;
     _fault_code    = FAULT_NONE;
     _fault_latched = false;
     _fault_last    = FAULT_NONE;   // explicit stop also clears the sticky report
@@ -1292,7 +1388,11 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
                 if (_hd_n[k] > nmax) nmax = _hd_n[k];
             }
             const uint32_t nmin = nmax / 4;
+            // The dwell counts are already a width measurement: the angle sweeps
+            // at a constant rate, so ticks-in-state k is directly proportional to
             // Circular mean of the forced angle per state = sector centre.
+            // The dwell counts _hd_n are deliberately NOT turned into per-sector
+            // widths: see the HALL_SECTOR comment for why a fixed 60 deg is used.
             for (uint8_t k = 0; k < 8; k++) {
                 const bool valid = (_hd_n[k] > nmin);
                 const float ang  = valid ? atan2f(_hd_sin[k], _hd_cos[k]) : NAN;
@@ -1348,10 +1448,11 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
     // (mcpwm_foc.c: phase_for_speed_est = state->phase).
     //
     // This deliberately does NOT read _hall_omega. Hall sector timing yields six
-    // samples per electrical revolution and the HALL_STOP_S timeout forces it to
-    // zero below ~200 eRPM, so as outer-loop feedback it is both coarse and, at
-    // low speed, simply false — the loop would integrate against a fabricated
-    // zero and dump the accumulated current the moment the rotor moved. The PLL
+    // samples per electrical revolution, and the decayed estimate built from it
+    // falls away below ~200 eRPM, so as outer-loop feedback it is both coarse
+    // and, at low speed, simply false — the loop would integrate against a
+    // fabricated zero and dump the accumulated current the moment the rotor
+    // moved. The PLL
     // tracks the same hall-derived angle but interpolates continuously, so it
     // stays smooth all the way down. _hall_omega now only informs the
     // hall→observer blend, which is what it is actually good for.
@@ -1467,10 +1568,7 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
         // Regen limit: when iq opposes rotation (decelerating) the braking energy
         // returns to the bus, which a bench PSU can't sink — cap the braking
         // current hard, folded toward zero as vbus approaches vbus_max.
-        if (iq_cmd * omega_ctrl < 0.0f) {
-            const float rl = _regen_max * ov_scale;
-            iq_cmd = clampf(iq_cmd, -rl, rl);
-        }
+        iq_cmd = apply_current_bounds(iq_cmd, omega_ctrl, i_max, ov_scale);
     } else if (mode == Mode::BRAKE) {
         // _cmd_current holds the brake magnitude (already capped to _regen_max);
         // sign opposes rotation. Clamp again here as the single enforcement
@@ -1478,23 +1576,12 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
         const float rl = _regen_max * ov_scale;
         iq_cmd = clampf((omega_ctrl >= 0.0f ? -1.0f : 1.0f) * _cmd_current, -rl, rl);
     } else {
-        iq_cmd = clampf(_cmd_current, -i_max, i_max);
         // Braking is capped by the regen ceiling, NOT by i_max — VESC's
         // l_current_min, which is a braking limit rather than a "negative iq"
-        // limit. mcpwm_foc.c:3651 applies it direction-aware off the sign of
-        // mod_q, so the ceiling follows power flow in both directions:
-        //     mod_q > 0 : iq in [ lo_current_min,  lo_current_max]
-        //     mod_q < 0 : iq in [-lo_current_max, -lo_current_min]
-        // i.e. l_current_max is the MOTORING ceiling and l_current_min the
-        // BRAKING one whichever way the motor turns. Our omega_ctrl (PLL speed)
-        // stands in for VESC's mod_q_filter as the rotation-direction sign; at
-        // standstill the product is zero, which correctly skips the clamp since
-        // there is no regen at zero speed. Same test the SPEED branch above
-        // already used; ov_scale folds it toward zero as vbus nears vbus_max.
-        if (iq_cmd * omega_ctrl < 0.0f) {
-            const float rl = _regen_max * ov_scale;
-            iq_cmd = clampf(iq_cmd, -rl, rl);
-        }
+        // limit. apply_current_bounds() holds VESC's direction-aware pair and
+        // the rate limit on their relaxation; ov_scale folds the braking ceiling
+        // toward zero as vbus nears vbus_max.
+        iq_cmd = apply_current_bounds(_cmd_current, omega_ctrl, i_max, ov_scale);
     }
 
     // ── Angle + torque source ───────────────────────────────────────────────
@@ -1509,7 +1596,17 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
         // Blend hall → observer angle across [_hall_blend_lo, _hall_blend_hi]
         // eRPM (VESC foc_sl_erpm): pure hall from standstill, pure observer at
         // speed, short-way interpolation of the wrapped angle difference between.
-        const float erpm_abs = fabsf(_hall_omega) * _w_to_erpm;
+        //
+        // The blend is driven by the PLL speed, NOT the hall-timed speed — VESC's
+        // choice (foc_math.c:596, `rpm_abs = |RADPS2RPM(m_pll_speed)|` feeding both
+        // m_using_hall and the weight_hall map). The distinction is not cosmetic:
+        // _hall_omega collapses to 0 whenever the halls stop producing transitions,
+        // whether the rotor stopped or the SIGNAL was lost. Blending on it hands
+        // full authority to a frozen hall angle at exactly the moment that angle
+        // became worthless, and the bridge then holds a fixed vector while the
+        // rotor walks away from it. The PLL speed does not collapse that way, so a
+        // rotor still turning keeps the observer weighted in.
+        const float erpm_abs = fabsf(_spd_pll_omega) * _w_to_erpm;
         const float k = mapf(erpm_abs, _hall_blend_lo, _hall_blend_hi, 0.0f, 1.0f);
         theta = (k <= 0.0f)
                     ? _hall_theta_rl
@@ -1563,7 +1660,21 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
     // the current during the _stall_t dwell before the trip fires.
     bool stalled;
     if (_sensor_mode == SensorMode::HALL) {
-        stalled = (_state == State::HALL) && (fabsf(_hall_omega) < 1.0f) && (fabsf(iq_set) > _stall_i);
+        // Tested on what is FLOWING, not on what was asked for. A frozen
+        // commutation angle can hold tens of amps in a leg while the reference
+        // sits near zero (observed: iq_cmd 0.06 A against 45 A measured), and a
+        // command-side test sees nothing and lets it cook. Peak phase current is
+        // the frame-independent measure — a wrong angle makes iq itself
+        // meaningless, but the winding current is real either way. The commanded
+        // value stays in the max() so the original case (current pushed into a
+        // rotor that never moves) is still covered. VESC has no stall fault at
+        // all, so there is nothing to match here; its nearest relative,
+        // FAULT_CODE_UNBALANCED_CURRENTS, is likewise a measurement check.
+        const float stall_i = fmaxf(fabsf(iq_set), peak_phase_current());
+        // _hall_erpm_eff, not _hall_omega: the latter is now the last observed
+        // sector rate and persists, so it no longer collapses when the rotor
+        // stops. The decayed estimate is what actually means "not turning".
+        stalled = (_state == State::HALL) && (_hall_erpm_eff < 10.0f) && (stall_i > _stall_i);
     } else {
         stalled = (_state == State::CLOSED) && (fabsf(_obs_omega) < _stall_w) && (fabsf(iq) > _stall_i);
     }
@@ -1644,6 +1755,7 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
     _t_duty  = sqrtf(m_alpha * m_alpha + m_beta * m_beta); // modulation depth (1.0 ≈ full)
     _t_erpm  = omega_ctrl * _w_to_erpm;
     _t_theta = theta;
+    _t_iq_cmd = iq_cmd;
 }
 
 // Dead-time voltage error projected into αβ, for subtracting from the commanded
@@ -1721,12 +1833,33 @@ void MotorControl::speed_pll_run(float phase)
     const float delta = wrap_pi(phase - _spd_pll_theta);
     _spd_pll_theta = wrap_pi(_spd_pll_theta + (_spd_pll_omega + _pll_kp * delta) * _dt);
     _spd_pll_omega += _pll_ki * delta * _dt;
+
+    // Low-latency speed estimate — VESC mcpwm_foc.c:3826. A plain finite
+    // difference of the SAME angle, clamped to one sector per tick so a 60°
+    // commutation step can't read as an enormous speed, then heavily low-passed.
+    // Independent of the PLL: it cannot wind up, because it never integrates.
+    float diff = wrap_pi(phase - _spd_phase_prev);
+    diff = clampf(diff, -PI_F / 3.0f, PI_F / 3.0f);
+    _speed_est_fast += ((diff / _dt) - _speed_est_fast) * 0.01f;   // UTILS_LP_FAST(.., 0.01)
+    _spd_phase_prev = phase;
+
+    // PLL wind-up protection — VESC mcpwm_foc.c:3840, verbatim in intent:
+    //     utils_truncate_number_abs(&m_pll_speed, fabsf(m_speed_est_fast) * 3.0);
+    // The PLL integrates an angle error, so anything that feeds it a sustained
+    // bogus angle — a glitch hall edge, an angle racing at a bad rate, a frozen
+    // frame — winds its speed away from reality with nothing to pull it back.
+    // That matters more here than in VESC: this speed picks the hall/observer
+    // blend AND sets the direction the current bounds are applied in, so a wound
+    // up PLL corrupts the angle source and the torque limits at the same time.
+    // Bounding it to 3x an estimate that cannot integrate keeps it honest.
+    const float pll_lim = fabsf(_speed_est_fast) * 3.0f;
+    _spd_pll_omega = clampf(_spd_pll_omega, -pll_lim, pll_lim);
 }
 
 // Ortega flux-linkage observer (vedderb/bldc foc_observer_update).
 //   x_dot = v − R·i + (γ/2)·(x − L·i)·(λ² − |x − L·i|²)
 //   θ     = atan2(x2 − L·iβ, x1 − L·iα)
-// L and R are the per-phase values pre-scaled by 3/2 in init.
+// L and R are the per-phase values, unscaled — see init().
 void MotorControl::observer_update(float v_alpha, float v_beta, float i_alpha, float i_beta)
 {
     // VESC-style speed/duty-scaled observer gain (m_gamma_now duty map): gain is
@@ -1747,7 +1880,17 @@ void MotorControl::observer_update(float v_alpha, float v_beta, float i_alpha, f
     _obs_x1 += (v_alpha - _obs_R * i_alpha + gamma_half * e1 * err) * _dt;
     _obs_x2 += (v_beta  - _obs_R * i_beta  + gamma_half * e2 * err) * _dt;
 
-    const float theta = atan2f(_obs_x2 - L_ib, _obs_x1 - L_ia);
+    float theta = atan2f(_obs_x2 - L_ib, _obs_x1 - L_ia);
+
+    // Compensate the phase lag from running the loop at a finite switching
+    // frequency — VESC mcpwm_foc.c:3451:
+    //     m_phase_now_observer += m_pll_speed * dt * (0.5 + foc_observer_offset)
+    // foc_observer_offset defaults to -1.0, so the net factor is -0.5: VESC
+    // RETARDS by half a cycle by default. _spd_pll_omega is last cycle's here,
+    // exactly as VESC's m_pll_speed is (its PLL also runs after the observer).
+    // Small at our speeds (~0.3° at 1800 eRPM, ~1.2° at 8000) but free, and it
+    // grows with the ERPM range this board is meant to reach.
+    theta = wrap_pi(theta + _spd_pll_omega * _dt * OBS_LAG_TICKS);
 
     // Speed via a VESC-style PLL (foc_pll_run): a tracking loop locks _pll_theta
     // onto the observer angle, and its integrator IS the speed estimate. Unlike
@@ -1957,12 +2100,25 @@ bool MotorControl::run_sensorless(Mode mode, float dir, float iq_cmd,
 // Raw 3-bit hall state from the J304 GPIOs: A=PB11, B=PB7, C=PB10 (all GPIOB).
 uint8_t MotorControl::read_hall_state() const
 {
-    const uint32_t idr = palReadPort(GPIOB);
-    uint8_t s = 0;
-    if (idr & (1u << 11)) s |= 0x1;   // Hall A
-    if (idr & (1u << 7))  s |= 0x2;   // Hall B
-    if (idr & (1u << 10)) s |= 0x4;   // Hall C
-    return s;
+    // Per-line majority vote over HALL_SAMPLES back-to-back reads, taken inside
+    // this one call — vedderb/bldc utils_read_hall_hw() (util/utils_sys.c:92),
+    // which samples 1 + 2*m_hall_extra_samples times and thresholds each line at
+    // half. VESC's default extra_samples is 3, i.e. 7 reads, so that is what we
+    // take. A single read cannot tell a real edge from a switching-noise spike,
+    // and the multi-cycle debounce below does not help: a spike that holds for
+    // two ISR cycles satisfies it and commits, yielding a sector time far shorter
+    // than physical and a hall RATE tens of times too high (observed: -40000 eRPM
+    // against a true -842). Voting rejects the spike where it happens instead.
+    constexpr uint8_t HALL_SAMPLES = 7;
+    uint8_t a = 0, b = 0, c = 0;
+    for (uint8_t i = 0; i < HALL_SAMPLES; i++) {
+        const uint32_t idr = palReadPort(GPIOB);
+        if (idr & (1u << 11)) a++;    // Hall A
+        if (idr & (1u << 7))  b++;    // Hall B
+        if (idr & (1u << 10)) c++;    // Hall C
+    }
+    constexpr uint8_t THRES = HALL_SAMPLES / 2;
+    return uint8_t((a > THRES ? 0x1 : 0) | (b > THRES ? 0x2 : 0) | (c > THRES ? 0x4 : 0));
 }
 
 // A 3-hall motor has exactly six valid states (the two it never enters stay
@@ -2003,6 +2159,60 @@ void MotorControl::update_hall_table_valid()
     _hall_table_valid = ok;
 }
 
+// VESC's direction-aware current bounds, with a rate limit on RELAXATION.
+//
+// The bounds themselves are exactly VESC's (mcpwm_foc.c:3651-3655):
+//     mod_q > 0 : iq in [ lo_current_min,  lo_current_max]
+//     mod_q < 0 : iq in [-lo_current_max, -lo_current_min]
+// i.e. l_current_max is the MOTORING ceiling and l_current_min the BRAKING one
+// whichever way the motor turns. VESC's direction proxy is mod_q_filter, the
+// low-passed q-axis modulation; we use omega_ctrl (PLL speed) instead, which
+// carries the same sign for a machine whose vq is dominated by back-EMF.
+//
+// What is NOT VESC's is the rate limit, and it has to be ours, because the
+// situation cannot arise upstream: stock configs set l_current_min =
+// -l_current_max, so both branches yield the SAME pair and the switch at the
+// direction change is a no-op. Nothing in update_override_limits() (mc_interface.c)
+// smooths it either — the deratings there are thermal, duty, input-current and
+// rpm-limit, none of them a zero-crossing fade — because with symmetric limits
+// there is nothing to smooth.
+//
+// Ours are deliberately asymmetric (I_MAX 15 A vs I_REGEN 5 A), which turns that
+// no-op into a cliff. Driving a reversal straight through zero, the reference is
+// pinned at -I_REGEN all the way down, and the tick the direction sign flips the
+// lower bound jumps -5 A -> -15 A, handing the already-waiting setpoint a 3x step
+// (worse if the bus rose during the brake and ov_scale folded the braking ceiling
+// further). It lands where the commutation angle is least trustworthy: hall
+// transitions have stopped so the angle is extrapolated, and the dead-time
+// correction's current-sign inputs are crossing zero.
+//
+// So the bounds keep VESC's values and only their RELAXATION is ramped, at the
+// existing torque slew rate (VESC's l_current_ramp analogue — ramping a setpoint
+// so it cannot step is VESC's own idiom, applied here to the bound instead).
+// Tightening stays instant in both directions: a bound that just got smaller is
+// a limit doing its job — OV foldback, thermal derate, entering braking — and
+// must bite on the same tick, never a slew later.
+float MotorControl::apply_current_bounds(float iq_cmd, float omega_ctrl, float i_max, float ov_scale)
+{
+    const float rl = _regen_max * ov_scale;   // braking ceiling (VESC |l_current_min|)
+    // At exactly zero the product test is ambiguous; >= 0 keeps the standstill
+    // case on the forward branch, matching VESC's `if (mod_q > 0.0) ... else`
+    // only in that both give a definite pair rather than skipping the clamp.
+    const float lo_t = (omega_ctrl >= 0.0f) ? -rl    : -i_max;
+    const float hi_t = (omega_ctrl >= 0.0f) ?  i_max :  rl;
+
+    if (!_iq_bounds_seeded || _i_slew_per_tick <= 0.0f) {
+        _iq_lo = lo_t;
+        _iq_hi = hi_t;
+        _iq_bounds_seeded = true;
+    } else {
+        // lo tightens by rising toward 0, loosens by falling; hi is the mirror.
+        _iq_lo = (lo_t > _iq_lo) ? lo_t : step_towards(_iq_lo, lo_t, _i_slew_per_tick);
+        _iq_hi = (hi_t < _iq_hi) ? hi_t : step_towards(_iq_hi, hi_t, _i_slew_per_tick);
+    }
+    return clampf(iq_cmd, _iq_lo, _iq_hi);
+}
+
 // Decode + debounce the halls, and produce an interpolated commutation angle
 // (_hall_theta) plus a speed estimate from transition timing (_hall_omega).
 // Validity is table-driven: any of the 8 states can be legal (some motors use
@@ -2010,51 +2220,193 @@ void MotorControl::update_hall_table_valid()
 // — i.e. one that never appeared during detection, or a genuine glitch.
 bool MotorControl::update_hall()
 {
+    // Already majority-voted across 7 reads inside read_hall_state(), so it is
+    // used immediately — VESC does the same and has no second, multi-cycle
+    // stability gate. The one we used to have was worse than useless: a spike
+    // holding two ISR cycles (100 us) satisfied it and committed anyway, while
+    // sustained chatter reset it every sample and could freeze _hall_state
+    // indefinitely with update_hall() still returning true.
     const uint8_t raw = read_hall_state();   // 0..7, all potentially valid
-
-    // Debounce: commit a new state only after HALL_DEBOUNCE identical raw reads.
-    if (raw == _hall_raw_prev) {
-        if (_hall_deb < HALL_DEBOUNCE) _hall_deb++;
-    } else {
-        _hall_raw_prev = raw;
-        _hall_deb = 0;
-    }
 
     _hall_ticks++;
 
-    if (_hall_deb >= HALL_DEBOUNCE && raw != _hall_state) {
+    if (raw != _hall_state) {
         const float ang = _hall_table[raw];
         if (isnan(ang)) {
             return false;   // table has no angle for this state → not calibrated
         }
         if (_hall_state == HALL_NONE) {
-            // First fix: no previous edge, so no speed yet — sit at the centre.
+            // First fix: the angle is re-established from this sector, but the
+            // RATE carries over (VESC re-inits m_ang_hall_int_prev only, never
+            // m_hall_dt_diff_last). Zeroing it here froze the frame for a whole
+            // sector after every re-arm — at speed, long enough to build tens of
+            // amps. Whatever the last sector rate was is a far better estimate of
+            // "how fast is this turning" than zero, and the ±60° clamp on the
+            // interpolation bounds how wrong it can get before the next edge.
             _hall_base  = ang;
-            _hall_dir   = 1.0f;
-            _hall_omega = 0.0f;
+            _hall_dir   = (_hall_omega >= 0.0f) ? 1.0f : -1.0f;
+            _hall_theta    = ang;   // seed the integrator at the sector centre
             _hall_theta_rl = ang;   // first fix: snap, nothing to slew from
+            // _hall_ticks is deliberately NOT restarted. A re-fix happens
+            // wherever the rotor happens to be INSIDE a sector, not at a
+            // boundary, so restarting the clock here would time the next real
+            // edge over only the REMAINDER of that sector and read the rate as
+            // however many times too fast that remainder is short. VESC zeroes
+            // its equivalent accumulator (m_hall_dt_diff_now) at exactly one
+            // place — foc_math.c:634, inside the genuine transition branch —
+            // and pointedly not in the re-init branch above it. Leaving the
+            // clock running makes the first post-re-arm sector read too SLOW
+            // instead, which is the safe direction: a slow rate lags inside the
+            // sector, where a fast one races to the bound. The second edge
+            // measures a whole sector and is correct.
         } else {
-            // Direction + speed from the 60° step between sector centres.
+            // Direction + speed from the step between sector centres.
             const float d   = wrap_pi(ang - _hall_table[_hall_state]);
-            _hall_dir       = (d >= 0.0f) ? 1.0f : -1.0f;
+            const float dir_new = (d >= 0.0f) ? 1.0f : -1.0f;
+            // Did the rotor just turn round? _hall_dir still holds the direction
+            // of the PREVIOUS step, so compare before overwriting it.
+            const bool  dir_changed = (dir_new != _hall_dir);
             const float dts = float(_hall_ticks) * _dt;
-            _hall_omega     = (dts > 1e-6f) ? (_hall_dir * HALL_SECTOR / dts) : 0.0f;
-            // The rotor just crossed into this sector, so it is one half-sector
-            // before the centre (in the direction of travel).
-            _hall_base      = wrap_pi(ang - _hall_dir * HALL_HALF_SECTOR);
+            _hall_ticks = 0;   // only a real edge-to-edge interval restarts the clock
+            // A sector timed at a small fraction of the previous one is not a
+            // rotor that quadrupled its speed in one sector — it is a spike that
+            // survived the vote. Counted, not rejected: rejecting an edge risks
+            // discarding a real one during a genuine hard reversal, and the
+            // interpolation is already bounded to the live sector so a bad rate
+            // can no longer move the angle out of it. A nonzero count in the trip
+            // snapshot says the hall wiring/filtering still needs work.
+            if (_hall_omega != 0.0f && !dir_changed) {
+                const float dts_prev = HALL_SECTOR / fabsf(_hall_omega);
+                // Half, not a quarter: the run that exposed this sat at 2.8x
+                // and slipped under a 4x threshold unnoticed. Halving a sector
+                // in one sector is an implausible acceleration at any speed this
+                // board reaches.
+                if (dts < dts_prev * 0.5f && _hall_glitch < 65535) {
+                    _hall_glitch++;
+                }
+            }
+            // dts only measures a speed if the rotor actually crossed a whole
+            // sector. When the direction just reversed it did not: the rotor
+            // turned round somewhere inside the sector and came back out of the
+            // edge it entered by, so dts times an arbitrarily short partial
+            // crossing. Dividing a full sector width by it manufactures a huge
+            // rate. VESC refuses to time that case at all (foc_math.c:622-633):
+            //
+            //     // This is only valid if the direction did not just change. If it
+            //     // did, we use the last speed together with the sign right now.
+            //     if (SIGN(diff) == SIGN(m_hall_dt_diff_last)) { ...time it... }
+            //     else { m_hall_dt_diff_last = -m_hall_dt_diff_last; }
+            //
+            // i.e. keep the magnitude, flip the sign. Timing it unconditionally is
+            // what produced hall=-22806 against pll=-4387 (5.2x) on a transition
+            // clocked at 13 ticks when a genuine crossing at that speed takes
+            // 36-68. The glitch counter never saw it because it compares against
+            // the PREVIOUS sector, which a reversal also shortens.
+            //
+            // dts timed the sector we just LEFT, and it is credited a fixed 60 deg
+            // exactly as VESC does (rad_per_sec_hall = (M_PI/3.0)/dt_diff_last,
+            // foc_math.c:597). A per-sector width table was tried here and
+            // REMOVED: measured at steady cruise against the PLL, this motor's
+            // sectors are 57-66 deg, i.e. near enough uniform that 60 is within
+            // 10%, while the detected width table was out by up to 40% and made
+            // the rate worse than the nominal it replaced.
+            if (dir_changed) {
+                _hall_omega = -_hall_omega;          // same speed, new sign
+            } else {
+                _hall_omega = (dts > 1e-6f) ? (dir_new * HALL_SECTOR / dts) : 0.0f;
+            }
+            _hall_dir       = dir_new;
+            // The rotor just crossed the BOUNDARY between the old sector and the
+            // new one, so that is where the angle is re-based. VESC forms exactly
+            // that point as the midpoint of the two table angles
+            // (foc_math.c:635-640):
+            //
+            //     // A transition was just made. The angle is in the middle of
+            //     // the new and old angle.
+            //     int ang_avg = motor->m_ang_hall_int_prev + diff / 2;
+            //
+            // Two reasons this beats the old `ang - _hall_dir * HALL_HALF_SECTOR`:
+            //
+            //  1. It is direction-free. `d` already carries the sign, so the same
+            //     expression is right travelling either way and no separate
+            //     direction term can misplace it. The old form needed _hall_dir to
+            //     agree with the motion; during a reversal that is precisely the
+            //     quantity that is momentarily stale, and disagreement puts the
+            //     base on the wrong edge — a full sector out. VESC calls out this
+            //     same 60° direction-change trap in the comment quoted below.
+            //
+            // The two forms are algebraically identical for a uniform 60 deg
+            // table, which is what this motor has, so what the change actually
+            // buys is removing the stale-direction hazard — not a geometry
+            // correction. dir_new is derived from d two lines up, on this same
+            // tick, so it cannot be stale here.
+            _hall_base      = wrap_pi(ang - dir_new * HALL_HALF_SECTOR);
+            _hall_theta     = _hall_base;   // integrator restarts at the boundary
             // A genuine sector transition = confirmed rotor motion; count it so
             // the break-away current clamp releases once the rotor is turning.
             if (_hall_move_count < 255) _hall_move_count++;
         }
         _hall_state = raw;
-        _hall_ticks = 0;
     }
 
-    // Interpolate within the sector, capped at ±60° so a missed edge can't let
-    // the angle run away past the next sector.
-    float adv = _hall_omega * (float(_hall_ticks) * _dt);
-    adv = clampf(adv, -HALL_SECTOR, HALL_SECTOR);
-    _hall_theta = wrap_pi(_hall_base + adv);
+    // Interpolate within the sector. VESC (foc_math.c:645) forms the implied
+    // speed from the LONGER of "time since the last transition" and "duration of
+    // the last sector", and below foc_hall_interp_erpm abandons interpolation
+    // for the raw sector centre:
+    //
+    //     // Don't interpolate on very low speed, just use the closest hall sensor.
+    //     // The reason is that we might get stuck at 60 degrees off if a direction
+    //     // change happens between two steps.
+    //
+    // The centre is at worst a half-sector off and never on the wrong side, where
+    // a frozen boundary after a reversal is wrong by a whole sector.
+    const float dt_now  = float(_hall_ticks) * _dt;
+    const bool  omega_known = fabsf(_hall_omega) > 1e-6f;
+    // Every "how far is a sector" question below is about the sector we are IN.
+    // A nominal 60 deg, as VESC assumes — see the HALL_SECTOR note above.
+    const float w_cur   = HALL_SECTOR;
+    const float dt_last = omega_known ? (w_cur / fabsf(_hall_omega)) : 0.0f;
+    // fmax(dt_now, dt_last) is VESC's: once the time SINCE the last edge exceeds
+    // the duration OF the last sector, the implied speed decays on its own. That
+    // is what retires a stale rate — gracefully, and without ever confusing
+    // "unknown" with "stopped". It replaces the old HALL_STOP_S hard zeroing.
+    const float dt_slow = fmaxf(dt_now, dt_last);
+    _hall_erpm_eff = (omega_known && dt_slow > 1e-6f)
+                         ? ((w_cur / dt_slow) * _w_to_erpm) : 0.0f;
+    if (_hall_state != HALL_NONE && _hall_erpm_eff < _hall_interp_erpm) {
+        _hall_theta = _hall_table[_hall_state];   // too slow/stale to interpolate
+    } else {
+        // VESC's structure (foc_math.c:652-659): m_ang_hall is an INTEGRATOR that
+        // advances by rad_per_sec_hall*dt, re-based at each transition, and when it
+        // runs away from the live sector it is not clamped but eased back:
+        //
+        //     diff = angle_difference(m_ang_hall, ang_hall_now);
+        //     if (|diff| < 2π/12 || SIGN(diff) != SIGN(rad_per_sec_hall)) {
+        //         m_ang_hall += rad_per_sec_hall * dt;   // Do interpolation
+        //     } else {
+        //         // We are too far away with the interpolation
+        //         m_ang_hall -= diff * 0.01;
+        //     }
+        //
+        // The old code recomputed base + omega*dt_now and hard-clamped the result,
+        // which parks the angle ON the sector edge for the remainder of the sector
+        // — a standing half-sector error rather than a decaying one. Two separate
+        // trips came back with hall=49 to the degree, which is table[1]=79 minus
+        // exactly the clamp: the tell that the angle was pinned, not tracking.
+        //
+        // The 2π/12 in VESC is its uniform 30° half-sector, which is what we use
+        // too. The second half of the test is what lets a lagging angle catch up:
+        // if the error points opposite to travel, interpolation is still closing
+        // the gap and must continue.
+        const float centre = _hall_table[_hall_state];
+        const float diff   = wrap_pi(_hall_theta - centre);
+        if (fabsf(diff) < 0.5f * w_cur ||
+            (diff >= 0.0f) != (_hall_omega >= 0.0f)) {
+            _hall_theta = wrap_pi(_hall_theta + _hall_omega * _dt);
+        } else {
+            _hall_theta = wrap_pi(_hall_theta - diff * 0.01f);
+        }
+    }
 
     // Rate-limit the commutation angle — vedderb/bldc foc_correct_hall():
     //     angle_step = max(|erpm_hall|, foc_hall_interp_erpm)/60 · 2π · dt · 1.5
@@ -2078,14 +2430,6 @@ bool MotorControl::update_hall()
         _hall_theta_rl = wrap_pi(_hall_theta_rl + ((ang_diff >= 0.0f) ? step : -step));
     }
 
-    // No transition for a while → the rotor has stopped (or is turning too
-    // slowly to time); drop the speed estimate. Only the hall→observer blend
-    // reads this; the outer loops close on _spd_pll_omega, which stays
-    // continuous here (VESC S_PID_SPEED_SRC_PLL).
-    if (float(_hall_ticks) * _dt > HALL_STOP_S) {
-        _hall_omega = 0.0f;
-    }
-
     _t_hall_state = _hall_state;
     return true;
 }
@@ -2093,7 +2437,7 @@ bool MotorControl::update_hall()
 // Kick off a hall-table detection spin (thread context; call at standstill).
 // Self-terminating after HD_REVS; the caller should not run the comms failsafe
 // while it is in progress (it would coast the spin early).
-void MotorControl::start_hall_detect()
+void MotorControl::start_hall_detect(float amps)
 {
     // Refuse while a trip is latched rather than clearing it: detection drives
     // real current into the motor, so the host must release the fault (command
@@ -2101,10 +2445,27 @@ void MotorControl::start_hall_detect()
     if (!_initialized || _fault_latched) {
         return;
     }
+    // Caller-supplied current wins; 0 keeps the configured default. Clamped to
+    // current_max exactly as the configured value is, so the wire cannot ask for
+    // more than the stage is rated to hold.
+    if (amps > 0.0f) {
+        _hd_current = (amps < _current_max) ? amps : _current_max;
+    }
     for (uint8_t k = 0; k < 8; k++) {
         _hd_sin[k] = _hd_cos[k] = 0.0f;
         _hd_n[k] = 0;
     }
+    // Soften the current loop for the spin, VESC commands.c:2247. Saved here and
+    // restored in reset_control(), which every exit from HALL_DETECT passes
+    // through — normal completion (hold_off), a trip (trip_fault) and stop().
+    if (!_hd_gains_saved) {
+        _hd_kp_save    = _cur_kp;
+        _hd_ki_save    = _cur_ki;
+        _hd_gains_saved = true;
+    }
+    _cur_kp    = HD_CUR_KP;
+    _cur_ki    = HD_CUR_KI;
+    _cur_ki_dt = _cur_ki * _dt;
     _hd_angle = 0.0f;
     _hd_ticks = 0;
     _hall_detect_done = false;

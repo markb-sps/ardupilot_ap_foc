@@ -65,10 +65,11 @@ public:
         // calibrated, so a bad angle can't hold near-DC current in one leg long
         // enough to cook a FET before the HALL stall trip fires. See run loop.
         float hall_breakaway_a   = 4.0f;
-        // Hall-table detection spin current [A], d-axis, current-regulated (VESC
+        // DEFAULT hall-table detection spin current [A], used only when the
+        // detect command does not carry one. d-axis, current-regulated (VESC
         // mcpwm_foc_hall_detect uses current control, not fixed voltage, so an
         // unloaded low-R motor can't draw a large spin current). Clamped to
-        // current_max in init.
+        // current_max in init, as is any value supplied on the wire.
         float hall_detect_a      = 5.0f;
 
         // ── PWM / current sense ────────────────────────────────────────────
@@ -390,7 +391,13 @@ public:
     // Start a hall-table detection spin: forces a slow open-loop electrical
     // rotation and records the forced angle seen in each hall state, then stores
     // the result into the live hall table and coasts. Call only at standstill.
-    void start_hall_detect();
+    // amps <= 0 uses cfg.hall_detect_a. VESC takes this from the wire
+    // (COMM_DETECT_HALL_FOC carries it, commands.c:2245) — it is the current
+    // that has to overcome the motor's cogging to hold the rotor at the forced
+    // angle, so it is a property of the MOTOR under test, not of the firmware.
+    void start_hall_detect(float amps = 0.0f);
+    // Current the next/last detection spin runs at [A], after clamping.
+    float hall_detect_current() const { return _hd_current; }
     // True while a detection spin owns the motor. The throttle arbiter MUST
     // stand off on this: the spin is self-terminating and takes several seconds,
     // and any set_current() reaching the controller meanwhile lands on the
@@ -462,6 +469,24 @@ public:
     float get_erpm()          const { return _t_erpm; }    // electrical RPM
     float get_estimated_angle() const { return _t_theta; }     // control angle [rad]
     float get_observer_angle()  const { return _t_obs_theta; } // observer angle [rad]
+
+// ─── FOC_WATCH ─── temporary diagnostic, remove as a unit ────────────────────
+// Live angle/current stream behind the `watch` terminal command, added to settle
+// whether the standing hall-vs-observer disagreement is a frame offset or an
+// observer-parameter error. Everything belonging to it is bracketed by FOC_WATCH
+// markers in MotorControl.h/.cpp and VescTelemetry.h/.cpp — set FOC_WATCH to 0 to
+// disable, or delete the four marked blocks to remove it entirely. Nothing in the
+// control path reads any of it.
+#define FOC_WATCH 1
+#if FOC_WATCH
+    // Rate-limited hall commutation angle [rad] — the angle HALL mode actually
+    // commutates with below the blend, as opposed to get_estimated_angle()'s
+    // post-blend result. Plain (non-volatile) ISR-written floats: a single-word
+    // read is atomic on this core and this is diagnostic only.
+    float get_hall_angle() const { return _hall_theta_rl; }
+    float get_hall_erpm()  const { return _hall_omega * _w_to_erpm; }
+#endif
+// ─── end FOC_WATCH ───────────────────────────────────────────────────────────
     // Filtered bus volts from the PA0 divider — or exactly 0 if the ADC has
     // never produced a plausible reading. Reporting 0 rather than the seeded
     // default is deliberate: a silent fallback to cfg.vbus makes a dead sense
@@ -485,6 +510,48 @@ public:
     float get_vbus_max_seen() const { return _vbus_max_seen; }
     float get_fet_temp()      const { return _t_fet_temp; }  // board NTC [°C]
     uint8_t get_fault()       const { return _fault_code; }
+
+    // ── Trip forensics ──────────────────────────────────────────────────────
+    // State latched at the tick a fault tripped, captured inside trip_fault()
+    // before the bridge cut unwinds any of it. Exists because a trip is over in
+    // 50 us: by the time a host polls, the currents have decayed, the angle has
+    // stopped advancing and the mode has been reset, so the ONLY evidence left
+    // is the fault code — which cannot distinguish a genuine overcurrent from a
+    // sense artifact, nor say whether the angle had come apart first.
+    // Every trip overwrites it, so this is the most recent one, not the first.
+    struct FaultSnapshot {
+        bool     valid;
+        uint8_t  code;         // FAULT_* that tripped
+        uint8_t  state;        // State at the trip
+        uint8_t  mode;         // Mode at the trip
+        uint8_t  hall_state;   // raw 3-bit hall word
+        uint32_t hall_ticks;   // ISR samples since the last committed hall state
+        uint16_t hall_glitch;  // sectors timed <1/4 of the previous — surviving hall spikes
+        float    ia, ib, ic;   // live phase currents [A] (the OC test's own inputs)
+        float    i_resid;      // ia+ib+ic — nonzero means a SENSE fault, not a real current
+        float    theta;        // commutation angle used [rad]
+        float    hall_theta;   // rate-limited hall angle [rad]; vs theta = angle divergence
+        float    obs_theta;    // observer angle [rad]
+        float    pll_erpm;     // PLL speed — sign says which side of a zero crossing
+        float    hall_erpm;    // last OBSERVED sector rate (persists; not a live speed)
+        float    hall_eff;     // decayed estimate the interp/stall logic uses
+        float    iq_cmd;       // torque reference after bounds [A]
+        float    id, iq;       // measured dq currents [A] — iq far from iq_cmd = loop lost control
+        float    iq_lo, iq_hi; // the current bounds in force
+        // The current loop's own output. Says who is responsible for a dq
+        // current the command did not ask for: vd OPPOSING id means the loop is
+        // fighting it and losing (gains too low, or theta is not the real rotor
+        // axis so this "d" is not the physical d); vd DRIVING id means the loop
+        // produced it (wound-up integrator, or it regulated against a bad
+        // angle). Those need opposite fixes, and the code cannot be read to
+        // tell which without the numbers.
+        float    vd, vq;       // PI output after the SVPWM clamp [V]
+        float    integ_d, integ_q; // integrator terms alone [V] — windup check
+        float    duty;         // modulation depth (1.0 ~ full) — saturation check
+        float    v_max;        // the SVPWM voltage limit in force [V]
+        float    vbus;         // filtered bus volts
+    };
+    const FaultSnapshot &get_fault_snapshot() const { return _trip; }
     // Fault code for HOST reporting. A trip is often cleared within ~500 ms (the
     // host commands zero, the latch releases), which is far too short for a
     // polling GUI to ever observe — so a trip stays reported for
@@ -542,9 +609,14 @@ public:
     // formula and is wrong the moment VESC Tool writes them independently.
     float get_current_ki() const { return _cur_ki; }
     // Per-phase motor params (unscaled — the observer holds L,R pre-scaled ×1.5).
+    // Report exactly what was configured. The 1/1.5 that used to be here was the
+    // matched inverse of a 3/2 applied in init(); that scaling is gone (it was a
+    // double-count — see init()), so undoing it here would make every MCCONF read
+    // understate R and L, and any read-modify-write round trip would then store
+    // the understated value back and shrink the param by 1.5 each time.
     void  get_motor_lrflux(float &L, float &R, float &flux) const {
-        L    = (_obs_L > 0.0f) ? _obs_L * (1.0f / 1.5f) : 0.0f;
-        R    = _obs_R * (1.0f / 1.5f);
+        L    = _obs_L;
+        R    = _obs_R;
         flux = _obs_lambda;
     }
 
@@ -589,6 +661,9 @@ private:
     // (foc_math.c), run once per control cycle on the angle the bridge is
     // actually commutating with.
     void        speed_pll_run(float phase);
+    // Apply VESC's direction-aware motoring/braking current bounds to a torque
+    // reference, rate-limiting the bounds when they RELAX. See the definition.
+    float       apply_current_bounds(float iq_cmd, float omega_ctrl, float i_max, float ov_scale);
     // Largest |phase current| across U/V/W [A] (lock-free telemetry snapshot).
     float       peak_phase_current() const;
     // False if `target` would hot-swap between active drive modes (CURRENT/
@@ -637,6 +712,15 @@ private:
 
     // ── Commands (written from thread, read in ISR) ────────────────────────
     volatile Mode  _mode        = Mode::STOP;
+    // Rate-limited copies of VESC's direction-aware iq bounds. Held across ISR
+    // cycles so a bound that RELAXES (notably the braking ceiling handing over to
+    // the motoring one as the rotor reverses) opens at the torque slew rate
+    // instead of stepping. _iq_bounds_seeded is cleared whenever the CURRENT
+    // setpoint is reset, so a (re)entry snaps to the true bounds rather than
+    // ramping open from a stale pair. Tightening is always instant.
+    float _iq_lo = 0.0f;
+    float _iq_hi = 0.0f;
+    bool  _iq_bounds_seeded = false;
     volatile float _cmd_current = 0.0f;   // [A] applied (slew-limited) CURRENT setpoint / BRAKE magnitude
     volatile float _cmd_current_target = 0.0f; // [A] raw CURRENT command; _cmd_current slews toward this
     volatile float _cmd_erpm    = 0.0f;   // [electrical RPM]
@@ -773,8 +857,6 @@ private:
     uint8_t _hall_move_count = 0;     // committed transitions since drive re-arm (saturating)
     // Runtime decode state (ISR-only except _t_hall_state snapshot).
     uint8_t  _hall_state    = 0xFF; // committed state (0..7); 0xFF = none yet (0 is a valid state)
-    uint8_t  _hall_raw_prev = 0;    // last raw read (debounce)
-    uint8_t  _hall_deb      = 0;    // consecutive identical raw reads
     float    _hall_dir      = 1.0f; // rotation sign from the last transition
     float    _hall_base     = 0.0f; // interpolation origin (sector entry edge) [rad]
     float    _hall_theta    = 0.0f; // interpolated commutation angle [rad]
@@ -791,6 +873,21 @@ private:
     // outer-loop feedback — use _spd_pll_omega for that.
     float    _hall_omega    = 0.0f;
     uint32_t _hall_ticks    = 0;    // ISR ticks since the last committed transition
+    // Raw hall changes seen since the last COMMITTED state. Chatter resets the
+    // debounce every sample, so nothing ever commits and _hall_state freezes with
+    // update_hall() still returning true — silent. Distinguishes that from the
+    // halls simply going quiet. Diagnostic only; nothing controls off it.
+    uint16_t _hall_glitch = 0;   // see the trip snapshot
+    // Hall speed [eRPM] implied by the LONGER of "time since the last edge" and
+    // "duration of the last sector" (VESC foc_math.c:646). Decays on its own once
+    // edges stop, so it means "not turning" without _hall_omega having to be
+    // destroyed to say so.
+    float _hall_erpm_eff = 0.0f;
+    // Low-latency speed [rad/s] — a clamped finite difference of the commutation
+    // angle, heavily low-passed (VESC m_speed_est_fast). It never integrates, so
+    // it cannot wind up, which is what makes it a valid bound on the PLL.
+    float _speed_est_fast = 0.0f;
+    float _spd_phase_prev = 0.0f;
     uint16_t _hall_fault    = 0;    // consecutive invalid-read samples
     // Hall-table detection accumulators (circular mean of the forced angle seen
     // in each state). _hd_* are only touched during a HALL_DETECT spin.
@@ -806,6 +903,11 @@ private:
     float          _ol_i_angle = 0.0f;   // forced electrical angle [rad]
     volatile float _tone_ipk   = 0.0f;   // peak |i_alpha| since play_tone() [A]
     float    _hd_current    = 5.0f; // detection d-axis current target [A]
+    // Running current-loop gains parked while a detection spin uses VESC's
+    // softened pair; restored by reset_control() on any exit from HALL_DETECT.
+    float    _hd_kp_save     = 0.0f;
+    float    _hd_ki_save     = 0.0f;
+    bool     _hd_gains_saved = false;
     bool     _hall_detect_done = false;
     volatile bool _hall_detect_fresh = false; // set on completion, cleared by take_hall_detect_result()
     float    _hall_detect_deg[8] = {0}; // last detection result [deg]
@@ -861,6 +963,7 @@ private:
 
     // ── Telemetry snapshots (ISR → thread) ─────────────────────────────────
     volatile State   _state      = State::IDLE;
+    FaultSnapshot _trip {};       // see get_fault_snapshot()
     volatile uint8_t _fault_code = FAULT_NONE;
     volatile float   _t_id    = 0.0f;
     volatile float   _t_iq    = 0.0f;
@@ -873,6 +976,7 @@ private:
     volatile float   _t_duty  = 0.0f;
     volatile float   _t_erpm  = 0.0f;
     volatile float   _t_theta = 0.0f;
+    volatile float   _t_iq_cmd = 0.0f;  // torque reference after bounds (trip forensics)
     volatile float   _t_obs_theta = 0.0f;
     volatile float   _t_fet_temp = 0.0f;   // board NTC [°C] (thread-written)
     volatile uint8_t _t_hall_state = 0;    // decoded hall state (1..6)

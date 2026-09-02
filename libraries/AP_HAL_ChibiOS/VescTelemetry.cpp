@@ -24,6 +24,11 @@ constexpr uint8_t COMM_SET_CURRENT = 6;
 constexpr uint8_t COMM_SET_CURRENT_BRAKE = 7;
 constexpr uint8_t COMM_SET_RPM    = 8;
 constexpr uint8_t COMM_TERMINAL_CMD = 20;   // VESC-Tool terminal command (ascii)
+// ─── FOC_WATCH ─── temporary diagnostic, remove as a unit (see MotorControl.h)
+#if FOC_WATCH
+constexpr uint32_t WATCH_HZ = 20;           // `watch` stream rate
+#endif
+// ─── end FOC_WATCH ───────────────────────────────────────────────────────────
 constexpr uint8_t COMM_PRINT        = 21;   // terminal text response
 // Real VESC COMM_PACKET_ID value (datatypes.h: FW_VERSION=0 … SAMPLE_PRINT=19,
 // TERMINAL_CMD=20, PRINT=21, ROTOR_POSITION=22, EXPERIMENT_SAMPLE=23,
@@ -181,6 +186,20 @@ void VescTelemetry::update()
     if (_uart == nullptr) {
         return;
     }
+// ─── FOC_WATCH ─── temporary diagnostic, remove as a unit (see MotorControl.h)
+#if FOC_WATCH
+    if (_watch_until_ms != 0) {
+        const uint32_t now = AP_HAL::millis();
+        if (int32_t(now - _watch_until_ms) >= 0) {
+            _watch_until_ms = 0;
+            send_print("watch off");
+        } else if (int32_t(now - _watch_next_ms) >= 0) {
+            _watch_next_ms = now + (1000U / WATCH_HZ);
+            print_watch();
+        }
+    }
+#endif
+// ─── end FOC_WATCH ───────────────────────────────────────────────────────────
     // Hall-table detection runs asynchronously (a ~12 s current-controlled spin in
     // the ISR — HD_RAMP_S + 2·HD_REVS/HD_HZ). The arbiter stands off for the whole
     // spin on MotorControl::is_hall_detecting(); the _override_ms refresh here is
@@ -561,7 +580,20 @@ void VescTelemetry::handle_set_rpm()
 // result is emitted asynchronously from update() when the spin completes.
 void VescTelemetry::handle_detect_hall()
 {
-    _mc.start_hall_detect();
+    // COMM_DETECT_HALL_FOC carries the detection current as an int32 in
+    // milliamps — VESC commands.c:2245, buffer_get_float32(data, 1e3). It is
+    // what VESC Tool's hall-detection box sends, so ignoring it left that box
+    // doing nothing and the spin pinned to the built-in default. An absent or
+    // nonsensical field falls back to that default rather than to zero current.
+    float amps = 0.0f;
+    if (_payload_len >= 5) {
+        const uint8_t *p = &_payload[1];
+        amps = get_f32(p, 1000.0f);
+        if (!(amps > 0.0f)) {
+            amps = 0.0f;
+        }
+    }
+    _mc.start_hall_detect(amps);
     _hall_detect_pending = true;
     _hall_detect_ms      = AP_HAL::millis();
     _override_ms         = AP_HAL::millis();   // hold the arbiter off during the spin
@@ -587,12 +619,13 @@ void VescTelemetry::print_hall_table()
     send_print(_mc.hall_table_valid()
                    ? "hall table (VALID):"
                    : "hall table (INVALID - run 'hall_detect' with the motor free to spin):");
-    char line[48];
+    char line[64];
     for (uint8_t k = 0; k < 8; k++) {
         if (isnan(deg[k])) {
             hal.util->snprintf(line, sizeof(line), "  state %u: ---", k);
         } else {
-            hal.util->snprintf(line, sizeof(line), "  state %u: %d deg", k, int(deg[k] + 0.5f));
+            hal.util->snprintf(line, sizeof(line), "  state %u: %d deg",
+                               k, int(deg[k] + 0.5f));
         }
         send_print(line);
     }
@@ -749,6 +782,92 @@ void VescTelemetry::send_detect_apply_all(int16_t result)
 
 // VESC-Tool terminal command (ascii payload after the id byte). Minimal set so
 // the hall table can be read/triggered from VESC Tool without MCCONF support.
+// See header. Angles are printed in degrees; the pairs that matter are
+// theta-vs-hall (angle divergence) and iq-vs-iq_cmd (did the loop hold).
+void VescTelemetry::print_trip()
+{
+    const MotorControl::FaultSnapshot &t = _mc.get_fault_snapshot();
+    char line[110];
+    if (!t.valid) {
+        send_print("no trip recorded since boot");
+        return;
+    }
+    const float r2d = 57.2957795f;
+    hal.util->snprintf(line, sizeof(line), "trip fault=%u state=%u mode=%u vbus=%.1f",
+                       unsigned(t.code), unsigned(t.state), unsigned(t.mode), double(t.vbus));
+    send_print(line);
+    // A residual far from zero means the three phases don't sum to zero, i.e. the
+    // SENSE chain is lying — the trip is then an artifact, not a real current.
+    hal.util->snprintf(line, sizeof(line), "  ia=%.1f ib=%.1f ic=%.1f resid=%.2f",
+                       double(t.ia), double(t.ib), double(t.ic), double(t.i_resid));
+    send_print(line);
+    // theta vs hall: how far the angle actually commutated with had drifted from
+    // the halls. hall_erpm 0 with pll_erpm nonzero = transitions had stopped and
+    // the angle was being extrapolated.
+    hal.util->snprintf(line, sizeof(line), "  theta=%.0f hall=%.0f obs=%.0f hstate=%u",
+                       double(t.theta * r2d), double(t.hall_theta * r2d),
+                       double(t.obs_theta * r2d), unsigned(t.hall_state));
+    send_print(line);
+    // Sign of pll_erpm says which side of the zero crossing the trip landed on.
+    // hall = last observed sector rate, eff = the decayed value the logic acts on,
+    // hticks = samples since the last edge. glitch counts sectors timed at under a
+    // quarter of the previous one, i.e. spikes that survived the majority vote —
+    // nonzero means the hall wiring or filtering is still passing noise.
+    hal.util->snprintf(line, sizeof(line), "  pll=%.0f hall=%.0f eff=%.0f hticks=%lu glitch=%u",
+                       double(t.pll_erpm), double(t.hall_erpm), double(t.hall_eff),
+                       (unsigned long)t.hall_ticks, unsigned(t.hall_glitch));
+    send_print(line);
+    // iq far from iq_cmd = the current loop had lost control (angle error), as
+    // opposed to iq tracking a reference that was simply too big.
+    hal.util->snprintf(line, sizeof(line), "  iq_cmd=%.2f iq=%.2f id=%.2f bounds=[%.1f,%.1f]",
+                       double(t.iq_cmd), double(t.iq), double(t.id),
+                       double(t.iq_lo), double(t.iq_hi));
+    send_print(line);
+    // The loop's own output, for a dq current nobody commanded. Read vd against
+    // the SIGN of id above: opposing = the loop is fighting the current and
+    // losing, driving = the loop made it. int_d is the integrator alone, so
+    // int_d near +/-vmax is windup. duty near 1.0 means the vector was clamped,
+    // in which case vd/vq are the clamp's output and not the PI's intent.
+    hal.util->snprintf(line, sizeof(line),
+                       "  vd=%.2f vq=%.2f int_d=%.2f int_q=%.2f duty=%.2f vmax=%.1f",
+                       double(t.vd), double(t.vq), double(t.integ_d),
+                       double(t.integ_q), double(t.duty), double(t.v_max));
+    send_print(line);
+}
+
+// ─── FOC_WATCH ─── temporary diagnostic, remove as a unit (see MotorControl.h)
+#if FOC_WATCH
+// One sample line. Angles in degrees; t is the angle actually commutated with,
+// h the hall angle, o the observer's. o-h is the disagreement being chased, and
+// its SIGN against the sign of e is the whole point of the exercise.
+void VescTelemetry::print_watch()
+{
+    char line[128];
+    const float r2d = 57.2957795f;
+    float id = 0.0f, iq = 0.0f, vd = 0.0f, vq = 0.0f;
+    _mc.get_idq(id, iq);
+    // vd/vq are what lets lambda be back-solved OFF a trip: at constant speed
+    // di/dt ~ 0, so E = V - I*Z holds and |E|/omega is the flux linkage with no
+    // transient term to argue about. Mid-trip the L*di/dt term is the same size
+    // as the d-axis result, so only a steady cruise settles it.
+    _mc.get_vdq(vd, vq);
+    const float h = _mc.get_hall_angle() * r2d;
+    const float o = _mc.get_observer_angle() * r2d;
+    float dif = o - h;
+    while (dif > 180.0f)  { dif -= 360.0f; }
+    while (dif < -180.0f) { dif += 360.0f; }
+    hal.util->snprintf(line, sizeof(line),
+                       "w t=%.0f h=%.0f o=%.0f d=%.0f e=%.0f he=%.0f id=%.1f iq=%.1f "
+                       "vd=%.2f vq=%.2f s=%u",
+                       double(_mc.get_estimated_angle() * r2d), double(h), double(o), double(dif),
+                       double(_mc.get_erpm()), double(_mc.get_hall_erpm()),
+                       double(id), double(iq), double(vd), double(vq),
+                       unsigned(_mc.get_hall_state()));
+    send_print(line);
+}
+#endif
+// ─── end FOC_WATCH ───────────────────────────────────────────────────────────
+
 void VescTelemetry::handle_terminal()
 {
     char cmd[48];
@@ -762,15 +881,46 @@ void VescTelemetry::handle_terminal()
     }
 
     if (strncmp(cmd, "hall_detect", 11) == 0) {
-        _mc.start_hall_detect();
+        // Optional current argument: "hall_detect [amps]". Same knob as the wire
+        // command, because the terminal is how this is actually triggered here.
+        const float det_a = strtof(cmd + 11, nullptr);
+        _mc.start_hall_detect((det_a > 0.0f) ? det_a : 0.0f);
         _hall_detect_pending = true;
         _hall_detect_ms      = AP_HAL::millis();
         _override_ms         = AP_HAL::millis();
-        send_print("hall detect started (~12 s); keep the motor free to spin, then run 'hall'");
+        hal.util->snprintf(line, sizeof(line),
+                           "hall detect started at %.1f A (~12 s); keep the motor free to spin, then run 'hall'",
+                           double(_mc.hall_detect_current()));
+        send_print(line);
     } else if (strncmp(cmd, "hall", 4) == 0) {
         print_hall_table();
     } else if (strncmp(cmd, "diag", 4) == 0) {
         print_diag();
+    } else if (strncmp(cmd, "trip", 4) == 0) {
+        print_trip();
+// ─── FOC_WATCH ─── temporary diagnostic, remove as a unit (see MotorControl.h)
+#if FOC_WATCH
+    } else if (strncmp(cmd, "watch", 5) == 0) {
+        // "watch [seconds]": no argument = 10 s, an argument of 0 (or less)
+        // stops it, anything else runs for that many seconds. Capped so a
+        // forgotten stream can never sit on the link indefinitely.
+        const char *arg = cmd + 5;
+        while (*arg == ' ') { arg++; }
+        const bool has_arg = (*arg != 0);
+        long secs = has_arg ? strtol(arg, nullptr, 10) : 10;
+        if (has_arg && secs <= 0) {
+            _watch_until_ms = 0;
+            send_print("watch off");
+        } else {
+            if (secs > 120) { secs = 120; }
+            _watch_until_ms = AP_HAL::millis() + uint32_t(secs) * 1000U;
+            _watch_next_ms  = AP_HAL::millis();
+            hal.util->snprintf(line, sizeof(line), "watch on for %ld s at %u Hz",
+                               secs, unsigned(WATCH_HZ));
+            send_print(line);
+        }
+#endif
+// ─── end FOC_WATCH ───────────────────────────────────────────────────────────
     } else if (strncmp(cmd, "beep", 4) == 0) {
         // On-demand tone: "beep [freq_hz] [amp] [ms]". The power-on chime is the
         // only thing known to push current through the windings on a board that
@@ -791,7 +941,7 @@ void VescTelemetry::handle_terminal()
                            double(freq), double(amp), ms);
         send_print(line);
     } else {
-        send_print("commands: hall | hall_detect | diag | beep [hz] [amp] [ms]");
+        send_print("commands: hall | hall_detect [A] | diag | trip | watch [s] | beep [hz] [amp] [ms]");
     }
 }
 

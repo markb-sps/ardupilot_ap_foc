@@ -187,7 +187,8 @@ private:
     // ── Throttle-source arbiter state (each stamps its latest torque + time) ──
     float    _can_amps  = 0.0f;   // last DroneCAN RawCommand torque [A]
     uint32_t _can_ms    = 0;      // millis() of that command (0 = none yet)
-    float    _pwm_amps  = 0.0f;   // last valid PWM-derived torque [A], always ≥ 0
+    float    _pwm_amps  = 0.0f;   // last valid PWM-derived torque [A]; signed, negative
+                                  // = reverse, but a magnitude when _pwm_brake
     uint32_t _pwm_ms    = 0;      // millis() of last valid PWM frame (0 = none)
     bool     _pwm_armed = false;  // boot-neutral safety gate for the PWM source
     // Trigger pulled back → _pwm_amps is a BRAKE magnitude for set_brake_current()
