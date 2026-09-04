@@ -50,8 +50,9 @@ private:
                                         const ChibiOS::VescTelemetry::McconfIn &in) {
         static_cast<FOC_ESC *>(ctx)->on_mcconf_write(in);
     }
-    // Sink for VESC Tool "Write App Configuration" — the PPM control type and the
-    // direction-switch speed ceiling. Same reboot-to-apply model.
+    // Sink for VESC Tool "Write App Configuration" — the PPM control type, the
+    // direction-switch speed ceiling and the PID-mode speed scale. Same
+    // reboot-to-apply model.
     void on_appconf_write(const ChibiOS::VescTelemetry::AppconfIn &in);
     static void appconf_write_trampoline(void *ctx,
                                          const ChibiOS::VescTelemetry::AppconfIn &in) {
@@ -183,19 +184,41 @@ private:
     AP_Float _p_stall_rpm;     // stall speed threshold [eRPM]  (DroneCAN-only)
     AP_Float _p_stall_i;       // stall current threshold [A]   (DroneCAN-only)
     AP_Float _p_stall_t;       // stall dwell before trip [s]   (DroneCAN-only)
+    // Speed control: the throttle→speed scale for the PPM PID modes, plus the
+    // outer speed PID itself. All in VESC's units so a value read out of, or
+    // typed into, VESC Tool means the same thing here.
+    AP_Float _p_pid_erpm;      // full-throttle speed [eRPM]    → app_ppm_conf.pid_max_erpm
+    AP_Float _p_spd_kp;        // speed PID P                   → s_pid_kp
+    AP_Float _p_spd_ki;        // speed PID I                   → s_pid_ki
+    AP_Float _p_spd_kd;        // speed PID D                   → s_pid_kd
+    AP_Float _p_spd_kdf;       // D-term LP coefficient         → s_pid_kd_filter
+    AP_Float _p_spd_minrpm;    // release speed [eRPM]          → s_pid_min_erpm
+    AP_Float _p_spd_ramp;      // setpoint slew [eRPM/s]        → s_pid_ramp_erpms_s
+    AP_Int8  _p_spd_brake;     // allow braking to hold speed   → s_pid_allow_braking
 
     // ── Throttle-source arbiter state (each stamps its latest torque + time) ──
     float    _can_amps  = 0.0f;   // last DroneCAN RawCommand torque [A]
     uint32_t _can_ms    = 0;      // millis() of that command (0 = none yet)
     float    _pwm_amps  = 0.0f;   // last valid PWM-derived torque [A]; signed, negative
-                                  // = reverse, but a magnitude when _pwm_brake
+                                  // = reverse, but a magnitude when PwmOut::BRAKE
+    float    _pwm_erpm  = 0.0f;   // last valid PWM-derived speed setpoint [eRPM]
     uint32_t _pwm_ms    = 0;      // millis() of last valid PWM frame (0 = none)
-    bool     _pwm_armed = false;  // boot-neutral safety gate for the PWM source
-    // Trigger pulled back → _pwm_amps is a BRAKE magnitude for set_brake_current()
-    // rather than a motoring command. Split from the sign of _pwm_amps because the
-    // two dispatch to different MotorControl entry points, and a forward trigger
-    // against a backwards roll is a reduced-magnitude MOTORING command, not a brake.
-    bool     _pwm_brake = false;
+    bool     _pwm_armed = false;  // boot-idle safety gate for the PWM source
+    // Which MotorControl entry point the decoded trigger dispatches to. Not
+    // derivable from the sign of _pwm_amps: a forward trigger against a backwards
+    // roll is a reduced-magnitude MOTORING command rather than a brake, and the
+    // PID control types produce a speed setpoint that is not a current at all.
+    // One enum rather than a pair of bools so "brake and speed at once" cannot
+    // be represented.
+    enum class PwmOut : uint8_t { CURRENT, BRAKE, SPEED };
+    PwmOut   _pwm_out   = PwmOut::CURRENT;
+    // Control type the decode last ran with. PPM_CTRL is read live rather than
+    // latched at boot, so a DroneCAN param write can change it under a running
+    // throttle — and the types disagree about where the idle stick is. Changing
+    // from a centre-idle type to a minimum-idle one with the stick at centre
+    // would otherwise go straight to half throttle, so a change forces a re-arm.
+    // (A change made through VESC Tool reboots anyway; this covers the other path.)
+    uint8_t  _pwm_ctrl_seen = 0xFF;
     // ── CURRENT_BRAKE_REV_HYST gesture state (VESC app_ppm.c statics) ────────
     // force_brake: speed is above the direction-switch ceiling, so back-stick is
     // pure brake whatever the operator does. Starts true, exactly as VESC's

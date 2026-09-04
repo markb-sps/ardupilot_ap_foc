@@ -295,16 +295,37 @@ public:
         // This is what keeps the open-loop hard-switch convergence from blipping.
         float    observer_gain_mod_full  = 0.4f;   // modulation at which gain hits full
         float    observer_gain_slow_frac = 0.25f;  // floor fraction at standstill (VESC foc_observer_gain_slow)
-        // Outer speed PI. NOTE: FOC_ESC::init() OVERRIDES both of these — the
-        // board-specific tuning lives there (Tools/AP_Periph/foc_esc.cpp), and
-        // these values are never what actually runs on the TEST-G4-FOC-ESC.
-        // They differ by 10x/50x from the override, so do not reason about loop
-        // behaviour from the numbers here. Neither set has been tuned against a
-        // real rotor; tune Kp first with Ki = 0 on a speed step, then add Ki.
-        // Anti-windup is back-calculation against the i_max and regen clamps,
-        // not an integrator clamp — see the SPEED branch of the run loop.
-        float    speed_kp      = 0.0005f;  // outer speed PI [A per eRPM]  (overridden)
-        float    speed_ki      = 0.001f;   // outer speed PI [A per eRPM·s] (overridden)
+        // Outer speed PID, in VESC's units so a gain copied from VESC Tool's
+        // "Speed PID" page means here exactly what it means there. VESC's loop
+        // (foc_math.c foc_run_pid_control_speed) computes a NORMALISED output in
+        // [-1, +1] and only scales it by the current ceiling at the very end:
+        //     p = err * kp / 20        d = (err - err_prev) * (kd / dt) / 20
+        //     out = clamp(p + i + d, ±1)          iq = out * i_max
+        //     i  += err * ki * dt / 20             (clamped to ±1)
+        // so the gains are [output fraction per eRPM] and the odd 1/20 is VESC's
+        // own scale factor, kept so the numbers transfer. Working in amps instead
+        // would be the same loop with a different unit, but then every gain would
+        // silently depend on I_MAX and VESC Tool would be lying about the tuning.
+        //
+        // NOTE: FOC_ESC::init() OVERRIDES these from the SPD_* params — the
+        // board-specific tuning lives there (Tools/AP_Periph/foc_esc.cpp), so
+        // these defaults are never what runs on the TEST-G4-FOC-ESC. Neither set
+        // has been tuned against a real rotor; tune Kp first with Ki = 0 on a
+        // speed step, then add Ki. Anti-windup is VESC's: a plain symmetric clamp
+        // of the integral term to the full output range, leaning on the ramped
+        // setpoint below to keep the error small enough that it never runs away.
+        float    speed_kp      = 0.004f;   // VESC s_pid_kp      (overridden)
+        float    speed_ki      = 0.004f;   // VESC s_pid_ki      (overridden)
+        float    speed_kd      = 0.0f;     // VESC s_pid_kd      (overridden)
+        // VESC s_pid_kd_filter: first-order LP on the D term alone, as a per-tick
+        // blend coefficient (1.0 = unfiltered). D on a speed error differentiates
+        // PLL noise, so VESC ships it filtered even with kd at its stock value.
+        float    speed_kd_filter = 0.2f;
+        // VESC s_pid_allow_braking. False forbids the loop from commanding torque
+        // that opposes rotation, so an over-speed coasts down instead of being
+        // braked back to the setpoint. VESC gates on ±20 eRPM of measured speed,
+        // not on the setpoint, so a stopped motor can still be driven either way.
+        bool     speed_allow_braking = true;
         // VESC s_pid_min_erpm. Below this SETPOINT the speed loop resets its
         // integrator and releases the motor (iq = 0) instead of regulating —
         // speed control is meaningless at a speed the feedback cannot resolve,
@@ -356,7 +377,20 @@ public:
     // ── Set-points (thread context) ────────────────────────────────────────
     void set_current(float amps);        // torque control (signed iq). 0 = hold iq=0 (smooth coast) if running, else idle.
     void set_brake_current(float amps);  // regen brake: iq opposite to rotation, |iq|=amps; auto-releases at low speed.
-    void set_rpm(float erpm);            // speed control (signed electrical RPM)
+    // Speed control (signed electrical RPM).
+    //
+    // zero_is_stop picks what a zero command means, because the two callers want
+    // opposite things from it. A host streaming COMM_SET_RPM uses zero as its
+    // explicit stop-and-clear-the-fault command (true, the default). A PPM
+    // throttle in one of VESC's PID modes is instead sitting at its idle stick,
+    // and VESC handles that by ramping the SETPOINT down through the loop —
+    // which brakes the motor on the way — and only releasing once it falls below
+    // s_pid_min_erpm. Passing false reproduces that: the command is taken as a
+    // real setpoint of zero while the motor is still turning, and collapses to
+    // stop() (bridge released, latched trip cleared) once it is below the same
+    // release speed VESC uses. Fault recovery therefore still lives on the idle
+    // stick, it just waits for the motor to actually be stopped.
+    void set_rpm(float erpm, bool zero_is_stop = true);
     void stop();                         // coast + clear latched fault
 
     // Host failsafe: coast if no host packet arrived within command_timeout_ms.
@@ -821,8 +855,14 @@ private:
     float _obs_gamma_half  = 0.0f;   // γ/2 (base, scaled by modulation each cycle)
     float _obs_gain_mod_inv = 0.0f;  // 1 / observer_gain_mod_full
     float _obs_gain_slow_frac = 0.25f; // gain floor fraction at low speed
-    float _spd_kp          = 0.0f;
-    float _spd_ki_dt       = 0.0f;
+    // Outer speed PID, precomputed into VESC's per-tick form (see Config).
+    float _spd_kp          = 0.0f;   // s_pid_kp / 20
+    float _spd_ki_dt       = 0.0f;   // s_pid_ki * dt / 20
+    float _spd_kd_dt       = 0.0f;   // s_pid_kd / dt / 20
+    float _spd_kd_filt     = 1.0f;   // s_pid_kd_filter (1 = unfiltered)
+    float _spd_d_state     = 0.0f;   // filtered D term
+    float _spd_prev_err    = 0.0f;   // previous speed error [eRPM]
+    bool  _spd_allow_brake = true;   // s_pid_allow_braking
     float _spd_ramp_erpm_s = 0.0f;   // speed-setpoint slew rate [eRPM/s]
     float _spd_min_erpm    = 0.0f;   // below this setpoint SPEED releases the motor
     float _spd_set_erpm    = 0.0f;   // ramped speed setpoint (follows _cmd_erpm)

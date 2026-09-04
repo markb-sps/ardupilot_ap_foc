@@ -57,7 +57,25 @@ constexpr uint32_t THR_SOURCE_TIMEOUT_MS = 200;
 // exchanged with the tool needs no translation in either direction.
 constexpr uint8_t PPM_CTRL_CURRENT              = 1;  // "Current"
 constexpr uint8_t PPM_CTRL_CURRENT_NOREV_BRAKE  = 3;  // "Current No Reverse With Brake"
+constexpr uint8_t PPM_CTRL_PID                  = 6;  // "PID Speed Control"
+constexpr uint8_t PPM_CTRL_PID_NOREV            = 7;  // "PID Speed Control No Reverse"
 constexpr uint8_t PPM_CTRL_CURRENT_BRAKE_REV_HYST = 8;  // "Current Hyst Reverse With Brake"
+
+// True for the control types whose idle stick is at MINIMUM pulse rather than
+// centre, because they map the trigger to a one-sided 0..1 command (VESC
+// app_ppm.c:144-151, `servo_val = (servo_val + 1) / 2`). Both the arming gate
+// and the throttle mapping have to agree on where "no command" lives, or a
+// NOREV type would arm at centre — which is already half throttle.
+static inline bool ppm_ctrl_is_norev(uint8_t ctrl)
+{
+    return ctrl == PPM_CTRL_PID_NOREV;
+}
+
+// True for the control types that command a SPEED rather than a current.
+static inline bool ppm_ctrl_is_pid(uint8_t ctrl)
+{
+    return ctrl == PPM_CTRL_PID || ctrl == PPM_CTRL_PID_NOREV;
+}
 
 // ── Power-on chime (played through the motor windings) ──────────────────────
 struct ChimeNote { uint16_t freq_hz; uint16_t ms; };
@@ -204,8 +222,8 @@ const AP_Param::GroupInfo FOC_ESC::var_info[] = {
     AP_GROUPINFO("ERPM_START", 48, FOC_ESC, _p_erpm_start, 0.8f),
     // @Param: PPM_CTRL
     // @DisplayName: PWM throttle control type
-    // @Description: How the RC PWM throttle input is interpreted (VESC app_ppm_conf.ctrl_type, "Control Type" on VESC Tool's App Settings PPM page). Values are VESC's enum, so this matches that dropdown's index. Only three are implemented: 1 = Current (seamless bidirectional — back-stick brakes and then accelerates in reverse through zero with no neutral visit, so a held back-stick WILL launch backwards once the motor stops), 3 = Current No Reverse With Brake (centre is off, back-stick brakes to a stop and no further), 8 = Current Hyst Reverse With Brake (as 3, but braking to a stop, releasing to centre, then braking again enters reverse — gated by DIR_ERPM). Writing any other value from VESC Tool is refused rather than silently substituted.
-    // @Values: 1:Current,3:Current No Reverse With Brake,8:Current Hyst Reverse With Brake
+    // @Description: How the RC PWM throttle input is interpreted (VESC app_ppm_conf.ctrl_type, "Control Type" on VESC Tool's App Settings PPM page). Values are VESC's enum, so this matches that dropdown's index. Five are implemented. Torque types: 1 = Current (seamless bidirectional — back-stick brakes and then accelerates in reverse through zero with no neutral visit, so a held back-stick WILL launch backwards once the motor stops), 3 = Current No Reverse With Brake (centre is off, back-stick brakes to a stop and no further), 8 = Current Hyst Reverse With Brake (as 3, but braking to a stop, releasing to centre, then braking again enters reverse — gated by DIR_ERPM). Speed types, which close the outer speed loop on the trigger and are scaled by PID_ERPM and tuned by the SPD_ parameters: 6 = PID Speed Control (centre is stop, full travel each way is plus or minus PID_ERPM), 7 = PID Speed Control No Reverse (MINIMUM stick is stop, full travel is PID_ERPM forward, and the arming gate moves to the minimum stick to match). Writing any other value from VESC Tool is refused rather than silently substituted.
+    // @Values: 1:Current,3:Current No Reverse With Brake,6:PID Speed Control,7:PID Speed Control No Reverse,8:Current Hyst Reverse With Brake
     // @User: Advanced
     AP_GROUPINFO("PPM_CTRL", 49, FOC_ESC, _p_ppm_ctrl, float(PPM_CTRL_CURRENT_NOREV_BRAKE)),
     // @Param: DIR_ERPM
@@ -214,6 +232,65 @@ const AP_Param::GroupInfo FOC_ESC::var_info[] = {
     // @Units: rpm
     // @User: Advanced
     AP_GROUPINFO("DIR_ERPM", 50, FOC_ESC, _p_dir_erpm, 4000.0f),
+
+    // ── Speed control (VESC app_ppm_conf.pid_max_erpm + the s_pid_* group) ────
+    // Indices 51-58 previously held HALLW0-7, which were AP_Int16 and have been
+    // removed. Reusing the indices is safe because AP_Param matches a stored
+    // record on TYPE as well as key and index (AP_Param::scan), so the orphaned
+    // int16 records cannot be read back as these floats — a board carrying them
+    // simply falls through to the defaults below. 59-62 are still virgin, and 63
+    // is the group terminator, so that is all the room left in this group.
+    // @Param: PID_ERPM
+    // @DisplayName: Full-throttle speed setpoint
+    // @Description: Speed commanded at full trigger when PPM_CTRL selects one of the PID speed control types (VESC app_ppm_conf.pid_max_erpm, "Max ERPM" on VESC Tool's App Settings PPM page). The trigger maps linearly onto plus/minus this for control type 6 and zero to this for type 7. The speed loop additionally truncates its setpoint to MIN_ERPM..MAX_ERPM, so setting this beyond those ceilings just saturates there rather than commanding a speed the drive is configured to refuse.
+    // @Units: rpm
+    // @Range: 0 100000
+    // @User: Standard
+    AP_GROUPINFO("PID_ERPM", 51, FOC_ESC, _p_pid_erpm, 15000.0f),
+    // @Param: SPD_KP
+    // @DisplayName: Speed PID P gain
+    // @Description: Proportional gain of the outer speed loop (VESC s_pid_kp). The loop is a direct port of VESC's, including its internal 1/20 scale factor and its normalised plus/minus 1 output, so this number is exactly the one VESC Tool shows and gains transfer between the two without conversion. Output of 1 means the full I_MAX ceiling. Tune this first with SPD_KI at zero on a speed step, then add I.
+    // @Range: 0 1
+    // @User: Advanced
+    AP_GROUPINFO("SPD_KP", 52, FOC_ESC, _p_spd_kp, 0.004f),
+    // @Param: SPD_KI
+    // @DisplayName: Speed PID I gain
+    // @Description: Integral gain of the outer speed loop (VESC s_pid_ki). Exactly zero disables the integral term and holds it cleared, matching VESC. The integral is clamped to the full plus/minus 1 output range rather than back-calculated; VESC relies on SPD_RAMP keeping the error small enough that it never runs away, so a very slow ramp with a large step command is the case to watch.
+    // @Range: 0 1
+    // @User: Advanced
+    AP_GROUPINFO("SPD_KI", 53, FOC_ESC, _p_spd_ki, 0.004f),
+    // @Param: SPD_KD
+    // @DisplayName: Speed PID D gain
+    // @Description: Derivative gain of the outer speed loop (VESC s_pid_kd). Acts on the speed ERROR, so a setpoint step kicks it — which is why it is filtered by SPD_KDF. Defaults to zero rather than to VESC's 0.0001 because differentiating a sensorless speed estimate is noise amplification and nothing here has been tuned against a real rotor; raise it only if P and I alone leave the response sluggish.
+    // @Range: 0 0.01
+    // @User: Advanced
+    AP_GROUPINFO("SPD_KD", 54, FOC_ESC, _p_spd_kd, 0.0f),
+    // @Param: SPD_KDF
+    // @DisplayName: Speed PID D filter
+    // @Description: First-order low-pass coefficient applied to the D term alone (VESC s_pid_kd_filter), as a per-tick blend fraction. 1 is unfiltered, smaller is heavier filtering. Irrelevant while SPD_KD is zero.
+    // @Range: 0 1
+    // @User: Advanced
+    AP_GROUPINFO("SPD_KDF", 55, FOC_ESC, _p_spd_kdf, 0.2f),
+    // @Param: SPD_MINRPM
+    // @DisplayName: Speed control release threshold
+    // @Description: Below this SETPOINT the speed loop clears its integrator and releases the motor to zero torque instead of regulating (VESC s_pid_min_erpm). Speed control is meaningless at a speed the feedback cannot resolve, and without the guard the loop integrates against a setpoint it can never reach while standing still. This is also the speed at which an idle trigger in a PID control type stops braking and coasts, and the point at which a latched fault clears.
+    // @Units: rpm
+    // @Range: 0 20000
+    // @User: Advanced
+    AP_GROUPINFO("SPD_MINRPM", 56, FOC_ESC, _p_spd_minrpm, 900.0f),
+    // @Param: SPD_RAMP
+    // @DisplayName: Speed setpoint slew rate
+    // @Description: Rate at which the speed setpoint is slewed toward the commanded speed (VESC s_pid_ramp_erpms_s). This is the acceleration AND deceleration limit of speed control: it bounds how fast the loop is allowed to ask for a change, which is what keeps the observer and PLL able to track it. Lower is gentler and slower; too low with a large step leaves the integrator saturated for the whole ramp.
+    // @Units: rpm/s
+    // @Range: 100 200000
+    // @User: Standard
+    AP_GROUPINFO("SPD_RAMP", 57, FOC_ESC, _p_spd_ramp, 25000.0f),
+    // @Param: SPD_BRAKE
+    // @DisplayName: Speed control braking
+    // @Description: Whether the speed loop may command torque opposing rotation to hold the setpoint (VESC s_pid_allow_braking). 0 makes an over-speed coast down instead of being braked back, which matters on a bus that cannot absorb regen. The gate is on measured speed with a plus/minus 20 eRPM dead zone, so a stopped motor can still be driven either way.
+    // @Values: 0:Disabled,1:Enabled
+    // @User: Advanced
+    AP_GROUPINFO("SPD_BRAKE", 58, FOC_ESC, _p_spd_brake, 1),
     // ── Sensorless open-loop start (VESC foc_sl_openloop_*) ──────────────────
     // Inactive in HALL sensor mode: the halls commutate from standstill and this
     // state machine is never entered.
@@ -410,9 +487,15 @@ void FOC_ESC::init(AP_HAL::UARTDriver *vesc_uart)
     // At boost_q=10 A of 15 A, a zero-throttle start hands over near 0.8·this;
     // full throttle at this ceiling — both well above the observer's speed floor.
     motor_cfg.openloop_erpm = 2000.0f;   // overridden by OL_ERPM below
-    // Outer speed PI — strong enough to reject load (tune: ↑ if sluggish, ↓ if hunting).
-    motor_cfg.speed_kp = 0.005f;   // [A per eRPM]
-    motor_cfg.speed_ki = 0.05f;    // [A per eRPM·s]
+    // Outer speed PID, straight from the SPD_* params in VESC's own units — see
+    // the param table above and MotorControl::Config for why they are not amps.
+    motor_cfg.speed_kp           = _p_spd_kp.get();
+    motor_cfg.speed_ki           = _p_spd_ki.get();
+    motor_cfg.speed_kd           = _p_spd_kd.get();
+    motor_cfg.speed_kd_filter    = _p_spd_kdf.get();
+    motor_cfg.speed_min_erpm     = _p_spd_minrpm.get();
+    motor_cfg.speed_ramp_erpm_s  = _p_spd_ramp.get();
+    motor_cfg.speed_allow_braking = _p_spd_brake.get() != 0;
     motor_cfg.current_scale = 1.0f / (phase_current_shunt_ohms *
                                        phase_current_shunt_input_attenuation *
                                        phase_current_amp_gain);
@@ -504,6 +587,16 @@ void FOC_ESC::init(AP_HAL::UARTDriver *vesc_uart)
     snap.observer_gain   = _p_obs_gain.get();
     snap.ppm_ctrl_type   = uint8_t(_p_ppm_ctrl.get());
     snap.max_erpm_for_dir = _p_dir_erpm.get();
+    snap.pid_max_erpm     = _p_pid_erpm.get();
+    // The speed PID is seeded here for the window before the first update()
+    // tick; set_speed_conf() keeps it live from then on.
+    snap.s_pid_kp         = _p_spd_kp.get();
+    snap.s_pid_ki         = _p_spd_ki.get();
+    snap.s_pid_kd         = _p_spd_kd.get();
+    snap.s_pid_kd_filter  = _p_spd_kdf.get();
+    snap.s_pid_min_erpm   = _p_spd_minrpm.get();
+    snap.s_pid_ramp_erpms_s = _p_spd_ramp.get();
+    snap.s_pid_allow_braking = _p_spd_brake.get() != 0;
     vesc_telem.set_conf_snapshot(snap);
     vesc_telem.set_mcconf_sink(this, &FOC_ESC::mcconf_write_trampoline);
     vesc_telem.set_appconf_sink(this, &FOC_ESC::appconf_write_trampoline);
@@ -624,6 +717,42 @@ void FOC_ESC::on_mcconf_write(const ChibiOS::VescTelemetry::McconfIn &in)
     if (in.erpm_start >= 0.05f && in.erpm_start <= 0.99f) {
         _p_erpm_start.set_and_save(in.erpm_start);
     }
+    // Outer speed PID. Every one of these is range-checked before it is stored,
+    // not because VESC Tool is expected to send nonsense but because this is a
+    // hand-decoded binary layout: if a field offset here is wrong by one, what
+    // arrives is a neighbouring field reinterpreted, and a gain is exactly the
+    // kind of value that turns a wrong number into current. The bounds are wide
+    // enough to accept anything VESC Tool's own boxes allow and narrow enough
+    // that a misparse lands outside them.
+    //
+    // Zero is ACCEPTED for the three gains — a zero Ki is VESC's documented way
+    // to disable the integral term, and zero Kd is our default — so the guard is
+    // a range test, not a nonzero test.
+    if (in.s_pid_kp >= 0.0f && in.s_pid_kp <= 1.0f) {
+        _p_spd_kp.set_and_save(in.s_pid_kp);
+    }
+    if (in.s_pid_ki >= 0.0f && in.s_pid_ki <= 1.0f) {
+        _p_spd_ki.set_and_save(in.s_pid_ki);
+    }
+    if (in.s_pid_kd >= 0.0f && in.s_pid_kd <= 0.01f) {
+        _p_spd_kd.set_and_save(in.s_pid_kd);
+    }
+    if (in.s_pid_kd_filter > 0.0f && in.s_pid_kd_filter <= 1.0f) {
+        _p_spd_kdf.set_and_save(in.s_pid_kd_filter);
+    }
+    // A zero release threshold would leave the loop regulating against a
+    // setpoint it cannot resolve at standstill, which is the exact failure
+    // s_pid_min_erpm exists to prevent — treat it as absent rather than stored.
+    if (in.s_pid_min_erpm > 0.0f && in.s_pid_min_erpm <= 50000.0f) {
+        _p_spd_minrpm.set_and_save(in.s_pid_min_erpm);
+    }
+    // Likewise zero: VESC reads a zero ramp as "no ramp" and skips the slew
+    // entirely (foc_math.c:505), which here would hand the loop an unbounded
+    // setpoint step. Refuse it rather than reproduce that.
+    if (in.s_pid_ramp_erpms_s > 0.0f && in.s_pid_ramp_erpms_s <= 1000000.0f) {
+        _p_spd_ramp.set_and_save(in.s_pid_ramp_erpms_s);
+    }
+    _p_spd_brake.set_and_save(in.s_pid_allow_braking ? 1 : 0);
     // Sensorless open-loop start. Each guarded on its own: VESC Tool sends the
     // whole config, and a field the operator never touched must not overwrite a
     // value tuned here. The times are the ones that matter — lock+ramp+const is
@@ -673,9 +802,10 @@ void FOC_ESC::on_mcconf_write(const ChibiOS::VescTelemetry::McconfIn &in)
     _reboot_ms = AP_HAL::millis();   // deferred reboot (see update())
 }
 
-// Sink for VESC Tool's "Write App Configuration". Only the PPM control type and
-// the direction-switch ceiling are backed by params here; the rest of the blob
-// describes apps this firmware does not implement and is discarded upstream.
+// Sink for VESC Tool's "Write App Configuration". Only the PPM control type, the
+// direction-switch ceiling and the PID-mode speed scale are backed by params
+// here; the rest of the blob describes apps this firmware does not implement and
+// is discarded upstream.
 void FOC_ESC::on_appconf_write(const ChibiOS::VescTelemetry::AppconfIn &in)
 {
     // An unimplemented control type is REFUSED, not clamped to the nearest thing
@@ -687,10 +817,19 @@ void FOC_ESC::on_appconf_write(const ChibiOS::VescTelemetry::AppconfIn &in)
     bool accepted = false;
     if (in.ppm_ctrl_type == PPM_CTRL_CURRENT ||
         in.ppm_ctrl_type == PPM_CTRL_CURRENT_NOREV_BRAKE ||
-        in.ppm_ctrl_type == PPM_CTRL_CURRENT_BRAKE_REV_HYST) {
+        in.ppm_ctrl_type == PPM_CTRL_CURRENT_BRAKE_REV_HYST ||
+        ppm_ctrl_is_pid(in.ppm_ctrl_type)) {
         _p_ppm_ctrl.set_and_save(float(in.ppm_ctrl_type));
         accepted = true;
         vesc_telem.note_appconf_accepted();
+    }
+    // Only meaningful to the PID types, but stored whatever the type is: VESC
+    // Tool sends the whole page every time, and refusing the field unless the
+    // type happened to be set in the same write would make the box on screen
+    // silently not stick when it is edited on its own.
+    if (in.pid_max_erpm > 0.0f) {
+        _p_pid_erpm.set_and_save(in.pid_max_erpm);
+        accepted = true;
     }
     // Zero would forbid the gesture at every speed, which is what control type 3
     // is for — treat it as an absent field rather than a setting.
@@ -1139,9 +1278,10 @@ void FOC_ESC::read_pwm_throttle(uint32_t now_ms)
     if (pulse_us < THR_PWM_MIN_US - THR_PWM_RANGE_TOL_US ||
         pulse_us > THR_PWM_MAX_US + THR_PWM_RANGE_TOL_US ||
         period_us < 2000 || period_us > 25000) {
-        _pwm_armed = false;   // bad signal → require a fresh neutral before driving
+        _pwm_armed = false;   // bad signal → require a fresh idle before driving
         _pwm_amps  = 0.0f;
-        _pwm_brake = false;
+        _pwm_erpm  = 0.0f;
+        _pwm_out   = PwmOut::CURRENT;
         return;               // and let the source go stale → coast
     }
     // Frame is valid → the PWM source is present (prevents coast even at neutral).
@@ -1149,15 +1289,29 @@ void FOC_ESC::read_pwm_throttle(uint32_t now_ms)
 
     constexpr uint16_t fwd_break = THR_PWM_CTR_US + THR_PWM_DEADBAND_US;
     constexpr uint16_t brk_break = THR_PWM_CTR_US - THR_PWM_DEADBAND_US;
+    // One-sided types idle at minimum pulse, two-sided ones at centre.
+    constexpr uint16_t low_break = THR_PWM_MIN_US + THR_PWM_DEADBAND_US;
+
+    const uint8_t ctrl  = uint8_t(_p_ppm_ctrl.get());
+    if (ctrl != _pwm_ctrl_seen) {
+        _pwm_ctrl_seen = ctrl;
+        _pwm_armed     = false;   // re-arm at the new type's idle position
+    }
+    const bool    norev = ppm_ctrl_is_norev(ctrl);
+    const bool    idle  = norev ? (pulse_us <= low_break)
+                                : (pulse_us >= brk_break && pulse_us <= fwd_break);
 
     if (!_pwm_armed) {
-        // Must be seen at neutral before it can drive. A boot or reconnect with
-        // the trigger held stays coasted until it is released.
-        if (pulse_us >= brk_break && pulse_us <= fwd_break) {
+        // Must be seen at idle before it can drive. A boot or reconnect with the
+        // trigger held stays coasted until it is released. Which stick position
+        // counts as idle depends on the control type — for a one-sided type,
+        // centre is half throttle, so arming there would be arming at speed.
+        if (idle) {
             _pwm_armed = true;
         }
-        _pwm_amps  = 0.0f;    // hold coast until armed through neutral
-        _pwm_brake = false;
+        _pwm_amps  = 0.0f;    // hold coast until armed through idle
+        _pwm_erpm  = 0.0f;
+        _pwm_out   = PwmOut::CURRENT;
         // Drop any half-finished reverse gesture. VESC keeps its statics across
         // a signal loss; we do not, deliberately — coming back from a dropout or
         // a boot with the gesture already half-complete would let the first
@@ -1167,23 +1321,50 @@ void FOC_ESC::read_pwm_throttle(uint32_t now_ms)
         return;
     }
 
-    // Map about centre to VESC's servo_val ∈ [-1, +1] (app_ppm.c:155), with the
-    // deadband removed from each side so the usable travel starts at zero output.
+    // Map to VESC's servo_val, with the deadband removed so the usable travel
+    // starts at zero output. Two-sided types (app_ppm.c:155) map about centre
+    // onto [-1, +1]; one-sided types (app_ppm.c:144-151) map the whole travel
+    // onto [0, +1] and ignore the centre pulse entirely.
     float val;
-    if (pulse_us > fwd_break) {
-        val = float(pulse_us - fwd_break) / float(THR_PWM_MAX_US - fwd_break);
-    } else if (pulse_us < brk_break) {
-        val = -float(brk_break - pulse_us) / float(brk_break - THR_PWM_MIN_US);
+    if (norev) {
+        val = (pulse_us > low_break)
+                  ? float(pulse_us - low_break) / float(THR_PWM_MAX_US - low_break)
+                  : 0.0f;
+        val = constrain_float(val, 0.0f, 1.0f);
     } else {
-        val = 0.0f;           // neutral band
+        if (pulse_us > fwd_break) {
+            val = float(pulse_us - fwd_break) / float(THR_PWM_MAX_US - fwd_break);
+        } else if (pulse_us < brk_break) {
+            val = -float(brk_break - pulse_us) / float(brk_break - THR_PWM_MIN_US);
+        } else {
+            val = 0.0f;       // neutral band
+        }
+        val = constrain_float(val, -1.0f, 1.0f);
     }
-    val = constrain_float(val, -1.0f, 1.0f);
 
     const float erpm  = motor_control.get_erpm();
     const float i_mot = motor_control.current_limit();
     const float i_brk = motor_control.regen_limit();
 
-    if (uint8_t(_p_ppm_ctrl.get()) == PPM_CTRL_CURRENT) {
+    if (ppm_ctrl_is_pid(ctrl)) {
+        // VESC PPM_CTRL_TYPE_PID / _PID_NOREV (app_ppm.c:341-350). Both hand the
+        // same thing to the motor — `set_pid_speed(servo_val * pid_max_erpm)` —
+        // and differ only in the mapping above, which is why they share a branch
+        // here as they do there.
+        //
+        // Everything that makes this feel like a throttle rather than a step
+        // command lives in the speed loop, not here: the setpoint slew (SPD_RAMP)
+        // bounds acceleration and deceleration, and SPD_MINRPM decides when a
+        // released trigger stops braking and coasts. So an idle stick is passed
+        // through as a real setpoint of zero rather than being turned into a
+        // coast at this level — see MotorControl::set_rpm's zero_is_stop.
+        _pwm_out  = PwmOut::SPEED;
+        _pwm_amps = 0.0f;
+        _pwm_erpm = val * _p_pid_erpm.get();
+        return;
+    }
+
+    if (ctrl == PPM_CTRL_CURRENT) {
         // VESC PPM_CTRL_TYPE_CURRENT (app_ppm.c:300-307). Seamless bidirectional
         // torque: one SIGNED current command, never a brake command. Back-stick
         // while rolling forward is negative current, which already is regenerative
@@ -1208,12 +1389,12 @@ void FOC_ESC::read_pwm_throttle(uint32_t now_ms)
         // pure motoring.
         const bool opposing = (val > 0.0f && erpm < -THR_REV_ERPM) ||
                               (val < 0.0f && erpm >  THR_REV_ERPM);
-        _pwm_brake = false;
-        _pwm_amps  = val * (opposing ? i_brk : i_mot);
+        _pwm_out  = PwmOut::CURRENT;
+        _pwm_amps = val * (opposing ? i_brk : i_mot);
         return;
     }
 
-    if (uint8_t(_p_ppm_ctrl.get()) == PPM_CTRL_CURRENT_BRAKE_REV_HYST) {
+    if (ctrl == PPM_CTRL_CURRENT_BRAKE_REV_HYST) {
         // VESC PPM_CTRL_TYPE_CURRENT_BRAKE_REV_HYST (app_ppm.c:227-294).
         //
         // Reverse is deliberately NOT seamless here. Pulling back brakes; to
@@ -1277,8 +1458,8 @@ void FOC_ESC::read_pwm_throttle(uint32_t now_ms)
             amps = val * i_brk;
         }
 
-        _pwm_brake = brake;
-        _pwm_amps  = brake ? fabsf(amps) : amps;
+        _pwm_out  = brake ? PwmOut::BRAKE : PwmOut::CURRENT;
+        _pwm_amps = brake ? fabsf(amps) : amps;
         return;
     }
 
@@ -1291,14 +1472,14 @@ void FOC_ESC::read_pwm_throttle(uint32_t now_ms)
     // roll — so it stays a motoring command (positive current, no reverse), just
     // limited to the braking ceiling because that is what is decelerating the bus.
     if (val < 0.0f) {
-        _pwm_brake = true;
-        _pwm_amps  = -val * i_brk;
+        _pwm_out  = PwmOut::BRAKE;
+        _pwm_amps = -val * i_brk;
     } else if (erpm < -THR_REV_ERPM) {
-        _pwm_brake = false;
-        _pwm_amps  = val * i_brk;
+        _pwm_out  = PwmOut::CURRENT;
+        _pwm_amps = val * i_brk;
     } else {
-        _pwm_brake = false;
-        _pwm_amps  = val * i_mot;
+        _pwm_out  = PwmOut::CURRENT;
+        _pwm_amps = val * i_mot;
     }
 }
 
@@ -1412,10 +1593,22 @@ void FOC_ESC::update(uint32_t now_ms)
             // is the only one that reaches set_brake_current(). Note the brake
             // releases to IDLE below ~100 eRPM (MotorControl.cpp:1226) — there is
             // no standstill hold, by design.
-            if (_pwm_brake) {
+            //
+            // It is likewise the only source that can command a SPEED: the PID
+            // control types close the outer loop on the trigger. zero_is_stop is
+            // false there so an idle trigger is a setpoint of zero the loop ramps
+            // down to (braking as it goes, exactly as VESC does) rather than an
+            // instant coast; it collapses to a release below SPD_MINRPM.
+            switch (_pwm_out) {
+            case PwmOut::BRAKE:
                 motor_control.set_brake_current(_pwm_amps);
-            } else {
+                break;
+            case PwmOut::SPEED:
+                motor_control.set_rpm(_pwm_erpm, false);
+                break;
+            case PwmOut::CURRENT:
                 motor_control.set_current(_pwm_amps);
+                break;
             }
         } else {
             motor_control.set_current(0.0f);          // all sources stale → coast
@@ -1427,7 +1620,11 @@ void FOC_ESC::update(uint32_t now_ms)
     // deferred reboot, and 'diag' reports this value — so it must be what the
     // param actually holds right now, not what it held at boot. Anything that
     // fails to persist then shows up as a run_ctrl that reverts after a reset.
-    vesc_telem.set_ppm_conf(uint8_t(_p_ppm_ctrl.get()), _p_dir_erpm.get());
+    vesc_telem.set_ppm_conf(uint8_t(_p_ppm_ctrl.get()), _p_dir_erpm.get(),
+                            _p_pid_erpm.get());
+    vesc_telem.set_speed_conf(_p_spd_kp.get(), _p_spd_ki.get(), _p_spd_kd.get(),
+                              _p_spd_kdf.get(), _p_spd_minrpm.get(),
+                              _p_spd_ramp.get(), _p_spd_brake.get() != 0);
     vesc_telem.set_storage_full(AP_Param::get_eeprom_full());
     vesc_telem.update();
 

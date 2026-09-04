@@ -88,6 +88,19 @@ public:
         float   max_erpm   = 0.0f;
         float   min_erpm   = 0.0f;
         float   erpm_start = 0.0f;  // knee as a fraction of the limit (0 = absent)
+        // s_pid_* — the outer speed PID, in VESC's own units (see
+        // MotorControl::Config). These have NO absent sentinel: zero is a legal
+        // value for every one of them (a zero Ki disables the integral term,
+        // which is a thing VESC Tool lets you ask for), and the parser is linear
+        // and length-guarded, so if the sink is called at all the whole group was
+        // read. The sink range-checks them before storing.
+        float   s_pid_kp        = 0.0f;
+        float   s_pid_ki        = 0.0f;
+        float   s_pid_kd        = 0.0f;
+        float   s_pid_kd_filter = 0.0f;
+        float   s_pid_min_erpm  = 0.0f;
+        float   s_pid_ramp_erpms_s = 0.0f;
+        bool    s_pid_allow_braking = true;
         // Sensorless open-loop start, VESC foc_sl_openloop_* / foc_openloop_rpm.
         // All are meaningless at or below zero except rpm_low (0 is valid and is
         // the default), so 0 doubles as "absent" for the rest.
@@ -129,6 +142,10 @@ public:
         // 0 = absent (a zero ceiling would forbid reverse entirely, which is what
         // the NOREV modes are for).
         float   max_erpm_for_dir = 0.0f;
+        // app_ppm_conf.pid_max_erpm — full-throttle speed for the PID control
+        // types. 0 = absent (a zero scale would be a throttle that commands a
+        // standstill at every stick position).
+        float   pid_max_erpm     = 0.0f;
     };
 
     // Param-derived values the GET_MCCONF responder needs but MotorControl does
@@ -147,6 +164,17 @@ public:
         // App Settings → PPM page reads back what is actually running.
         uint8_t ppm_ctrl_type   = 3;      // → app_ppm_conf.ctrl_type (NOREV_BRAKE)
         float   max_erpm_for_dir = 4000.0f; // → app_ppm_conf.max_erpm_for_dir
+        float   pid_max_erpm    = 15000.0f; // → app_ppm_conf.pid_max_erpm
+        // Outer speed PID, echoed by the GET_MCCONF responder so VESC Tool's
+        // Motor Settings → Advanced → "Speed PID" page shows the gains that are
+        // actually running. They live in VESC's units on both sides of the wire.
+        float   s_pid_kp        = 0.004f;
+        float   s_pid_ki        = 0.004f;
+        float   s_pid_kd        = 0.0f;
+        float   s_pid_kd_filter = 0.2f;
+        float   s_pid_min_erpm  = 900.0f;
+        float   s_pid_ramp_erpms_s = 25000.0f;
+        bool    s_pid_allow_braking = true;
     };
     void set_conf_snapshot(const ConfSnapshot &s) {
         _conf = s;
@@ -178,9 +206,26 @@ public:
     // The sink accepted a ctrl_type and called set_and_save(). Separates "the
     // wire delivered a value we refused" from "we saved it and it did not stick".
     void note_appconf_accepted() { _appconf_ok++; }
-    void set_ppm_conf(uint8_t ctrl_type, float max_erpm_for_dir) {
+    void set_ppm_conf(uint8_t ctrl_type, float max_erpm_for_dir, float pid_max_erpm) {
         _conf.ppm_ctrl_type    = ctrl_type;
         _conf.max_erpm_for_dir = max_erpm_for_dir;
+        _conf.pid_max_erpm     = pid_max_erpm;
+    }
+    // Speed PID, kept LIVE for the same reason as the PPM block above: VESC Tool
+    // re-reads to confirm a write and that read lands before the deferred reboot,
+    // and 'diag' prints these — so they must be what the params hold right now,
+    // not what they held at boot. Unlike the rest of the MCCONF group, which is
+    // boot-latched, these have a read-back path an operator will actually use to
+    // check that a gain took.
+    void set_speed_conf(float kp, float ki, float kd, float kd_filter,
+                        float min_erpm, float ramp_erpms_s, bool allow_braking) {
+        _conf.s_pid_kp             = kp;
+        _conf.s_pid_ki             = ki;
+        _conf.s_pid_kd             = kd;
+        _conf.s_pid_kd_filter      = kd_filter;
+        _conf.s_pid_min_erpm       = min_erpm;
+        _conf.s_pid_ramp_erpms_s   = ramp_erpms_s;
+        _conf.s_pid_allow_braking  = allow_braking;
     }
 
     // ── Parameter-detection bridge (VESC Tool FOC tab / motor wizard) ────────

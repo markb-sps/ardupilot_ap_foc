@@ -311,8 +311,17 @@ bool MotorControl::init(const Config &cfg)
     _obs_gain_mod_inv   = (cfg.observer_gain_mod_full > 1e-3f) ? (1.0f / cfg.observer_gain_mod_full) : 1e6f;
     _obs_gain_slow_frac = cfg.observer_gain_slow_frac;
 
-    _spd_kp    = cfg.speed_kp;
-    _spd_ki_dt = cfg.speed_ki * _dt;
+    // VESC's 1/20 scale factor on the speed PID gains, folded in once here
+    // (foc_math.c foc_run_pid_control_speed) so the run loop is a plain PID.
+    constexpr float S_PID_SCALE = 1.0f / 20.0f;
+    _spd_kp    = cfg.speed_kp * S_PID_SCALE;
+    // VESC treats a Ki below 1e-9 as "no integral term at all" and holds the sum
+    // cleared (foc_math.c:555). Fold that in here so the run loop can test the
+    // precomputed gain directly instead of re-deriving the threshold through dt.
+    _spd_ki_dt = (cfg.speed_ki < 1e-9f) ? 0.0f : (cfg.speed_ki * _dt * S_PID_SCALE);
+    _spd_kd_dt = (_dt > 1e-9f) ? (cfg.speed_kd / _dt * S_PID_SCALE) : 0.0f;
+    _spd_kd_filt     = clampf(cfg.speed_kd_filter, 0.0f, 1.0f);
+    _spd_allow_brake = cfg.speed_allow_braking;
     _spd_ramp_erpm_s = cfg.speed_ramp_erpm_s;
     _spd_min_erpm    = cfg.speed_min_erpm;
     _pll_kp    = cfg.pll_kp;
@@ -360,6 +369,7 @@ void MotorControl::reset_control()
         _hd_gains_saved = false;
     }
     _integ_d = _integ_q = _integ_spd = 0.0f;
+    _spd_d_state = _spd_prev_err = 0.0f;
     _override_ang = 0.0f;
     _hyst_timer = 0.0f;
     _ol_timer = 0.0f;
@@ -732,12 +742,19 @@ void MotorControl::set_brake_current(float amps)
     _mode = Mode::BRAKE;
 }
 
-void MotorControl::set_rpm(float erpm)
+void MotorControl::set_rpm(float erpm, bool zero_is_stop)
 {
     const uint32_t now_ms = AP_HAL::millis();
     _last_cmd_ms = now_ms;
-    if (fabsf(erpm) < 1.0f) {    // zero command = explicit stop (also clears a latched fault)
-        stop();
+    // Zero command. For a streaming host that is an explicit stop (and the only
+    // way to clear a latched fault). For a PPM throttle at its idle stick it is
+    // a setpoint of zero, which VESC lets the loop ramp down to — braking the
+    // motor on the way — and only turns into a release below s_pid_min_erpm,
+    // which is where the loop would have dropped to iq = 0 anyway. See the
+    // header for why the two callers need different answers.
+    if (fabsf(erpm) < 1.0f &&
+        (zero_is_stop || fabsf(get_erpm()) < _spd_min_erpm)) {
+        stop();                  // coast + clear latched fault
         return;
     }
     // A live RPM command must not clear a latched trip: doing so armed the bridge
@@ -1290,6 +1307,7 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
         float id, iq;
         FOC::park(i_alpha, i_beta, st, ct, id, iq);
         _integ_d = _integ_q = _integ_spd = 0.0f; // keep loop clean for later
+        _spd_d_state = _spd_prev_err = 0.0f;
         _state   = State::DEBUG;
         _t_id    = id;
         _t_iq    = iq;
@@ -1511,6 +1529,8 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
         _state != State::ALIGN && !coasting) {
         _override_ang = _obs_theta;
         _integ_spd    = 0.0f;
+        _spd_d_state  = 0.0f;
+        _spd_prev_err = 0.0f;
         _hyst_timer   = 0.0f;
         _track_timer  = _resync_t;
         _lock_count   = 0;
@@ -1527,20 +1547,30 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
         // On a fresh SPEED entry, seed the ramped setpoint to the current speed
         // (and clear the integrator) so the takeover error ≈ 0 — no step brake.
         if (speed_entry) {
-            _spd_set_erpm = omega_ctrl * _w_to_erpm;
-            _integ_spd    = 0.0f;
+            _spd_set_erpm  = omega_ctrl * _w_to_erpm;
+            _integ_spd     = 0.0f;
+            _spd_d_state   = 0.0f;
+            _spd_prev_err  = 0.0f;
         }
         // VESC-style ramped setpoint (foc_run_pid_control_speed): slew toward the
         // command at an accel limit, and while still in open loop clamp it to the
         // handover speed. So at handover the setpoint ≈ actual speed (no error step
         // → no kick) and afterwards it ramps up under control (observer/PLL keep
         // up → no desync on big speed commands).
+        //
+        // The ramp is also where an unreachable command is made harmless: VESC
+        // truncates the ramped setpoint to l_min_erpm / l_max_erpm here
+        // (foc_math.c:510), so a throttle scaled past the configured speed
+        // ceiling saturates at the ceiling instead of leaving the loop chasing a
+        // speed it can never reach with a permanently saturated integrator.
         _spd_set_erpm = step_towards(_spd_set_erpm, _cmd_erpm, _spd_ramp_erpm_s * _dt);
+        _spd_set_erpm = clampf(_spd_set_erpm, _erpm_min, _erpm_max);
         float set_erpm = _spd_set_erpm;
         if (_ol_timer > 0.0f) {
             set_erpm = clampf(set_erpm, -_open_handover_erpm, _open_handover_erpm);
         }
-        const float erpm_err = set_erpm - omega_ctrl * _w_to_erpm;
+        const float erpm_now = omega_ctrl * _w_to_erpm;
+        const float erpm_err = set_erpm - erpm_now;
 
         // Minimum-speed guard (VESC foc_run_pid_control_speed s_pid_min_erpm):
         // below this SETPOINT the loop resets its integrator and RELEASES the
@@ -1550,20 +1580,43 @@ void MotorControl::adc_sample_isr(uint16_t sample_u, uint16_t sample_v, uint16_t
         // indefinitely. Tested on the SETPOINT, not the measurement, so a motor
         // dragged to a standstill under a real command still gets regulated.
         if (fabsf(_spd_set_erpm) < _spd_min_erpm) {
-            _integ_spd = 0.0f;
-            iq_cmd     = 0.0f;
+            _integ_spd    = 0.0f;
+            _spd_prev_err = erpm_err;   // VESC keeps the error, only zeroes the sum
+            iq_cmd        = 0.0f;
         } else {
+            // A straight port of VESC's foc_run_pid_control_speed, working in its
+            // normalised ±1 output so the SPD_* gains are the VESC Tool numbers
+            // (the 1/20 scale is already folded into _spd_kp/_spd_ki_dt/_spd_kd_dt).
+            const float p_term = erpm_err * _spd_kp;
+            // D is on the error, so a setpoint step kicks it — which is exactly
+            // why VESC filters it. Filter state persists across ticks; both it and
+            // prev_err are reseeded on SPEED entry so a re-entry cannot inherit a
+            // stale derivative from the last run.
+            const float d_raw = (erpm_err - _spd_prev_err) * _spd_kd_dt;
+            _spd_d_state += _spd_kd_filt * (d_raw - _spd_d_state);
+            _spd_prev_err = erpm_err;
+
             // Output first, from the PREVIOUS integrator, then integrate —
-            // VESC's ordering (foc_math.c foc_run_pid_control_speed). Windup
-            // protection is VESC's too: a plain symmetric clamp of the integral
-            // term to the full output range. Deliberately NOT back-calculation
-            // — VESC leans on the ramped setpoint above to keep the error small
-            // enough that the term never runs away, and matching its structure
-            // keeps the two tunings comparable. VESC normalises output to ±1
-            // then scales by current_max; working directly in amps is the same
-            // thing with i_max as the limit.
-            iq_cmd = clampf(erpm_err * _spd_kp + _integ_spd, -i_max, i_max);
-            _integ_spd = clampf(_integ_spd + erpm_err * _spd_ki_dt, -i_max, i_max);
+            // VESC's ordering. Windup protection is VESC's too: a plain symmetric
+            // clamp of the integral term to the full output range. Deliberately
+            // NOT back-calculation — VESC leans on the ramped setpoint above to
+            // keep the error small enough that the term never runs away, and
+            // matching its structure keeps the two tunings comparable.
+            float out = clampf(p_term + _integ_spd + _spd_d_state, -1.0f, 1.0f);
+            _integ_spd = clampf(_integ_spd + erpm_err * _spd_ki_dt, -1.0f, 1.0f);
+            if (_spd_ki_dt <= 0.0f) {
+                _integ_spd = 0.0f;      // VESC: no Ki means no integral state at all
+            }
+            // s_pid_allow_braking. VESC gates on the MEASURED speed with a ±20
+            // eRPM dead zone, so the loop can still drive a stopped rotor either
+            // way; it only refuses to command torque against actual rotation.
+            if (!_spd_allow_brake) {
+                if ((erpm_now >  20.0f && out < 0.0f) ||
+                    (erpm_now < -20.0f && out > 0.0f)) {
+                    out = 0.0f;
+                }
+            }
+            iq_cmd = out * i_max;       // VESC: output * lo_current_max
         }
         // Regen limit: when iq opposes rotation (decelerating) the braking energy
         // returns to the bus, which a bench PSU can't sink — cap the braking
@@ -1972,7 +2025,13 @@ bool MotorControl::run_sensorless(Mode mode, float dir, float iq_cmd,
         if (time_fwd < OL_IQ_RAMP_S) {
             iq_set *= time_fwd / OL_IQ_RAMP_S;
         }
-        _integ_spd = clampf(_integ_spd, -_ol_max_q, _ol_max_q);
+        // Clamp the speed-PI integrator to the forced-start current ceiling so it
+        // cannot wind up while the angle is forced. The integrator is VESC's
+        // normalised ±1 output, so the amps ceiling has to be normalised too — a
+        // bare _ol_max_q here would be a ceiling of 15 on a quantity that never
+        // exceeds 1, i.e. no clamp at all.
+        const float ol_norm = (i_max > 1e-3f) ? fminf(_ol_max_q / i_max, 1.0f) : 1.0f;
+        _integ_spd = clampf(_integ_spd, -ol_norm, ol_norm);
 
         // Convergence watch (decides the transfer only — NOT commutation, which
         // stays forced above). The free-running observer is "converged" once its
@@ -2033,6 +2092,8 @@ bool MotorControl::run_sensorless(Mode mode, float dir, float iq_cmd,
                     // (same reset as the OL handover).
                     _spd_set_erpm = _spd_pll_omega * _w_to_erpm;
                     _integ_spd    = 0.0f;
+                    _spd_d_state  = 0.0f;
+                    _spd_prev_err = 0.0f;
                 }
             } else {
                 // No lock → standstill (or too slow to matter): forced start.
@@ -2082,6 +2143,8 @@ bool MotorControl::run_sensorless(Mode mode, float dir, float iq_cmd,
             if (handover) {
                 _spd_set_erpm = _spd_pll_omega * _w_to_erpm;
                 _integ_spd    = 0.0f;
+                _spd_d_state  = 0.0f;
+                _spd_prev_err = 0.0f;
                 iq_set        = 0.0f;
             }
             _ol_release = 0.0f;

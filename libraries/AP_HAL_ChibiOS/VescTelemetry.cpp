@@ -639,7 +639,7 @@ void VescTelemetry::print_hall_table()
 void VescTelemetry::print_diag()
 {
     const uint32_t now = AP_HAL::millis();
-    char line[96];
+    char line[128];   // widest line is the speed-PID read-back below
     float amps = 0.0f;
     const bool usb_ok = usb_current(now, 200, amps);
     const bool ovr_ok = override_active(now, 200);
@@ -676,6 +676,20 @@ void VescTelemetry::print_diag()
                        unsigned(_appconf_rx), unsigned(_appconf_badsig),
                        unsigned(_appconf_short), unsigned(_appconf_ctrl),
                        unsigned(_appconf_ok), unsigned(_conf.ppm_ctrl_type));
+    send_print(line);
+    // Speed control, as the params actually hold it. This is the read-back that
+    // proves the MCCONF/APPCONF field offsets for this group are right: write a
+    // distinctive value from VESC Tool, reboot, and check it appears here. A
+    // wrong offset shows up as one of these carrying a neighbouring field's
+    // value, which the sink's range checks may have refused outright — in which
+    // case the number here is the unchanged old one.
+    hal.util->snprintf(line, sizeof(line),
+                       "spd kp=%.5f ki=%.5f kd=%.6f kdf=%.3f min=%.0f ramp=%.0f brk=%u pid_erpm=%.0f",
+                       double(_conf.s_pid_kp), double(_conf.s_pid_ki),
+                       double(_conf.s_pid_kd), double(_conf.s_pid_kd_filter),
+                       double(_conf.s_pid_min_erpm), double(_conf.s_pid_ramp_erpms_s),
+                       unsigned(_conf.s_pid_allow_braking ? 1 : 0),
+                       double(_conf.pid_max_erpm));
     send_print(line);
     if (_storage_full) {
         send_print("PARAM STORAGE FULL - set_and_save() is a no-op, nothing persists");
@@ -1112,14 +1126,19 @@ void VescTelemetry::handle_get_mcconf(uint8_t reply_id)
     put_u8      (p, 0);                        // foc_short_ls_on_zero_duty
     put_f16     (p, 1.0f, 10000.0f);           // foc_overmod_factor
     put_u8      (p, 0);                        // sp_pid_loop_rate
-    put_f32_auto(p, 0.004f);                   // s_pid_kp
-    put_f32_auto(p, 0.004f);                   // s_pid_ki
-    put_f32_auto(p, 0.0001f);                  // s_pid_kd
-    put_f16     (p, 0.2f, 10000.0f);           // s_pid_kd_filter
-    put_f32_auto(p, 900.0f);                   // s_pid_min_erpm
-    put_u8      (p, 1);                        // s_pid_allow_braking
-    put_f32_auto(p, 25000.0f);                 // s_pid_ramp_erpms_s
-    put_u8      (p, 0);                        // s_pid_speed_source
+    // ── Outer speed PID: live, from the SPD_* params ────────────────────────
+    put_f32_auto(p, _conf.s_pid_kp);           // s_pid_kp        ← param (SPD_KP)
+    put_f32_auto(p, _conf.s_pid_ki);           // s_pid_ki        ← param (SPD_KI)
+    put_f32_auto(p, _conf.s_pid_kd);           // s_pid_kd        ← param (SPD_KD)
+    put_f16     (p, _conf.s_pid_kd_filter, 10000.0f); // s_pid_kd_filter ← param (SPD_KDF)
+    put_f32_auto(p, _conf.s_pid_min_erpm);     // s_pid_min_erpm  ← param (SPD_MINRPM)
+    put_u8      (p, _conf.s_pid_allow_braking ? 1 : 0); // s_pid_allow_braking ← (SPD_BRAKE)
+    put_f32_auto(p, _conf.s_pid_ramp_erpms_s); // s_pid_ramp_erpms_s ← param (SPD_RAMP)
+    // s_pid_speed_source: reported as S_PID_SPEED_SRC_PLL and not accepted back.
+    // The speed loop closes on the PLL estimate and there is no second or third
+    // estimator here to switch to, so offering the dropdown would be offering a
+    // choice that silently does nothing.
+    put_u8      (p, 0);                        // s_pid_speed_source = PLL
     put_f32_auto(p, 0.03f);                    // p_pid_kp
     put_f32_auto(p, 0.0f);                     // p_pid_ki
     put_f32_auto(p, 0.0004f);                  // p_pid_kd
@@ -1292,12 +1311,14 @@ void VescTelemetry::handle_set_mcconf()
     U8(); U8();                             // foc_speed_soure, foc_short_ls_on_zero_duty
     H(10000);                               // foc_overmod_factor
     U8();                                   // sp_pid_loop_rate
-    A(); A(); A();                          // s_pid_kp, ki, kd
-    H(10000);                               // s_pid_kd_filter
-    A();                                    // s_pid_min_erpm
-    U8();                                   // s_pid_allow_braking
-    A();                                    // s_pid_ramp_erpms_s
-    U8();                                   // s_pid_speed_source
+    in.s_pid_kp        = get_f32_auto(p);    // s_pid_kp
+    in.s_pid_ki        = get_f32_auto(p);    // s_pid_ki
+    in.s_pid_kd        = get_f32_auto(p);    // s_pid_kd
+    in.s_pid_kd_filter = get_f16(p, 10000);  // s_pid_kd_filter
+    in.s_pid_min_erpm  = get_f32_auto(p);    // s_pid_min_erpm
+    in.s_pid_allow_braking = (*p != 0); p += 1; // s_pid_allow_braking
+    in.s_pid_ramp_erpms_s  = get_f32_auto(p);   // s_pid_ramp_erpms_s
+    U8();                                   // s_pid_speed_source (PLL only — see emit)
     A(); A(); A(); A();                     // p_pid_kp, ki, kd, kd_proc
     H(10000);                               // p_pid_kd_filter
     A();                                    // p_pid_ang_div
@@ -1374,7 +1395,7 @@ void VescTelemetry::handle_get_appconf(uint8_t reply_id)
     // three are still compile-time constants here (THR_PWM_* in foc_esc.cpp);
     // they are reported, not accepted back.
     put_u8      (p, _conf.ppm_ctrl_type);      // ctrl_type       ← param (PPM_CTRL)
-    put_f32_auto(p, 15000.0f);                 // pid_max_erpm
+    put_f32_auto(p, _conf.pid_max_erpm);       // pid_max_erpm    ← param (PID_ERPM)
     put_f32_auto(p, 0.08f);                    // hyst  = 40 us / 500 us
     put_f32_auto(p, 1.0f);                     // pulse_start  [ms]
     put_f32_auto(p, 2.0f);                     // pulse_end    [ms]
@@ -1515,7 +1536,8 @@ void VescTelemetry::handle_set_appconf()
     U8(); U8(); U8();                       // uavcan_status_current_mode, servo_out_enable, kill_sw_mode
     U8();                                   // app_to_use
     in.ppm_ctrl_type = *p; p += 1;          // app_ppm_conf.ctrl_type
-    A(); A(); A(); A(); A();                // pid_max_erpm, hyst, pulse_start, _end, _center
+    in.pid_max_erpm  = get_f32_auto(p);     // pid_max_erpm
+    A(); A(); A(); A();                     // hyst, pulse_start, _end, _center
     U8(); U8();                             // median_filter, safe_start
     A(); A();                               // throttle_exp, throttle_exp_brake
     U8();                                   // throttle_exp_mode
